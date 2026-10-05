@@ -221,7 +221,10 @@ def build_prompt(
     if seed:
         systems, kept, truncated = _seed_messages(messages, seed_max_chars or DEFAULT_SEED_MAX_CHARS)
         parts: List[str] = [
-            "[上下文重建] 这是一个新会话。以下是本次任务此前的对话记录，请据此继续，不要从头重做。"
+            "[上下文重建] 这是一个新会话。以下是本次任务此前的对话记录，请据此继续，不要从头重做。",
+            # 明确告知：git 仓库就在本地，模型直接下命令即可，无需请求用户提供
+            # 远程地址 / 手动执行。放在重建头之后、历史之前，避免被尾部截断丢掉。
+            config.SEED_ENV_NOTE,
         ]
         if task_block:
             parts.append(task_block)

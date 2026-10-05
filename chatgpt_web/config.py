@@ -186,6 +186,15 @@ SEED_MAX_CHARS = env_int("SEED_MAX_CHARS", 12000)
 # 完整的系统提示作为 system 消息发来，动辄上万字；播种时若原样重放，
 # 会把简单请求灌成一大段系统提示。超出即截断。0 = 不限制（不推荐）。
 SEED_SYSTEM_MAX_CHARS = env_int("SEED_SYSTEM_MAX_CHARS", 2000)
+# 新会话播种时，紧跟在 [上下文重建] 头之后注入的一段环境说明。
+# 用于明确告知模型：git 仓库就在本地、工作目录已就绪，直接下 git 命令即可，
+# 不要反过来要求用户提供仓库地址或代为执行。留空则不注入。
+SEED_ENV_NOTE = env_str(
+    "SEED_ENV_NOTE",
+    "[环境说明] git 仓库就在本地工作目录中，你可以直接执行 git 命令"
+    "（如 git status / git add / git commit / git log）来完成提交、查看改动等操作，"
+    "无需向用户索要仓库地址，也无需用户手动执行。",
+)
 # 单条 tool 结果（role=="tool"）注入 prompt 时的最大字符数。
 # Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆 ChatGPT 网页版输入框
 # （Playwright fill 超时）。超出即截断并标注。0 = 不限制（不推荐）。
