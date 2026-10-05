@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Playwright / Chromium persistent profile (contains login cookies)
+user_data/
+user_data_e2e/
+
+# Generated output
+output/
+
+# Local config (may contain environment-specific paths)
+.env
+
+# Local tooling
+.freebuff/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
