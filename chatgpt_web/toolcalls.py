@@ -234,8 +234,10 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "- `arguments` must be a valid JSON object matching the tool's parameters.",
         "- Inside JSON strings, escape double quotes as \\\" and newlines as \\n.",
         "- For shell commands, prefer single quotes inside the command.",
-        "- You may output several TOOL_CALL lines to call multiple tools at once.",
-        "- When you call a tool, output ONLY the TOOL_CALL line(s): no explanation, no preamble.",
+        "- Output EXACTLY ONE TOOL_CALL line per reply. Never emit two or more TOOL_CALL lines",
+        "  together; the client can only process a single call at a time. If you need several",
+        "  tools, issue one call, wait for its result, then issue the next in your next reply.",
+        "- When you call a tool, output ONLY the single TOOL_CALL line: no explanation, no preamble.",
         "- Only if the task needs no tool at all, answer directly with no TOOL_CALL line.",
         "- Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter> — they will not be executed.",
     ]
@@ -258,7 +260,9 @@ def format_tool_call_emphasis() -> str:
         "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
         "to avoid a clash between double quotes in the command and the JSON boundary quotes.",
         "Use the tool names exactly as listed in [Tool Calling Instructions]; do not invent generic names like bash / shell.",
-        "Output only the TOOL_CALL line(s) when calling a tool: no explanation, no preamble.",
+        "Output EXACTLY ONE TOOL_CALL line per reply - never two or more in the same message.",
+        "If you need several tools, call one now and the next only after you receive its result.",
+        "Output only the single TOOL_CALL line when calling a tool: no explanation, no preamble.",
         "Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter>, <tool_calls> - they will not be executed.",
     ])
 

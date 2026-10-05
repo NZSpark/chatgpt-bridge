@@ -96,6 +96,26 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         self.assertIn("MUST use", text)
         self.assertIn("TOOL_CALL:", text)
 
+    def test_instruction_mandates_single_call(self):
+        """提示词必须要求「一次只返回一个 TOOL_CALL」。
+
+        客户端一次只能处理一个工具调用；若模型在同一回复里输出多条
+        TOOL_CALL，用户端无法处理。两块提示词（工具说明 + 格式强调）都要
+        明确禁止多调用，且不得再出现旧版「可以一次调用多个工具」的措辞。
+        """
+        from chatgpt_web.toolcalls import (
+            format_tools_instruction,
+            format_tool_call_emphasis,
+        )
+
+        for text in (
+            format_tools_instruction(self.TOOLS),
+            format_tool_call_emphasis(),
+        ):
+            self.assertIn("ONE TOOL_CALL", text)
+            self.assertNotIn("several TOOL_CALL", text)
+            self.assertNotIn("multiple tools at once", text)
+
     def test_example_placeholder_is_not_angle_bracket(self):
         """示例里的占位符不能用 <command> 这种形式。
 

@@ -41,14 +41,19 @@ def _file(bucket: str) -> Path:
 
 
 def _goal_from_messages(messages: List[ChatMessage]) -> str:
-    """取任务目标：第一条**真正的** user 消息（跳过 system 与环境包装块）。
+    """取任务目标：**最后一条**真正的 user 消息（跳过 system 与环境包装块）。
+
+    历史实现取“第一条”并永不刷新，结果任何一次寒暄（``who r u?``、``hi``）
+    都会被永久钉成「任务目标」，此后每次轮转播种都反复注入、与真实任务冲突。
+    改为取“最近一条”，使 goal 随任务推进而自然刷新：长期任务进行中，最近的
+    user 消息仍属于该任务，目标不会丢；而闲聊会被后续真实指令覆盖，不再残留。
 
 注意：Codex / 部分 Agent 会在每轮最前面自动注入 ``<environment_context>`` 之类的
 环境元信息（cwd、权限、时间等）。它不是“用户想做的事”，若当成 goal 存下来，
 resume 时就会看到“目标 = 另一个项目的 cwd”这种串台错觉。因此这里跳过纯包装块。
 """
     fallback = ""
-    for message in messages:
+    for message in reversed(messages):
         if message.role != "user":
             continue
         text = _content_to_text(message.content).strip()
@@ -149,15 +154,21 @@ def load(bucket: str) -> Dict[str, Any]:
 
 
 def record(bucket: str, messages: List[ChatMessage]) -> None:
-    """每轮把当前 messages 快照写入任务文件（goal 只首次写入，之后保留）。"""
+    """每轮把当前 messages 快照写入任务文件。
+
+    goal 随任务推进刷新：优先采用「本轮的最近一条真实 user 消息」，仅当本轮
+    没有可用的 user 消息时才沿用旧 goal。这样既保证长期任务的目标始终是当前
+    意图，又避免把早期的寒暄（``who r u?``）永久钉成任务目标。
+    """
     if not config.TASK_SNAPSHOT_ENABLED:
         return
     data = load(bucket)
-    goal = data.get("goal") or ""
-    if _is_meta_prompt(goal):
-        # 自愈：早先把元提示误存成了 goal，丢弃并重新挑选真实目标
-        goal = ""
-    goal = goal or _goal_from_messages(messages)
+    previous = data.get("goal") or ""
+    if _is_meta_prompt(previous):
+        # 自愈：早先把元提示误存成了 goal，丢弃
+        previous = ""
+    # 本轮若带来了新的真实 user 消息，就用它刷新 goal；否则沿用旧的
+    goal = _goal_from_messages(messages) or previous
     payload = {
         "namespace": _namespace(),
         "bucket": bucket,

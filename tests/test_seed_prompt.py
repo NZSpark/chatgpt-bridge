@@ -110,6 +110,62 @@ class MetaPromptDetectionTests(unittest.TestCase):
         self.assertFalse(tasks._is_meta_prompt("更新README.md文件"))
 
 
+class GoalRefreshOnNewTaskTests(unittest.TestCase):
+    """goal 必须随任务推进刷新，不能被早期寒暄永久钉住。
+
+    历史 bug：goal 只首次写入、永不更新，导致 ``who r u?`` / ``hi`` 之类的
+    闲聊被当成任务目标，此后每次轮转播种都反复注入（曾持续 41 轮）。
+    """
+
+    def test_goal_refreshes_to_latest_user_message(self):
+        import tempfile
+        from unittest import mock
+
+        from chatgpt_web import tasks
+        from chatgpt_web.models import ChatMessage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(config, "TASK_FILE_DIR", tmp), mock.patch.object(
+                config, "TASK_SNAPSHOT_ENABLED", True
+            ):
+                tasks.record("b", [ChatMessage(role="user", content="who r u?")])
+                self.assertEqual(tasks.load("b")["goal"], "who r u?")
+                tasks.record(
+                    "b",
+                    [
+                        ChatMessage(role="user", content="who r u?"),
+                        ChatMessage(role="assistant", content="..."),
+                        ChatMessage(role="user", content="更新README.md"),
+                    ],
+                )
+                self.assertEqual(tasks.load("b")["goal"], "更新README.md")
+                block = tasks.resume_block("b")
+                self.assertIn("任务目标：更新README.md", block)
+                self.assertNotIn("任务目标：who r u?", block)
+
+    def test_goal_kept_when_no_new_user_message(self):
+        """本轮没有新的真实 user 消息（如仅 tool 结果）时，沿用旧 goal。"""
+        import tempfile
+        from unittest import mock
+
+        from chatgpt_web import tasks
+        from chatgpt_web.models import ChatMessage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(config, "TASK_FILE_DIR", tmp), mock.patch.object(
+                config, "TASK_SNAPSHOT_ENABLED", True
+            ):
+                tasks.record("b", [ChatMessage(role="user", content="重构 config")])
+                tasks.record(
+                    "b",
+                    [
+                        ChatMessage(role="user", content="重构 config"),
+                        ChatMessage(role="tool", content="done", tool_call_id="c1"),
+                    ],
+                )
+                self.assertEqual(tasks.load("b")["goal"], "重构 config")
+
+
 class ResumeBlockSanitizesPollutedGoalTests(unittest.TestCase):
     """被污染成“只回复N个字”的 goal，不应再以「任务目标：」口吻注入。"""
 
