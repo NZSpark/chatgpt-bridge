@@ -138,9 +138,11 @@ ChatGPTBridge/
 
 ### 会话分桶
 - `SESSION_SCOPING_BY_UA`：请求头与 `user` 都缺失时按 User-Agent 分桶，默认 `true`。
+- `SESSION_SCOPING_BY_UA_FINGERPRINT`：UA 分桶时是否再折进「首条 user 消息」指纹，让同一客户端的多个 agent 会话各用一个桶，默认 `true`。
 - `MAX_SESSION_BUCKETS`：最大会话桶数，默认 `3`，应 >= 同时访问的 Agent 数。
 - `PARALLEL_BUCKETS`：是否真正并行驱动多会话，默认 `true`。
-- `BUCKET_LOCK_TIMEOUT_S`：同一桶排队上限（秒），默认 `15`，超时返回 503 `upstream_busy`；`0` = 一直等。
+- `BUCKET_LOCK_TIMEOUT_S`：同一桶排队上限（秒），默认 `120`，超时返回 503 `upstream_busy`；`0` = 一直等。
+- `BUCKET_LOCK_QUEUE`：流式路径遇到「桶已忙」时是否排队等待，默认 `false`（直接返回 503 让客户端退避）。
 - `SESSION_MAX_TURNS`：单会话最大轮次，默认 `80`。
 - `SESSION_MAX_TOKENS`：单会话最大估算 token，默认 `240000`。
 
@@ -197,9 +199,9 @@ ChatGPTBridge/
 
 ### 5.8 `server.py`
 - 路由：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`（受 `ENABLE_RESPONSES_API` 控制）、`GET /healthz`、`GET /debug/dom`（受 `CHATGPT_DEBUG` 控制，不回显正文）。
-- 会话桶：键优先 `X-ChatGPT-Session`，其次 `user`，最后（`SESSION_SCOPING_BY_UA=true` 时）User-Agent。
+- 会话桶：键优先 `X-ChatGPT-Session`，其次 `user`，最后（`SESSION_SCOPING_BY_UA=true` 时）User-Agent；开启 `SESSION_SCOPING_BY_UA_FINGERPRINT` 时再折进首条 user 消息指纹。
 - `PARALLEL_BUCKETS=true` 时各桶独立页面并行；`MAX_SESSION_BUCKETS` 限制总数。
-- `BUCKET_LOCK_TIMEOUT_S>0` 时同桶排队超时返回 503 `upstream_busy`。
+- `BUCKET_LOCK_TIMEOUT_S>0` 时同桶排队超时返回 503 `upstream_busy`；流式路径在 `BUCKET_LOCK_QUEUE=false` 时预先探测忙闲并直接返回 503（而非 200 空 SSE）。
 - 达到 `SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS` 时轮转到新会话并播种已有上下文。
 - `/healthz` 返回状态与 cluster 字段：`parallel`、`max_buckets`、`busy`、`open_pages`。
 

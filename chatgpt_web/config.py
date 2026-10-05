@@ -161,6 +161,13 @@ SESSION_SCOPING = env_bool("SESSION_SCOPING", True)
 # 默认开：不同 AI 编程助手自动各用一条 ChatGPT 会话。关闭后退回旧的「默认桶，全局共用」行为。
 # 注意：自动分桶会使桶数随客户端数量增长，实际受 MAX_SESSION_BUCKETS 约束（超出按 LRU 回收页面，状态保留）。
 SESSION_SCOPING_BY_UA = env_bool("SESSION_SCOPING_BY_UA", True)
+# 在 UA 自动分桶时，是否再把「本轮第一条 user 消息的指纹」折进桶名。
+# 背景：Codex / Pi 这类 agent 是串行循环，所有请求 UA 相同（如 codex-tui），
+# 仅按 UA 分桶会让「上一轮没跑完、下一轮已进来」在同一条桶里排队，
+# 叠加 BUCKET_LOCK_TIMEOUT_S 后表现为反复 ChatGPTBusyError。
+# 打开后，每条逻辑会话（首条 user 消息相同视为同一会话）各用一个桶，互不排队。
+# 关闭则退化为「每个客户端一条桶」（旧行为）。
+SESSION_SCOPING_BY_UA_FINGERPRINT = env_bool("SESSION_SCOPING_BY_UA_FINGERPRINT", True)
 # 单个 key 的长度上限（防止超长头部变成文件名/JSON 键）
 SESSION_KEY_MAX_LEN = env_int("SESSION_KEY_MAX_LEN", 64)
 # 同时在用的会话桶数量上限。超出时**回收最久未用**的页面（状态保留，下次按 URL 恢复）。
@@ -176,10 +183,16 @@ BUCKET_IDLE_TTL_S = env_float("BUCKET_IDLE_TTL_S", 900)
 # 是否允许**按桶并发**（每个会话桶一把锁）。默认 false = 所有桶串行（更安全）。
 # 打开后会同时驱动多个网页会话，可能触发风控，请自行评估。
 PARALLEL_BUCKETS = env_bool("PARALLEL_BUCKETS")
-# 等待某个会话桶锁的最长时间（秒）：0 = 一直等（默认，保持旧行为）。
+# 等待某个会话桶锁的最长时间（秒）：0 = 一直等。
 # >0 时，若同一会话桶已有请求在跑（同一 key 并发/重试堆叠），超过该时间就快速失败，
 # 返回「上游繁忙」而不是无限排队、拖到客户端自己超时。不同桶互不影响。
-BUCKET_LOCK_TIMEOUT_S = env_float("BUCKET_LOCK_TIMEOUT_S", 0)
+# 默认 120s：网页版单轮（思考模式 + 上万字 prompt）常见几十秒，
+# 早期默认 0（一直等）会让客户端先超时，默认 15 又过短，故取 120 作折中。
+BUCKET_LOCK_TIMEOUT_S = env_float("BUCKET_LOCK_TIMEOUT_S", 120)
+# 流式（Responses SSE）路径遇到「桶已忙」时是否排队等待（true），还是直接
+# 返回 HTTP 503（false，默认）。返回 503 能让 Codex 走正常退避，避免它收到
+# 一条 200 的空 SSE 后立刻重试、反复撞同一把锁（表现为「一直有另一个会话请求」）。
+BUCKET_LOCK_QUEUE = env_bool("BUCKET_LOCK_QUEUE", False)
 # 新建/恢复页面后等待输入框就绪的超时（毫秒）
 READY_TIMEOUT_MS = env_int("READY_TIMEOUT_MS", 15000)
 # 单次 fill() 填充输入框的超时（毫秒）。React 重挂载时旧句柄会失效，

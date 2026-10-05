@@ -359,6 +359,21 @@ async def handle_responses(
     if req.stream:
         from fastapi.responses import StreamingResponse
 
+        # 预先探测桶是否已被占用：若已忙，直接返回 HTTP 503，而不是开一条 200 的
+        # SSE 再把 ChatGPTBusyError 塞进 response.failed。后者在客户端看来是
+        # 「200 但内容为空」，Codex 会立刻重试并再次撞上同一把锁，形成
+        # 「一直有另一个会话请求」的热重试。503 能让客户端走正常的退避。
+        bucket = session_key or DEFAULT_SESSION_KEY
+        if driver._bucket_busy(bucket) and not config.BUCKET_LOCK_QUEUE:
+            return JSONResponse(
+                status_code=503,
+                content=_error_payload(
+                    f"会话桶 {bucket} 正在处理另一个请求；请稍后重试。"
+                    "若要并发访问，请为每个 Agent 使用不同的会话标识。",
+                    "upstream_busy",
+                ),
+            )
+
         return StreamingResponse(
             stream_responses(chat_req, driver, session_key),
             media_type="text/event-stream",
