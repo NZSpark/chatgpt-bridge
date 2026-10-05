@@ -4,6 +4,10 @@
 
 面向 Pi、Codex CLI、`agy` 等只认 OpenAI 端点的客户端。
 
+> ChatGPT 网页端使用注意
+> 1. 与 ChatGPT 网页端对话时，请开启 思考模式（Thinking），以获得更稳定、完整的任务处理效果。
+> 2. 请明确要求 ChatGPT 严格按指定格式下达指令；例如本项目的工具调用应使用 TOOL_CALL: {...} 格式，并要求输出只包含规定格式的指令，不要添加额外解释或其他文本。
+
 ## 特性
 
 - **OpenAI 兼容端点**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`。
