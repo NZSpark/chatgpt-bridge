@@ -243,24 +243,22 @@ user_data/                浏览器 profile 与状态（gitignore）
 
 ## 设计要点
 
-- **不恢复旧会话**：每轮播种重放历史，代价是 token 消耗更高，换来对网页版改版的鲁棒性；用 `tasks.py` 快照保住任务目标。
-- **结束判定偏保守**：双阈值（内容 / 长度）避免把生成中途的长停顿误判成结束；
-  且「停止按钮消失」时若回复节点仍有未显现 token（`.pending`/`.animating`），会继续等待，
-  避免读到被截断的半截回复（读取文本走 `_complete_text`，克隆节点去动画后取全文）。
-- **到顶可区分**：用 `CAP_NOTICE_PATTERNS` 与轮次/token 双阈值判定对话长度上限，不伪装成超时。
-- **选择器外置**：全部集中在 `.env`，网页版改版只改配置、不改代码。
+- 网页版驱动而非官方 API：服务通过 Playwright 操作持久化 Chromium 会话，因此登录态、DOM 结构和 ChatGPT 网页改版都会直接影响可用性。
+- 每轮任务重播：不依赖恢复旧网页会话，而是按会话历史重新播种任务；同时由 tasks.py 保存任务目标，避免轮转或上下文压缩导致目标丢失。
+- 结束判定偏保守：结合内容 / 长度双阈值，并在回复节点仍存在 .pending / .animating token 时继续等待，降低读到半截回复的概率。
+- 工具调用单独解析：tools 不直接交给网页端，而是先注入结构化提示，再从模型文本中解析 TOOL_CALL: {...}；解析失败时回退为普通文本。
+- 会话隔离与资源回收：通过 X-ChatGPT-Session、user、User-Agent 建立会话桶，并配合 LRU 与页面池控制浏览器资源。
+- 配置与 DOM 解耦：选择器、轮询阈值、会话数量、任务快照和 Responses API 开关集中在 .env，网页版改版时优先调整配置。
 
-## 故障排查
+## 测试
 
-| 现象 | 处理 |
-| --- | --- |
-| 一直判不到结束 | 设 `CHATGPT_DEBUG=1` 看轮询日志；确认 `RESPONSE_SELECTORS` 命中 |
-| 工具调用参数被截断（如 JSON 只剩半截） | ChatGPT 逐 token 显现动画会让 `inner_text()` 取不到未显现的 token；代码已改为 `_complete_text`（去动画类后取全文）并在 `.pending` 清空前不收尾。若仍出现，检查页面是否新增了别的动画类名 |
-| 登录态失效 | `HEADLESS=0` 手动重登，profile 存在 `user_data/`；登录后**继续用 `HEADLESS=0`**（无头会被 Cloudflare 拦截） |
-| profile 被占用 | 同一时间只允许一个实例，先 `pkill` 旧进程 |
-| Codex 连接断开 | 调大客户端 `stream_idle_timeout_ms`，或调小 `RESPONSES_KEEPALIVE_S` |
-| 抓不到回复节点 | `/debug/dom` 定位，改 `.env` 里的选择器 |
-| 报「找不到输入框 / 新建对话」 | 先看启动日志里的 `[启动告警]`：若为 `命中 Cloudflare 挑战页`（title=`Just a moment...`），说明当前是无头模式，改 `HEADLESS=false`（无显示服务器用 `xvfb-run -a`）。若页面正常但仍定位失败，用 `CHATGPT_DEBUG=true` 触发 `/debug/dom` 看真实 DOM，并对照 `INPUT_SELECTORS` / `NEW_CHAT_SELECTOR` 修正选择器 |
+项目提供 tests/ 自动化测试，覆盖配置漂移、Markdown / 工具调用解析、会话管理、流式输出、Responses / Chat 路由等核心逻辑。建议修改后运行：
+
+bash
+pytest -q
+
+
+端到端浏览器行为还需要实际登录 ChatGPT 网页环境验证；自动化测试通过不代表当前网页 DOM 仍与选择器完全兼容。
 
 ## 安全
 

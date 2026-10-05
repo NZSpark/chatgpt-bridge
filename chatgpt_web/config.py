@@ -119,6 +119,13 @@ STABLE_POLLS = env_int("STABLE_POLLS", 2)
 # 次保守的兜底：仅凭“长度不再增长”收尾时要多等几轮，
 # 避免生成中途的长停顿（如长思考）被误判成结束
 LEN_STABLE_POLLS = env_int("LEN_STABLE_POLLS", 4)
+# 结束判定的「内容静默窗口」：即便停止按钮已消失 / 文本已稳定，也要求页面
+# 内容在连续这么多次轮询里**完全不再变化**才收尾。
+# 背景：ChatGPT 会分段输出——先给一段不含 TOOL_CALL 的正文，停顿一下
+# （停止按钮短暂消失、文本短暂稳定），随后**继续**输出含 TOOL_CALL 的内容。
+# 旧逻辑一看到「停止按钮消失」就立即收尾，于是把后续 TOOL_CALL 段整段丢掉。
+# 用静默窗口确认「确实不再有后续内容」后才结束；期间内容一旦恢复，计数清零。
+RESUME_QUIET_POLLS = env_int("RESUME_QUIET_POLLS", 4)
 # 连续多少次轮询既无正文也无「生成中」信号即判定页面卡死，提前失败（不再干等到总超时）
 STALL_POLLS = env_int("STALL_POLLS", 20)
 

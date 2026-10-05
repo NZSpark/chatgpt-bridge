@@ -636,6 +636,11 @@ class ChatIOMixin:
             stall_limit = max(1, int(config.STALL_POLLS))
             stalled = 0
 
+            # 内容静默计数：页面「看起来结束」后，仍要求内容连续多次不再变化才收尾。
+            # 用于区分「真的结束」与「分段输出间的短暂停顿」（后者随后会继续吐内容）。
+            quiet_count = 0
+            quiet_polls = max(1, int(config.RESUME_QUIET_POLLS))
+
             while True:
                 poll += 1
                 responses = await page.query_selector_all(config.RESPONSE_SELECTORS)
@@ -685,43 +690,67 @@ class ChatIOMixin:
                         saw_generating = True
 
                 if reply_seen:
-                    # 2.1 主判定：页面「生成中」状态。一旦观测到过「停止生成」
-                    #     控件、又发现它消失，就说明生成真正结束，可立即收尾
+                    # 2.1 探测页面「生成中」状态。True=仍在生成；False=停止按钮已消失。
                     generating = await self._page_is_generating(bucket)
                     if generating:
                         saw_generating = True
-                    elif generating is False and saw_generating and normalized:
-                        # 停止按钮消失也要确认没有尚未显现的 token，
-                        # 否则会读到被截断的半截回复（如 TOOL_CALL 的 JSON 参数）。
-                        if await self._has_pending_tokens(latest_node):
-                            if config.DEBUG:
-                                print(f"[debug] poll={poll} 停止按钮已消失，但仍有 pending token，继续等待")
-                            # 落到下面的稳定判定 / 下一轮轮询
-                        else:
-                            last_text = current_text
-                            if config.DEBUG:
-                                print(f"[debug] poll={poll} 停止按钮已消失且无 pending，判定结束")
-                            break
 
-                    # 2.2 兜底判定：文本一模一样算一轮不变；
-                    #     仅长度不再增长也算，但要更保守（多等几轮），
-                    #     以免尾部重排 / 工具栏插入导致永远等不到逐字相等
-                    # 空文本（首帧未渲染）不算「稳定」，否则会把空串当结果收尾
-                    same_text = bool(normalized) and normalized == last_normalized
-                    same_len = bool(normalized) and len(normalized) == last_len
-                    if same_text or same_len:
-                        stable_count += 1
-                        threshold = config.STABLE_POLLS if same_text else config.LEN_STABLE_POLLS
+                    # 本轮内容相对上一次是否又变了（文本不同 或 长度不同）。
+                    # 分段输出恢复时，这里会变 True，从而把静默计数清零。
+                    content_changed = (
+                        normalized != last_normalized or len(normalized) != last_len
+                    )
+                    if content_changed:
+                        quiet_count = 0
+                    elif generating is True:
+                        # 页面仍在生成（有停止按钮）也算「不安静」，不清零但阻止收尾
+                        quiet_count = 0
+                    else:
+                        quiet_count += 1
+
+                    # 停止按钮是否已消失、且无尚未显现的 token。
+                    # 注意：**不能据此立即收尾**——ChatGPT 分段输出时停止按钮会
+                    # 短暂消失，随后继续吐含 TOOL_CALL 的内容。必须再等静默窗口。
+                    pending = await self._has_pending_tokens(latest_node)
+                    settled = (
+                        generating is False
+                        and saw_generating
+                        and bool(normalized)
+                        and not pending
+                    )
+
+                    # 2.2 结束判定（基于内容连续性）：
+                    #   页面已「落定」（停止按钮消失、无 pending），且内容在
+                    #   RESUME_QUIET_POLLS 次轮询里完全不再变化 -> 确认结束。
+                    #   期间任何一次内容变化 / 重新生成中，都会把 quiet_count 清零，
+                    #   从而避免把分段间的短暂停顿误判成结束。
+                    if settled and quiet_count >= quiet_polls:
+                        last_text = current_text
+                        if config.DEBUG:
+                            print(
+                                f"[debug] poll={poll} 页面已落定且内容静默 "
+                                f"{quiet_count} 次，判定结束"
+                            )
+                        break
+
+                    # 2.2b 兜底：停止按钮始终探测不到（generating 恒为 None/False 但
+                    #     从未观测到 True）时，退回纯文本稳定判定，但同样要求静默窗口
+                    #     至少达到 max(STABLE_POLLS, RESUME_QUIET_POLLS)，比旧逻辑更保守。
+                    if not saw_generating and generating is not True:
+                        same_text = bool(normalized) and normalized == last_normalized
+                        if same_text:
+                            stable_count += 1
+                        else:
+                            stable_count = 0
+                        threshold = max(config.STABLE_POLLS, quiet_polls)
                         if stable_count >= threshold:
                             last_text = current_text
                             if config.DEBUG:
                                 print(
-                                    f"[debug] poll={poll} 内容稳定 {stable_count} 次"
-                                    f"（same_text={same_text}），判定结束"
+                                    f"[debug] poll={poll} 未观测到生成信号，"
+                                    f"内容稳定 {stable_count} 次，判定结束"
                                 )
                             break
-                    else:
-                        stable_count = 0
 
                     # 2.3 生成过程中吐出增量，供 SSE 使用。
                     #     用「已发送内容」的公共前缀做 diff，即使节点中途重排也不会漏字

@@ -173,6 +173,11 @@ class EndDetectionTestCase(unittest.TestCase):
             ("RESPONSE_TIMEOUT_S", 5.0),
             ("PARALLEL_BUCKETS", False),
             ("BUCKET_LOCK_TIMEOUT_S", 0),
+            # 内容静默窗口：测试里取小值，避免每个用例都要跑很多轮空轮询。
+            # 它只影响「要多确认几轮才收尾」，不影响「内容恢复则清零」的核心契约。
+            # 注意：必须 **大于** 测试里模拟的「短暂停顿轮数」，否则停顿还没结束
+            # 就已收尾——那正是本修复要避免的行为（真实默认值 4）。
+            ("RESUME_QUIET_POLLS", 3),
         ):
             p = unittest.mock.patch.object(config, name, value)
             p.start()
@@ -206,14 +211,40 @@ class ReplySeenViaGeneratingTests(EndDetectionTestCase):
 
 
 class GeneratingStateTests(EndDetectionTestCase):
-    def test_stop_button_disappearing_ends_immediately(self):
+    def test_stop_button_disappearing_waits_for_quiet_window(self):
+        """停止按钮消失后不能立即收尾，要等内容静默窗口走完。
+
+        旧行为：停止按钮一消失就 break（本用例会停在「答案3」）。
+        新行为：继续确认内容不再变化后才收尾，因此会读到更后面的内容。
+        """
         page = FakePage(
             baseline=["旧"],
             script=[["答案1"], ["答案2"], ["答案3"], ["答案4"]],
             generating=[True, True, False, False],
         )
         text, _ = self.run_chat(self.driver_for(page))
-        self.assertEqual(text, "答案3")
+        # 不再停在 答案3；静默窗口内内容持续变化，最终读到 答案4
+        self.assertEqual(text, "答案4")
+
+    def test_transient_pause_then_tool_call_is_not_truncated(self):
+        """核心回归（用户实测）：ChatGPT 先输出不含 TOOL_CALL 的正文，
+        停顿一下（停止按钮短暂消失），随后**继续**输出含 TOOL_CALL 的内容。
+        旧逻辑一看到停止按钮消失就收尾，把后续 TOOL_CALL 整段丢掉。
+        新逻辑基于内容连续性：停顿期间不收尾，内容恢复后继续累积。
+        """
+        page = FakePage(
+            baseline=["旧"],
+            script=[
+                ["先说明一下。"],            # poll1: 正文，生成中
+                ["先说明一下。"],            # poll2: 停顿，停止按钮消失（旧逻辑在此收尾）
+                ["先说明一下。"],            # poll3: 仍停顿
+                ['先说明一下。\nTOOL_CALL: {"name": "bash", "arguments": {"command": "ls"}}'],  # poll4: 恢复，吐出 TOOL_CALL
+            ],
+            generating=[True, False, False, False],
+        )
+        text, _ = self.run_chat(self.driver_for(page))
+        self.assertIn("TOOL_CALL", text)
+        self.assertIn('"command": "ls"', text)
 
     def test_replaced_content_detected_without_node_growth(self):
         page = FakePage(
