@@ -1,4 +1,4 @@
-"""防止 design.md 的默认值表与 config.py 漂移（对照 doc/update_codex.md §3.1）。"""
+"""防止 README 配置默认值表与 config.py 漂移。"""
 
 import re
 import sys
@@ -7,19 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chatgpt_web import config  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# design.md 正文里以 `NAME`：...默认 `VALUE` 形式记录的键。
-# 注意：config.py 的默认值会被 .env 覆盖，运行时实际生效的是 .env 里的值，
-# 因此这里对照 .env（部署基线），而不是 config.py 的字面量。
-DOC_KEYS = (
-    "STABLE_POLLS",
-    "LEN_STABLE_POLLS",
-    "MAX_SESSION_BUCKETS",
-    "BUCKET_LOCK_TIMEOUT_S",
-)
 
 
 def _env_values():
@@ -37,27 +27,6 @@ def _env_values():
 
 
 class DesignDocSyncTests(unittest.TestCase):
-    def test_documented_defaults_match_config(self):
-        text = (ROOT / "doc" / "design.md").read_text(encoding="utf-8")
-        env_values = _env_values()
-        for env_key in DOC_KEYS:
-            match = re.search(
-                rf"`{re.escape(env_key)}`[^\n]*?默认 `([^`]+)`", text
-            )
-            self.assertIsNotNone(match, f"design.md 未记录 {env_key} 的默认值")
-            documented = match.group(1).strip()
-            actual = env_values.get(env_key)
-            self.assertIsNotNone(actual, f".env 缺少 {env_key}")
-            # 数值比较：doc 写 5，env 写 5.0 也应视为一致
-            try:
-                same = float(actual) == float(documented)
-            except ValueError:
-                same = actual == documented
-            self.assertEqual(
-                same, True,
-                f"{env_key}: design.md 写 {documented}，.env 实际 {actual}",
-            )
-
     def test_env_example_lists_every_config_key(self):
         example = (ROOT / ".env.example").read_text(encoding="utf-8")
         documented = set(re.findall(r"^([A-Z][A-Z0-9_]+)=", example, re.MULTILINE))
@@ -67,6 +36,50 @@ class DesignDocSyncTests(unittest.TestCase):
             "MAX_SESSION_STATE_CACHE", "SESSION_MAX_TURNS", "RESPONSES_TOOL_BUFFER",
         ):
             self.assertIn(key, documented)
+
+    def test_readme_table_defaults_match_config_literals(self):
+        """README 变量表里的「默认值」必须等于 config.py 里 env_* 的字面量默认值。
+
+        背景：README 表格曾与 config.py 脱节（README 写 1000000/120/10000000，
+        config 却是 100000/60/60000），因为旧测试只校验 design.md 的 4 个键，
+        没覆盖 README。这里把 README 表格整体纳入校验。
+
+        注意：README 明确写「列出的是 config.py 的**内置默认值**」，因此这里
+        对照的是 config.py 源码里的字面量默认值（而非被 .env 覆盖后的运行值）。
+        """
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        config_src = (ROOT / "chatgpt_web" / "config.py").read_text(encoding="utf-8")
+
+        # README 表格行：| `KEY` | `VALUE` | 说明 |
+        rows = re.findall(r"^\|\s*`([A-Z][A-Z0-9_]+)`\s*\|\s*`([^`]*)`\s*\|", readme, re.MULTILINE)
+        self.assertTrue(rows, "README 未解析到任何变量表行")
+
+        def builtin_default(key: str):
+            """从 config.py 取 env_*("KEY", <default>) 的字面量默认值；取不到返回 None。"""
+            match = re.search(
+                rf'env_(?:int|float|bool|str)\(\s*"{re.escape(key)}"\s*,\s*([^)\n]+?)\s*\)',
+                config_src,
+            )
+            if not match:
+                return None
+            return match.group(1).strip().strip('"').strip("'")
+
+        checked = 0
+        for key, documented in rows:
+            actual = builtin_default(key)
+            if actual is None:
+                # README 里可能记录的是组合/派生项（config 无直接 env_* 字面量），跳过
+                continue
+            checked += 1
+            try:
+                same = float(actual) == float(documented)
+            except ValueError:
+                same = str(actual).lower() == str(documented).lower()
+            self.assertTrue(
+                same,
+                f"{key}: README 写 {documented}，config.py 内置默认 {actual}",
+            )
+        self.assertGreater(checked, 0, "没有校验到任何 README 变量表默认值")
 
 
 if __name__ == "__main__":

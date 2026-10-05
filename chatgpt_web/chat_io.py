@@ -628,6 +628,10 @@ class ChatIOMixin:
             latest_node = None          # 本轮最新的回复节点
             poll = 0
             deadline = asyncio.get_event_loop().time() + config.RESPONSE_TIMEOUT_S
+            # 总超时到点但页面仍在生成时，允许延长等待的剩余额度（秒）。
+            # 用光后不再延长，仍按超时处理，避免无限等待。
+            extend_budget = max(0.0, config.RESPONSE_TIMEOUT_EXTEND_S)
+            extended_printed = False
 
             cap_check_every = max(1, config.CAP_CHECK_EVERY)
 
@@ -793,6 +797,20 @@ class ChatIOMixin:
                     if last_text:
                         print("[超时] 已读取到回复内容，直接返回，不重发。")
                         break
+                    # 关键加固：页面**仍在生成**时（思考模式 / 大 prompt 常见），
+                    # 说明这一轮确实已提交并在跑，重发只会让网页多出一轮、与客户端
+                    # 状态错位。此时延长等待而不是抛超时（延长额度用光为止）。
+                    if extend_budget > 0 and await self._page_is_generating(bucket):
+                        wait = min(extend_budget, max(1.0, config.RESPONSE_TIMEOUT_S))
+                        extend_budget -= wait
+                        deadline = asyncio.get_event_loop().time() + wait
+                        if not extended_printed:
+                            print(
+                                f"[超时] 页面仍在生成，延长等待 {wait:g}s"
+                                f"（剩余可延长 {extend_budget:g}s），不重发 prompt。"
+                            )
+                            extended_printed = True
+                        continue
                     # 超时前最后确认一次是否“到顶”，否则错误信息会误导排查方向
                     if await self._page_shows_context_limit(bucket):
                         self._mark_context_limit(bucket)

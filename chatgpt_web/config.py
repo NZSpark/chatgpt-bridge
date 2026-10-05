@@ -112,6 +112,11 @@ CHAT_KEEPALIVE_S = env_float("CHAT_KEEPALIVE_S", 10.0)
 # 总超时（秒）：仅在「结束判定完全失灵 / 消息压根没发出去」时才会用到的兜底。
 # 必须小于 Pi 侧 HTTP 客户端的超时，否则客户端会先报错。可用 CHATGPT_TIMEOUT 覆盖。
 RESPONSE_TIMEOUT_S = env_float("CHATGPT_TIMEOUT", 180)
+# 总超时到点时，若页面**仍在生成**，额外延长等待的秒数（0 = 不延长，旧行为）。
+# 背景：思考模式 + 大 prompt 单轮可能超过 CHATGPT_TIMEOUT，但页面其实在正常生成。
+# 旧行为会抛 ChatGPTTimeoutError → 外层重试 → **把同一句 prompt 再发一遍**，
+# 网页于是多出一轮、与客户端状态错位。延长等待可避免这种“假超时重发”。
+RESPONSE_TIMEOUT_EXTEND_S = env_float("RESPONSE_TIMEOUT_EXTEND_S", 300)
 # 轮询间隔（秒）
 POLL_INTERVAL_S = env_float("POLL_INTERVAL_S", 1.5)
 # 兜底判定：内容（忽略首尾空白）完全相同连续这么多次即认为生成结束
@@ -220,10 +225,10 @@ TOOLS_INSTRUCTION_VERBOSE = env_bool("TOOLS_INSTRUCTION_VERBOSE", False)
 TOOLS_DESC_MAX_CHARS = env_int("TOOLS_DESC_MAX_CHARS", 200)
 # 单次 fill() 入参（整段 prompt）的最大字符数硬上限，兜底防止输入框溢出。
 # 这是发送侧最后一道护栏：无论上游怎么拼 prompt，都不超过它。0 = 不限制。
-PROMPT_MAX_CHARS = env_int("PROMPT_MAX_CHARS", 100000)
+PROMPT_MAX_CHARS = env_int("PROMPT_MAX_CHARS", 1000000)
 # 网页会话超过以下任一阈值后，下一轮自动轮转到新会话（0 表示禁用该维度）
-SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 60)
-SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 60000)
+SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 120)
+SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 10000000)
 
 
 # ==================== Responses API（Codex CLI）====================

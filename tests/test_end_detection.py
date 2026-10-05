@@ -270,6 +270,48 @@ class GeneratingStateTests(EndDetectionTestCase):
 
 
 
+class TimeoutExtensionTests(EndDetectionTestCase):
+    """来源 1 加固回归：总超时到点但页面仍在生成时，延长等待而非抛超时重发。
+
+    场景：思考模式 + 大 prompt，页面确实在生成，但首帧文本迟迟为空，
+    CHATGPT_TIMEOUT 先到。旧行为抛 ChatGPTTimeoutError -> send_chat 重试
+    -> 把同一句 prompt 再发一遍（网页多出一轮）。新行为先延长等待。
+    """
+
+    def test_still_generating_at_deadline_extends_instead_of_raising(self):
+        # 前几轮：文本仍为空、页面一直在生成（模拟首帧未渲染）。
+        # 之后：回复出现、生成结束 -> 正常收尾返回。
+        page = FakePage(
+            baseline=["旧答案"],
+            script=[
+                [""], [""], [""], [""],
+                ["迟到的答案"], ["迟到的答案"], ["迟到的答案"], ["迟到的答案"],
+            ],
+            generating=[True, True, True, True, False, False, False, False],
+        )
+        driver = self.driver_for(page)
+        with unittest.mock.patch.object(config, "RESPONSE_TIMEOUT_S", 0.05):
+            with unittest.mock.patch.object(config, "RESPONSE_TIMEOUT_EXTEND_S", 5.0):
+                with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1):
+                    text, _ = self.run_chat(driver)
+        self.assertEqual(text, "迟到的答案")
+
+    def test_extension_budget_exhausted_still_times_out(self):
+        # 页面永远在生成、但永远没有正文：延长额度用光后仍必须超时，
+        # 而不是无限等待。
+        page = FakePage(
+            baseline=["旧答案"],
+            script=[[""]],
+            generating=[True],
+        )
+        driver = self.driver_for(page)
+        with unittest.mock.patch.object(config, "RESPONSE_TIMEOUT_S", 0.05):
+            with unittest.mock.patch.object(config, "RESPONSE_TIMEOUT_EXTEND_S", 0.1):
+                with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1):
+                    with self.assertRaises(ChatGPTTimeoutError):
+                        self.run_chat(driver)
+
+
 class PendingTokenTests(EndDetectionTestCase):
     """真实故障回归：ChatGPT 逐 token 显现动画导致回复被截断。
 

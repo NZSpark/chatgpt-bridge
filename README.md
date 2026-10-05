@@ -173,12 +173,12 @@ codex --profile chatgpt
 | `MAX_SESSION_STATE_CACHE` | `64` | 内存会话状态缓存上限（LRU 逐出，0 不限） |
 | `BUCKET_IDLE_TTL_S` | `900` | 空闲回收 |
 | `PARALLEL_BUCKETS` | `false` | 各桶并行页面 |
-| `BUCKET_LOCK_TIMEOUT_S` | `0` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
+| `BUCKET_LOCK_TIMEOUT_S` | `120` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
 | `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
-| `PROMPT_MAX_CHARS` | `100000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
-| `SESSION_MAX_TURNS` | `60` | 轮数到顶阈值（0 禁用） |
-| `SESSION_MAX_TOKENS` | `60000` | 估算 token 到顶阈值（0 禁用） |
+| `PROMPT_MAX_CHARS` | `1000000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
+| `SESSION_MAX_TURNS` | `120` | 轮数到顶阈值（0 禁用） |
+| `SESSION_MAX_TOKENS` | `10000000` | 估算 token 到顶阈值（0 禁用） |
 
 > 上表列出的是 `config.py` 的**内置默认值**。实际运行时以 `.env` 为准（真实环境变量优先）；
 > 例如仓库自带 `.env` 覆盖为 `STABLE_POLLS=5`、`MAX_SESSION_BUCKETS=3`。
