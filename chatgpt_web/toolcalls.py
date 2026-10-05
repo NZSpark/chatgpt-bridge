@@ -211,14 +211,35 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "",
         "Available tools (use these exact names):",
     ]
+    from . import config
+
     for tool in tools:
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
         name = fn.get("name", "")
         desc = fn.get("description", "")
-        params = fn.get("parameters", {})
-        lines.append(f"- {name}: {desc}")
-        if params:
-            lines.append(f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
+        params = fn.get("parameters", {}) or {}
+        # 描述截断：超长描述对“选对工具”帮助有限，却显著撑大 prompt。
+        limit = config.TOOLS_DESC_MAX_CHARS
+        if limit and len(desc) > limit:
+            desc = desc[:limit] + "…"
+        if config.TOOLS_INSTRUCTION_VERBOSE:
+            # 旧行为：完整 JSON Schema（调试 / 复杂工具用）
+            lines.append(f"- {name}: {desc}")
+            if params:
+                lines.append(
+                    f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}"
+                )
+        else:
+            # 紧凑形态：`name(必填参数): 描述`。模型只要知道名字 + 有哪些必填键
+            # 就够发出正确调用；完整 schema 由客户端的 tool 定义负责，不必重述。
+            required = params.get("required") if isinstance(params, dict) else None
+            keys = ""
+            if isinstance(required, list) and required:
+                keys = ",".join(str(k) for k in required)
+            elif isinstance(params, dict) and isinstance(params.get("properties"), dict):
+                keys = ",".join(list(params["properties"].keys())[:4])
+            sig = f"{name}({keys})" if keys else name
+            lines.append(f"- {sig}: {desc}")
 
     # 输出格式：始终用纯文本 `TOOL_CALL: {json}` 行，**不要**用 ```tool_call 代码围栏。
     # 原因：ChatGPT 网页 UI 会把 markdown 代码围栏渲染成 Code snippet 组件，

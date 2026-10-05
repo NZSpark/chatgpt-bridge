@@ -161,13 +161,6 @@ SESSION_SCOPING = env_bool("SESSION_SCOPING", True)
 # 默认开：不同 AI 编程助手自动各用一条 ChatGPT 会话。关闭后退回旧的「默认桶，全局共用」行为。
 # 注意：自动分桶会使桶数随客户端数量增长，实际受 MAX_SESSION_BUCKETS 约束（超出按 LRU 回收页面，状态保留）。
 SESSION_SCOPING_BY_UA = env_bool("SESSION_SCOPING_BY_UA", True)
-# 在 UA 自动分桶时，是否再把「本轮第一条 user 消息的指纹」折进桶名。
-# 背景：Codex / Pi 这类 agent 是串行循环，所有请求 UA 相同（如 codex-tui），
-# 仅按 UA 分桶会让「上一轮没跑完、下一轮已进来」在同一条桶里排队，
-# 叠加 BUCKET_LOCK_TIMEOUT_S 后表现为反复 ChatGPTBusyError。
-# 打开后，每条逻辑会话（首条 user 消息相同视为同一会话）各用一个桶，互不排队。
-# 关闭则退化为「每个客户端一条桶」（旧行为）。
-SESSION_SCOPING_BY_UA_FINGERPRINT = env_bool("SESSION_SCOPING_BY_UA_FINGERPRINT", True)
 # 单个 key 的长度上限（防止超长头部变成文件名/JSON 键）
 SESSION_KEY_MAX_LEN = env_int("SESSION_KEY_MAX_LEN", 64)
 # 同时在用的会话桶数量上限。超出时**回收最久未用**的页面（状态保留，下次按 URL 恢复）。
@@ -219,6 +212,12 @@ SEED_ENV_NOTE = env_str(
 # Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆 ChatGPT 网页版输入框
 # （Playwright fill 超时）。超出即截断并标注。0 = 不限制（不推荐）。
 TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 20000)
+# 工具说明注入时是否输出每个工具的完整 JSON Schema。
+# 默认 false：只列 `name(必填参数): 描述`，能省下大量字符（Codex 的工具
+# schema 动辄数千字，是播种 prompt 变长的隐藏大头）。true = 旧行为（全量 schema）。
+TOOLS_INSTRUCTION_VERBOSE = env_bool("TOOLS_INSTRUCTION_VERBOSE", False)
+# 工具说明里单条描述的最大字符数（0 = 不限制）。过长的描述无助于模型选对工具。
+TOOLS_DESC_MAX_CHARS = env_int("TOOLS_DESC_MAX_CHARS", 200)
 # 单次 fill() 入参（整段 prompt）的最大字符数硬上限，兜底防止输入框溢出。
 # 这是发送侧最后一道护栏：无论上游怎么拼 prompt，都不超过它。0 = 不限制。
 PROMPT_MAX_CHARS = env_int("PROMPT_MAX_CHARS", 100000)

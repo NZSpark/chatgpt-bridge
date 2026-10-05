@@ -105,81 +105,6 @@ def _client_from_ua(ua: str) -> Optional[str]:
     return None
 
 
-def _text_of(content: Any) -> str:
-    """把一条消息的 content 归一化成纯文本（string / 分片数组 / dict 都兼容）。
-
-    只做「取文本」，不引入 responses 模块的转换逻辑，避免循环依赖。
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        pieces: List[str] = []
-        for part in content:
-            if isinstance(part, str):
-                pieces.append(part)
-            elif isinstance(part, dict):
-                text = part.get("text")
-                if isinstance(text, str):
-                    pieces.append(text)
-        return "\n".join(pieces)
-    if isinstance(content, dict):
-        text = content.get("text")
-        return text if isinstance(text, str) else ""
-    return str(content)
-
-
-def _first_user_text(request: Any) -> str:
-    """从请求里取「第一条 user 消息」的文本。
-
-    同时兼容两种请求形状：
-
-    * ``ChatCompletionRequest``：``.messages``（``/v1/chat/completions``）；
-    * ``ResponsesRequest``：``.input``（``/v1/responses``），可能是字符串，
-      也可能是 ``[{type: message, role: user, content: ...}, ...]`` 列表。
-    """
-    # 形状一：chat.completions 的 messages
-    messages = getattr(request, "messages", None)
-    if isinstance(messages, list):
-        for msg in messages:
-            if getattr(msg, "role", None) != "user":
-                continue
-            text = _text_of(getattr(msg, "content", None))
-            if text.strip():
-                return text
-
-    # 形状二：responses 的 input
-    raw_input = getattr(request, "input", None)
-    if isinstance(raw_input, str) and raw_input.strip():
-        return raw_input
-    if isinstance(raw_input, list):
-        for item in raw_input:
-            if isinstance(item, str) and item.strip():
-                return item
-            if isinstance(item, dict) and item.get("role") == "user":
-                text = _text_of(item.get("content"))
-                if text.strip():
-                    return text
-    return ""
-
-
-def _conversation_fingerprint(request: Any) -> str:
-    """从本轮请求里取一个稳定的「逻辑会话」指纹。
-
-    取第一条 user 消息的内容做哈希：同一个 agent 循环里，首条 user 消息
-    （任务目标 / 系统注入的首条指令）在多轮之间保持不变，而不同任务/不同
-    会话会不同。这样同一逻辑会话落在同一个桶（保住上下文连续性），
-    不同逻辑会话各自一个桶（互不排队）。
-
-    注意：tool / assistant 消息不参与，避免多轮之间指纹漂移导致每轮都换桶。
-    """
-    text = _first_user_text(request)
-    if not text:
-        return ""
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
-
-
 def _session_key(
     request: ChatCompletionRequest,
     header_value: Optional[str],
@@ -192,10 +117,11 @@ def _session_key(
     1. ``X-ChatGPT-Session`` 请求头（可用 ``SESSION_KEY_HEADER`` 改名）；
     2. OpenAI 的 ``user`` 字段；
     3. **自动识别**：从 ``User-Agent`` 提取客户端名称，使不同客户端自动隔离。
-       （``SESSION_SCOPING_BY_UA_FINGERPRINT=true`` 时再折进逻辑会话指纹，
-       让同一客户端的多个 agent 会话各用一个桶，互不排队。）
 
     前两者都没有、且 User-Agent 也无法识别时返回 None（默认桶，全局共用）。
+
+    注意：**同一个客户端（同一 UA）永远只用一个桶**。绝不按消息内容再去拆分，
+    否则同一个 agent 任务的各轮会被拆到不同会话，丢掉上下文连续性。
     取值会被消毒（只保留 ``[\\w.\\-:]``）并限长，避免变成非法文件名 / 超长 JSON 键。
     """
     if not config.SESSION_SCOPING:
@@ -207,15 +133,7 @@ def _session_key(
     raw = raw.strip()
     if not raw and config.SESSION_SCOPING_BY_UA:
         # 自动按 User-Agent 分桶：不同客户端自动隔离到不同会话（可由参数关闭）
-        client = _client_from_ua(user_agent or "")
-        if client:
-            raw = client
-            if config.SESSION_SCOPING_BY_UA_FINGERPRINT:
-                # 同一客户端的多个逻辑会话（不同首条 user 消息）各用一个桶，
-                # 避免 agent 串行循环里「上一轮未完成、下一轮已到」在同桶排队。
-                fp = _conversation_fingerprint(request)
-                if fp:
-                    raw = f"{client}:{fp}"
+        raw = _client_from_ua(user_agent or "") or ""
     if not raw:
         return None
     sanitized = re.sub(r"[^\w.\-:]", "_", raw)[: max(1, config.SESSION_KEY_MAX_LEN)]

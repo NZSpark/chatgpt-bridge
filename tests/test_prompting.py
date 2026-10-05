@@ -1,6 +1,5 @@
 import unittest
-
-
+from unittest import mock
 
 
 class ToolResultFidelityTests(unittest.TestCase):
@@ -35,7 +34,8 @@ class ToolsInstructionDesignTests(unittest.TestCase):
     否则模型又会退回「直接作答」：
       1. 必须明确切断退路（“你没有直接的 shell/文件系统访问，唯一方式是 TOOL_CALL”）；
       2. 必须给出**具体到参数**的调用示例（只给格式模板不够）；
-      3. 工具清单里每个工具的参数 schema 要带上；
+      3. 工具清单里每个工具的必填参数要带上（默认紧凑形态；完整 schema 由
+         TOOLS_INSTRUCTION_VERBOSE 控制）；
       4. 工具说明要放在**用户任务之前**，别被用户消息隔开。
     """
 
@@ -70,10 +70,23 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         self.assertIn('"name": "bash"', text)
         self.assertIn('"command"', text)
 
-    def test_instruction_lists_parameters_schema(self):
+    def test_instruction_lists_required_params_compactly(self):
+        """默认紧凑形态：只列 name(必填参数)，不 dump 完整 JSON Schema。"""
+        from chatgpt_web import config
         from chatgpt_web.toolcalls import format_tools_instruction
 
-        text = format_tools_instruction(self.TOOLS)
+        with mock.patch.object(config, "TOOLS_INSTRUCTION_VERBOSE", False):
+            text = format_tools_instruction(self.TOOLS)
+        self.assertIn("bash(command)", text)
+        self.assertNotIn("parameters (JSON Schema)", text)
+
+    def test_instruction_lists_parameters_schema_when_verbose(self):
+        """打开 VERBOSE 时回退到完整 JSON Schema（调试用）。"""
+        from chatgpt_web import config
+        from chatgpt_web.toolcalls import format_tools_instruction
+
+        with mock.patch.object(config, "TOOLS_INSTRUCTION_VERBOSE", True):
+            text = format_tools_instruction(self.TOOLS)
         self.assertIn("parameters (JSON Schema)", text)
         self.assertIn('"required"', text)
 
