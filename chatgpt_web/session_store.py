@@ -23,6 +23,10 @@ class SessionState:
     cap_hit: bool = False
     pending_rotation: bool = False
     last_error: Optional[str] = None
+    # 连续“到顶”失败次数：播种过大时会陷入「到顶→失败→下轮仍播种→再
+    # 到顶」的死循环。累计到阈值后，重试时会改用更小的播种预算。成功
+    # 收到回复或轮转到新会话时清零。
+    cap_failures: int = 0
     updated_at: int = 0
 
     def to_payload(self) -> Dict[str, Any]:
@@ -36,7 +40,7 @@ class SessionState:
         for name in ("has_history", "cap_hit", "pending_rotation"):
             if name in payload:
                 setattr(state, name, bool(payload.get(name)))
-        for name in ("turns", "est_tokens", "updated_at"):
+        for name in ("turns", "est_tokens", "updated_at", "cap_failures"):
             try:
                 setattr(state, name, int(payload.get(name) or 0))
             except (TypeError, ValueError):
@@ -211,6 +215,8 @@ class SessionStoreMixin:
             "cap_hit": state.cap_hit,
             "pending_rotation": state.pending_rotation,
             "last_error": state.last_error,
+            # 连续“到顶”失败次数：>=2 时播种内容会被自动压缩（防死循环）
+            "cap_failures": getattr(state, "cap_failures", 0),
             "buckets": self.session_keys(),
         }
 

@@ -102,6 +102,12 @@ class ChatIOMixin:
 
             # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文
             active_prompt = seeded if not self._state(bucket).has_history else prompt
+            # 防死循环：若这个会话桶连续多次“到顶”，说明播种内容仍超过网页版
+            # 能承受的上下文。此时把播种 prompt 进一步压缩（保留头部说明 + 尾部
+            # 最近内容），否则会陷入「到顶→失败→下轮仍播种→再到顶」的死循环。
+            active_prompt = self._shrink_seed_if_repeated_cap(
+                bucket, active_prompt, is_seed=not self._state(bucket).has_history
+            )
             # 记录真正要发出的那份 prompt，供上层估算 usage（按桶隔离，避免并发串台）
             self._last_prompts[bucket] = active_prompt
 
@@ -111,8 +117,16 @@ class ChatIOMixin:
             except ChatGPTContextLimitError as exc:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
                 last_error = exc
-                self._state(bucket).pending_rotation = True
-                print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限。")
+                state = self._state(bucket)
+                state.pending_rotation = True
+                state.cap_failures = getattr(state, "cap_failures", 0) + 1
+                if state.cap_failures >= 2:
+                    print(
+                        f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限"
+                        f"（连续 {state.cap_failures} 次，下次将压缩播种内容）。"
+                    )
+                else:
+                    print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限。")
             except ChatGPTTimeoutError as exc:
                 # 只有「超时 / 到顶」才可重试；找不到输入框、profile 被占用等不可重试
                 last_error = exc
@@ -122,6 +136,38 @@ class ChatIOMixin:
         if last_error is not None:
             raise last_error
         raise RuntimeError("上游请求未能发送")
+
+    def _shrink_seed_if_repeated_cap(
+        self, bucket: str, prompt: str, is_seed: bool
+    ) -> str:
+        """连续“到顶”时把播种 prompt 压得更小，避免陷入死循环。
+
+        背景：会话没有历史（``has_history=False``）时每轮都必须播种。若播种内容
+        本身就超过网页版能承受的上下文，就会出现「播种→到顶→失败→下轮仍播种」
+        的循环，``has_history`` 永远无法置 True。
+
+        这里在 ``cap_failures >= 2`` 后逐步压缩：保留头部说明（模型需要知道
+        工具约定与上下文重建头）与尾部最近内容（真实任务通常在最后），砍掉中段。
+        阈值 ``2`` 与下限由常量控制；非播种 prompt（增量）不受影响。
+        """
+        if not is_seed:
+            return prompt
+        failures = getattr(self._state(bucket), "cap_failures", 0)
+        if failures < 2:
+            return prompt
+        # 每次连续失败进一步收紧：2 次 -> 半量，3 次 -> 1/4，最低 2000 字符
+        keep = max(2000, len(prompt) // (2 ** (failures - 1)))
+        if len(prompt) <= keep:
+            return prompt
+        head = keep // 2
+        tail = keep - head
+        marker = "\n\n…（播种内容因连续到顶已压缩中段，仅保留开头与最近内容）…\n\n"
+        shrunk = prompt[:head] + marker + prompt[-tail:]
+        print(
+            f"[恢复] 会话连续到顶 {failures} 次，播种 prompt 压缩："
+            f"{len(prompt)} -> {len(shrunk)} 字符。"
+        )
+        return shrunk
 
     @staticmethod
     def _strip_code_noise(code_content: str, lang: str) -> str:
@@ -269,11 +315,30 @@ class ChatIOMixin:
     }
     """
 
-    async def _dispatch_enter(self, chat_input) -> bool:
-        """在页面内对输入框派发 Enter 键事件（纯 DOM，不碰 OS 焦点）。
+    async def _keyboard_enter(self, page) -> bool:
+        """用真实键盘事件提交（首选）。
 
-        不用 page.keyboard.press：那是全局键盘通道，窗口不在前台时按键会
-        落到别的应用，逼得代码去抢前台（bring_to_front），干扰用户其它窗口。
+        合成 KeyboardEvent（dispatchEvent）的 isTrusted=false，ProseMirror 的
+        keymap 会直接忽略——尤其当 prompt 含换行、composer 内已分成多段时，
+        合成 Enter 更可能被当成「软换行/新段」而非提交。真实键盘 Enter 才能
+        稳定触发 ProseMirror 的提交 handler。
+
+        之所以敢用全局键盘通道：_call_fill 已经 click() 聚焦过 composer，
+        焦点就在输入框上，Enter 会落到它。这里不调 bring_to_front，窗口不在
+        前台也不影响——Playwright 的 keyboard 事件走 CDP，不依赖 OS 前台焦点。
+        """
+        if page is None:
+            return False
+        try:
+            await page.keyboard.press("Enter")
+            return True
+        except Exception:
+            return False
+
+    async def _dispatch_enter(self, chat_input) -> bool:
+        """兜底：在页面内对输入框派发合成 Enter 键事件（纯 DOM）。
+
+        合成事件对 ProseMirror 常被忽略，仅作真实键盘 Enter 不可用时的退路。
         """
         if chat_input is None:
             return False
@@ -297,14 +362,205 @@ class ChatIOMixin:
                 continue
         return False
 
+    async def _find_input(self, page):
+        """按 INPUT_SELECTORS 回退链定位输入框；找不到返回 None。
+
+        调试要点：这里所有失败都必须**打印**，否则 _fill_prompt 报
+        "多次重试后仍为空" 时完全无法区分是「定位不到输入框」还是
+        「fill 后读到空」。真实环境的 composer 可能是 shadow DOM /
+        iframe，或选择器全部落空。
+        """
+        errors = []
+        for selector in config.INPUT_SELECTORS:
+            try:
+                # 关键：用 state="attached" 而非默认的 "visible"。
+                # 实测 ChatGPT 的 ProseMirror composer（div#prompt-textarea）
+                # 经常被判定为 not visible（y 为大幅负值、高度异常），
+                # 用默认 "visible" 会永远等不到、直接超时。
+                el = await page.wait_for_selector(
+                    selector, timeout=2000, state="attached"
+                )
+                if el:
+                    if config.DEBUG:
+                        print(f"[输入] 命中选择器：{selector}")
+                    return el
+                errors.append(f"{selector}: 未命中")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{selector}: {exc}")
+                continue
+        print("[输入] 未找到输入框，尝试过的选择器：")
+        for line in errors:
+            print(f"        - {line}")
+        return None
+
+    async def _fill_prompt(self, page, prompt: str):
+        """填充输入框并返回可用的句柄；成功返回句柄，失败返回 None。
+
+        ``fill`` 对 ChatGPT 的 React ``contenteditable`` composer 不可靠：
+        新建对话 / 节点重挂载后，之前拿到的句柄可能已失效，``fill`` 会一直
+        等到超时（ElementHandle.fill: Timeout 30000ms exceeded）。这里每次
+        重试都**重新定位**输入框，并对填完的内容做非空校验。
+        """
+        retries = max(1, config.FILL_RETRIES)
+        timeout = max(1000, config.FILL_TIMEOUT_MS)
+        for attempt in range(retries):
+            chat_input = await self._find_input(page)
+            if not chat_input:
+                print(f"[输入] 第 {attempt + 1}/{retries} 次重试：未定位到输入框。")
+                await asyncio.sleep(0.5)
+                continue
+            try:
+                await self._call_fill(page, chat_input, prompt, timeout)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[输入] 第 {attempt + 1}/{retries} 次输入失败：{exc!r}")
+                await asyncio.sleep(0.5)
+                continue
+            # contenteditable 的 fill 可能“成功”但内容为空，必须校验。
+            # 真实 composer 读到空时，额外用 input_value/value 兜底探测。
+            try:
+                text = await self._complete_text(chat_input)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[输入] 第 {attempt + 1}/{retries} 次读取文本异常：{exc!r}")
+                text = ""
+            if text and text.strip():
+                if config.DEBUG:
+                    print(f"[输入] fill 成功，读到 {len(text)} 字符。")
+                return chat_input
+            print(
+                f"[输入] fill 第 {attempt + 1}/{retries} 次后内容为空"
+                f"（读到 {text!r}），重试。"
+            )
+            await asyncio.sleep(0.5)
+        return None
+
+    @staticmethod
+    async def _call_fill(page, chat_input, prompt: str, timeout: int) -> None:
+        """向 composer 输入文本。
+
+        实测 ChatGPT 的 composer 是 ProseMirror（div#prompt-textarea），
+        ``ElementHandle.fill()`` 对它不可靠：受控组件不吃直接设值，且元素常被
+        判定为 not visible 导致 fill 超时。正确做法是聚焦后逐字 ``insert_text``
+        （触发 beforeinput/input 事件，ProseMirror 才会更新内部 state）。
+
+        优先 click 聚焦；元素不可见/被遮挡时退回 JS focus，再插入文本。
+        """
+        focused = False
+        try:
+            await chat_input.click(timeout=timeout)
+            focused = True
+        except Exception:  # noqa: BLE001
+            try:
+                await chat_input.evaluate("(el) => el.focus()")
+                focused = True
+            except Exception:  # noqa: BLE001
+                focused = False
+        if not focused:
+            raise RuntimeError("无法聚焦输入框（click 与 JS focus 均失败）")
+        await ChatIOMixin._clear_input(page, chat_input)
+        await page.keyboard.insert_text(prompt)
+
+    @staticmethod
+    async def _read_input_text(chat_input) -> str:
+        """读取 composer 当前文本；任何异常都当作「读不到」返回空串。"""
+        try:
+            text = await chat_input.evaluate(
+                "(el) => el.innerText ?? el.textContent ?? el.value ?? ''"
+            )
+            return text or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    async def _clear_input(page, chat_input) -> None:
+        """把 composer 清空到「读到的文本为空」为止。
+
+        ProseMirror 会把草稿持久化到浏览器存储，重新进入页面 / 新建对话后
+        输入框里可能残留上一次没发出去的内容；若不清空，``insert_text`` 会
+        把它和新 prompt 拼在一起发出去。
+
+        单一手法都不可靠：Control+A 在 macOS 上未必被识别、Meta+A 在其它
+        平台无意义、Backspace 对空段落无效、DOM 直接改 textContent 会被
+        ProseMirror 回滚。这里组合使用并**循环校验**，直到读回空串。
+        """
+        max_rounds = 3
+        for round_index in range(max_rounds):
+            if not (await ChatIOMixin._read_input_text(chat_input)).strip():
+                return
+            # 手法 1：全选后删除。两个平台的修饰键都按一遍，谁生效算谁。
+            for modifier in ("Control+A", "Meta+A"):
+                try:
+                    await page.keyboard.press(modifier)
+                    await page.keyboard.press("Backspace")
+                except Exception:  # noqa: BLE001
+                    pass
+            # 手法 2：Playwright 的 fill("") 对可编辑元素会派发清空输入事件
+            try:
+                await chat_input.fill("")
+            except Exception:  # noqa: BLE001
+                pass
+            # 手法 3：JS 清空并派发 input 事件，让 ProseMirror 同步内部 state
+            try:
+                await chat_input.evaluate(
+                    """
+                    (el) => {
+                      el.focus();
+                      if (el.isContentEditable) {
+                        el.innerHTML = '';
+                      } else {
+                        el.value = '';
+                      }
+                      el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, cancelable: true, inputType: 'deleteContentBackward',
+                      }));
+                    }
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.1)
+        leftover = (await ChatIOMixin._read_input_text(chat_input)).strip()
+        if leftover:
+            print(
+                f"[输入] 警告：清空输入框后仍读到残留内容（{leftover[:80]!r}），"
+                "新 prompt 可能被拼接。"
+            )
+
     async def _submit_prompt(self, page, chat_input) -> None:
-        """提交 prompt：先派发 Enter，无效再点发送按钮。全程无窗口焦点依赖。"""
+        """提交 prompt：真实键盘 Enter → 合成事件 → 点发送按钮。
+
+        首选真实键盘 Enter：合成 KeyboardEvent 对 ProseMirror 不可靠，
+        prompt 含换行时合成 Enter 会被当成软换行而非提交（见 _keyboard_enter）。
+        """
+        if await self._keyboard_enter(page):
+            return
         if await self._dispatch_enter(chat_input):
             return
         if not await self._click_send_button(page):
             raise RuntimeError(
-                "无法提交 prompt：输入框 Enter 事件无效，且未找到发送按钮。"
+                "无法提交 prompt：键盘 Enter、输入框 Enter 事件均无效，"
+                "且未找到发送按钮。"
             )
+
+    @staticmethod
+    def _clamp_prompt(prompt: str) -> str:
+        """发送侧最后一道护栏：把整段 prompt 压到输入框能承受的字符上限内。
+
+        ChatGPT 网页版 composer 有字符上限，超出后 Playwright ``fill`` 会超时
+        （ElementHandle.fill: Timeout 30000ms exceeded）。这里保留**头部**
+        （系统/工具说明、任务目标通常在前）与**尾部**（最新用户指令）各一半，
+        中间截断并标注，保证最新指令一定送达。
+        """
+        limit = config.PROMPT_MAX_CHARS
+        if not limit or len(prompt) <= limit:
+            return prompt
+        head = limit // 2
+        tail = limit - head
+        dropped = len(prompt) - limit
+        return (
+            prompt[:head]
+            + f"\n\n…（prompt 过长，已省略中间 {dropped} 字符）\n\n"
+            + prompt[-tail:]
+        )
 
     async def _send_chat_locked(self, prompt: str, on_delta=None,
                                 key: Optional[str] = None) -> tuple[str, List[dict]]:
@@ -325,18 +581,7 @@ class ChatIOMixin:
             # 1. 定位输入框。只做 DOM 查询与重试，绝不 bring_to_front / focus：
             #    那会抢 OS 前台、干扰用户正在使用的其它窗口；而提交走页面内
             #    事件派发（见 _submit_prompt），本就不依赖窗口是否在前台。
-            chat_input = None
-            for attempt in range(3):
-                for selector in config.INPUT_SELECTORS:
-                    try:
-                        chat_input = await page.wait_for_selector(selector, timeout=2000)
-                        if chat_input:
-                            break
-                    except Exception:
-                        continue
-                if chat_input:
-                    break
-
+            chat_input = await self._find_input(page)
             if not chat_input:
                 raise RuntimeError("无法找到对话输入框，请检查 ChatGPT 网页是否打开或处于登录状态。")
 
@@ -355,7 +600,16 @@ class ChatIOMixin:
             except Exception:
                 before_text = ""
 
-            await chat_input.fill(prompt)
+            prompt = self._clamp_prompt(prompt)
+            # 用带「重新定位 + 非空校验」的重试填充，规避 React 重挂载后
+            # 旧句柄失效导致的 fill 超时（新会话首轮尤其常见）。
+            filled = await self._fill_prompt(page, prompt)
+            if filled is None:
+                raise RuntimeError(
+                    "填充输入框失败（多次重试后仍为空或 fill 超时）。"
+                    "请检查登录状态与 INPUT_SELECTORS 配置。"
+                )
+            chat_input = filled
             await self._submit_prompt(page, chat_input)
 
             # 2. 轮询等待回复完成
@@ -523,6 +777,8 @@ class ChatIOMixin:
             state.turns += 1
             state.est_tokens += estimate_tokens(prompt) + estimate_tokens(last_text)
             state.last_error = None
+            # 成功建立历史：清空连续到顶计数，恢复正常预算
+            state.cap_failures = 0
             if self._session_over_budget(bucket):
                 state.pending_rotation = True
                 print(

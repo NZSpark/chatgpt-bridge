@@ -75,7 +75,13 @@ class DefaultValueTests(unittest.TestCase):
         joined = " ".join(config.INPUT_SELECTORS) + config.READY_SELECTOR + config.NEW_CHAT_SELECTOR
         self.assertNotIn("ds-markdown", joined)
         self.assertNotIn("deepseek", joined.lower())
-        self.assertIn("contenteditable", config.READY_SELECTOR)
+        # 真实 DOM 校准后：composer 是 ProseMirror（#prompt-textarea），
+        # READY_SELECTOR 覆盖它就绪即可，不再强求含 contenteditable 字面量。
+        self.assertTrue(
+            "prompt-textarea" in config.READY_SELECTOR
+            or "ProseMirror" in config.READY_SELECTOR
+            or "contenteditable" in config.READY_SELECTOR
+        )
 
     def test_response_selectors_are_chatgpt(self):
         self.assertIn("message-content", config.RESPONSE_SELECTORS)

@@ -41,8 +41,49 @@ class CompletionMixin:
         self.session_cap_hit = False
         print("[系统提示] 服务启动成功！请确保 ChatGPT 页面保持登录状态。\n")
 
+    async def _warn_if_blocked(self, page) -> None:
+        """启动后自检：页面是否被 Cloudflare 挑战页 / 登录页挡住。
+
+        实测 HEADLESS=1 时 ChatGPT 返回 ``title="Just a moment..."`` 的
+        Cloudflare 挑战页（body 为空、按钮数 0、composer 不渲染），随后所有
+        选择器都会落空。这里提前检测并给出可操作的告警，避免用户面对
+        "找不到输入框/新建对话" 却无从下手。
+        """
+        try:
+            title = (await page.title()) or ""
+            n_buttons = await page.evaluate(
+                "() => document.querySelectorAll('button, a, [role=button]').length"
+            )
+        except Exception:  # noqa: BLE001
+            return
+        blocked = (
+            "just a moment" in title.lower()
+            or "attention required" in title.lower()
+        )
+        if blocked or n_buttons == 0:
+            reason = (
+                "命中 Cloudflare 挑战页" if blocked
+                else "页面无任何可点击元素（可能未登录 / 被风控 / 仍在加载）"
+            )
+            print(
+                "\n[启动告警] ChatGPT 页面疑似不可用：" + reason + "\n"
+                + f"  title={title!r}  可点击元素={n_buttons}\n"
+                + "  对策：用有头模式运行（.env 设 HEADLESS=false）；"
+                + "无显示服务器请用 `xvfb-run -a python chatgpt_api_server.py`。\n"
+                + "  若仍未登录，请先 HEADLESS=false 手动登录一次，"
+                + "登录态会存入 user_data/。\n"
+            )
+
     async def _open_new_chat(self, page) -> None:
-        """点击「新建对话」，确保从干净会话开始（点不到就沿用当前页）。"""
+        """点击「新建对话」，确保从干净会话开始（点不到就沿用当前页）。
+
+        调试要点：旧实现失败时完全静默，无法区分「选择器全落空」还是
+        「按钮存在但不可点」。这里逐个选择器打印匹配结果，并明确指出
+        是点不到还是异常。新版 ChatGPT 的入口是
+        ``<a data-testid="create-new-chat-button">``（不是 button，
+        aria-label 也可能为空），所以按 testid 优先的顺序尝试。
+        """
+        errors = []
         for selector in config.NEW_CHAT_SELECTOR.split("||"):
             selector = selector.strip()
             if not selector:
@@ -50,13 +91,26 @@ class CompletionMixin:
             try:
                 button = await page.wait_for_selector(selector, timeout=3000)
                 if button:
-                    await button.click()
+                    try:
+                        await button.click(timeout=3000)
+                    except Exception as click_exc:  # noqa: BLE001
+                        # 侧边栏图标常被相邻 <svg> 覆盖导致 click 被拦截；
+                        # 退回 JS 原生 click，避免在 30s 可见性重试上卡死。
+                        try:
+                            await button.evaluate("(el) => el.click()")
+                        except Exception:  # noqa: BLE001
+                            raise click_exc
                     await asyncio.sleep(0.5)
+                    if config.DEBUG:
+                        print(f"[会话] 已点击新建对话：{selector}")
                     return
-            except Exception:
+                errors.append(f"{selector}: 未命中")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{selector}: {exc!r}")
                 continue
-        if config.DEBUG:
-            print("[debug] 未找到新建对话按钮，沿用当前会话页。")
+        print("[会话] 未找到新建对话按钮，沿用当前会话页。尝试过的选择器：")
+        for line in errors:
+            print(f"        - {line}")
 
     async def _start_new_session(self, key: Optional[str] = None) -> None:
         """轮转到新会话，并重置会话状态（调用方必须使用“播种”prompt）。"""

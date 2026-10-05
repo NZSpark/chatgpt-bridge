@@ -24,16 +24,50 @@ from chatgpt_web.driver import ChatGPTTimeoutError, ChatGPTWebDriver  # noqa: E4
 
 
 class FakeInput:
-    async def fill(self, text):
+    def __init__(self):
+        self.text = ""
+
+    async def fill(self, text, **kwargs):
+        # 真 Playwright 的 ElementHandle.fill(value, timeout=...) 接受 timeout；
+        # 这里同样吞掉任意关键字参数，避免生产代码传 timeout= 时触发 TypeError。
+        self.text = text
+        return None
+
+    async def click(self, **kwargs):
+        # _call_fill 会先 click 聚焦；假件直接视为成功。
         return None
 
     async def evaluate(self, script):
-        # _dispatch_enter 的脚本会派发 Enter 键事件；假节点只回报“已派发”。
-        return True
+        # _dispatch_enter（兜底合成事件）的脚本派发 Enter；
+        # _complete_text 的脚本返回当前文本。
+        if "dispatchEvent" in script or "Enter" in script:
+            return True
+        # _call_fill 的兜底聚焦脚本含 focus()
+        if "focus()" in script:
+            return None
+        return self.text
 
 
 class FakeKeyboard:
+    def __init__(self):
+        # 指向 FakePage 最近一次定位到的输入框，insert_text 写回它的 text。
+        self.current_input = None
+        # 记录是否用真实键盘 Enter 提交过（_submit_prompt 的首选路径）。
+        self.submitted = False
+
     async def press(self, key):
+        # Control+A / Meta+A / Backspace 清空草稿：这里把内容清掉以模拟。
+        if key in ("Backspace",) and self.current_input is not None:
+            self.current_input.text = ""
+        # 真实键盘 Enter 是提交首选路径（见 chat_io._keyboard_enter）。
+        if key == "Enter":
+            self.submitted = True
+        return None
+
+    async def insert_text(self, text):
+        # _call_fill 用 keyboard.insert_text 向 ProseMirror composer 输入。
+        if self.current_input is not None:
+            self.current_input.text = (self.current_input.text or "") + text
         return None
 
 
@@ -88,7 +122,12 @@ class FakePage:
         self.keyboard = FakeKeyboard()
 
     async def wait_for_selector(self, selector, timeout=0, **kwargs):
-        return FakeInput()
+        # 每次定位返回同一个输入框句柄，并把 keyboard 指向它，
+        # 这样 _call_fill 里的 keyboard.insert_text 能写回 _complete_text 读到的对象。
+        if not hasattr(self, "_input"):
+            self._input = FakeInput()
+        self.keyboard.current_input = self._input
+        return self._input
 
     async def query_selector_all(self, selector):
         index = self.query_calls

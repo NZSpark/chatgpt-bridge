@@ -179,10 +179,37 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
 
 
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
-    """把 OpenAI tools 描述转换成注入网页版的自然语言指令。"""
+    """把 OpenAI tools 描述转换成注入网页版的自然语言指令。
+
+    实测（联网真机验证）：模型很容易**无视工具、直接凭知识作答**——例如问它
+    “查看当前目录”时，它会直接编一份 ls 输出，parse 结果为空。让模型真正调用
+    工具的关键有三点：
+      1. 明确切断退路：“你没有直接的 shell/文件系统访问，唯一方式是输出
+         TOOL_CALL 行，直接作答＝任务失败”；
+      2. 给一个**具体到参数**的调用示例（只给格式模板不够）；
+      3. 指令要短、聚焦，长段 meta 说明会稀释掉核心要求。
+    因此这里把命令式要求 + 工具清单 + 具体示例放在一起，规则尽量精简。
+    """
+    # 示例要带真实工具名和参数键，否则模型不认；但值必须是「一眼就知道要替换」的
+    # 占位符——用 <command> 这种形式模型会原样照抄，把占位符当命令发出来
+    # （实测：shell 收到字面量 <command> 直接语法报错）。这里用 "..." 并显式声明。
+    first = tools[0] if tools else {}
+    fn0 = first.get("function", first) if isinstance(first, dict) else {}
+    example_name = fn0.get("name") or "tool_name"
+    props = (fn0.get("parameters") or {}).get("properties") or {}
+    example_args = {key: "..." for key in list(props.keys())[:2]} or {}
+    example_call = "TOOL_CALL: " + json.dumps(
+        {"name": example_name, "arguments": example_args}, ensure_ascii=False
+    )
+
     lines = [
         "[Tool Calling Instructions]",
-        "You can call the following tools to complete the task (valid for this turn):",
+        "You are an agent connected to external tools. You have NO direct access to a shell,",
+        "filesystem, or the internet — the ONLY way to perform an action or fetch real data is",
+        "to emit a TOOL_CALL line. If the task needs a tool and you answer from your own",
+        "knowledge instead, the task FAILS. Never fabricate tool output.",
+        "",
+        "Available tools (use these exact names):",
     ]
     for tool in tools:
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
@@ -193,22 +220,24 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         if params:
             lines.append(f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
 
-    # Always use a plain-text `TOOL_CALL: {json}` line, **never** a ```tool_call code fence.
-    # Reason: the ChatGPT web UI renders markdown code fences as a Code snippet component,
-    # corrupting the fence/newlines when the DOM text is retrieved and breaking tool_call
-    # parsing; plain text lines are not rendered as code blocks and come back verbatim.
-    # The parser (_TOOL_CALL_LINE_RE) already treats that form as the preferred one.
+    # 输出格式：始终用纯文本 `TOOL_CALL: {json}` 行，**不要**用 ```tool_call 代码围栏。
+    # 原因：ChatGPT 网页 UI 会把 markdown 代码围栏渲染成 Code snippet 组件，
+    # 取 DOM 文本时围栏/换行被破坏，导致解析失败；纯文本行不会被渲染成代码块，
+    # 能原样取回。解析器（_TOOL_CALL_LINE_RE）已把它作为首选形态。
     lines += [
         "",
-        "When you need to call a tool, output only one or more of the following format as **plain text lines** (no code fences, "
-        "do not add ```):",
-        "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
-        "arguments must be valid JSON: double quotes inside strings must be escaped as \\\" (backslash+quote), "
-        "never write a bare double quote;",
-        "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
-        "to avoid a clash between double quotes in the command and the JSON boundary quotes;",
-        "one call per line; you may output multiple lines to call multiple tools in parallel; do not output extra explanation outside the TOOL_CALL lines.",
-        "If you do not need to call any tool, just give the final answer directly; do not output a TOOL_CALL line.",
+        "To call a tool, output ONLY the following as a plain-text line (no code fences):",
+        example_call,
+        "(In the example above, \"...\" is a placeholder: replace it with the real value.",
+        "Do NOT copy the example literally.)",
+        "Rules:",
+        "- `arguments` must be a valid JSON object matching the tool's parameters.",
+        "- Inside JSON strings, escape double quotes as \\\" and newlines as \\n.",
+        "- For shell commands, prefer single quotes inside the command.",
+        "- You may output several TOOL_CALL lines to call multiple tools at once.",
+        "- When you call a tool, output ONLY the TOOL_CALL line(s): no explanation, no preamble.",
+        "- Only if the task needs no tool at all, answer directly with no TOOL_CALL line.",
+        "- Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter> — they will not be executed.",
     ]
     return "\n".join(lines)
 
@@ -217,18 +246,19 @@ def format_tool_call_emphasis() -> str:
     """Format-emphasis block placed at the start of the seed prompt for a new / reset session.
 
     A new bucket has no history turns that demonstrate the correct format, so the model is
-    most likely to fall back to native DSML markers at that point; repeating the full format
-    is a second safeguard.
+    most likely to fall back to native DSML markers (or ignore tools entirely) at that point;
+    repeating the mandate + full format is a second safeguard.
     """
     return "\n".join([
         "[Output Format Emphasis] This is a new session (or one that was just reset); the following rules stay in effect for this whole session:",
-        "When you need to call a tool, output only the following format as **plain text lines** (no code fences, do not add ```):",
+        "You MUST use the provided tools whenever the task needs real action or data; never fabricate tool output.",
+        "To call a tool, output only the following format as **plain text lines** (no code fences, do not add ```):",
         "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
-        "arguments must be valid JSON: double quotes inside strings must be escaped as \\\" (backslash+quote), "
-        "never write a bare double quote; otherwise the web UI renders the content as code and the arguments get truncated.",
+        "arguments must be valid JSON: escape double quotes inside strings as \\\" and newlines as \\n; never write a bare double quote or a raw newline inside a JSON string.",
         "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
         "to avoid a clash between double quotes in the command and the JSON boundary quotes.",
         "Use the tool names exactly as listed in [Tool Calling Instructions]; do not invent generic names like bash / shell.",
+        "Output only the TOOL_CALL line(s) when calling a tool: no explanation, no preamble.",
         "Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter>, <tool_calls> - they will not be executed.",
     ])
 
@@ -445,27 +475,79 @@ _NAME_ARG_COMMAND_RE = re.compile(
 )
 
 
-def _salvage_single_string_arg(raw: str):
-    """Salvage objects shaped like {"name": X, "arguments": {"<key>": "<body>"}}.
+# 前面已完整闭合的字符串参数对，形如 `"path": "README.md",`。
+_STRING_ARG_PAIR_RE = re.compile(r'"(?P<key>[A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"(?P<val>(?:[^"\\]|\\.)*)"\s*,')
 
-    When the value string contains raw newlines or unescaped inner quotes that
-    defeat JSON repair, locate structurally: anchor name and the single argument
-    key with a regex, take everything from that key's opening quote up to the
-    object-closing quote before }}, and re-serialize. Only single-string-arg
-    objects are accepted, to avoid misreading multi-arg or nested shapes.
+
+def _parse_complete_string_args(raw: str):
+    """Parse leading ``"key": "value",`` pairs; return None if anything is off.
+
+    Used by :func:`_salvage_string_args` to recover the well-formed arguments
+    that precede an object's broken final string value.
+    """
+    text = raw.strip()
+    if text.endswith(","):
+        text = text[:-1].rstrip()
+    if not text:
+        return {}
+    out = {}
+    pos = 0
+    while pos < len(text):
+        m = _STRING_ARG_PAIR_RE.match(text, pos)
+        if not m:
+            return None
+        try:
+            out[m.group("key")] = json.loads('"' + m.group("val") + '"')
+        except Exception:
+            return None
+        pos = m.end()
+    return out
+
+
+def _salvage_string_args(raw: str):
+    """Salvage objects shaped like {"name": X, "arguments": {"<key>": "<body>"[, ...]}}.
+
+    When a value string contains raw newlines or unescaped inner quotes (the
+    common case for markdown / shell content) that defeat JSON repair, locate
+    structurally: anchor ``name`` and the leading string-valued argument key(s)
+    with a regex, take everything from that key's opening quote up to the
+    object-closing quote before ``}}``, and re-serialize. Only objects whose
+    preceding arguments are all well-formed quoted strings are accepted, which
+    keeps multi-key shapes like the ``write`` tool (path + content) working
+    while refusing to guess at nested/array values.
     """
     m = _NAME_ARG_COMMAND_RE.match(raw)
     if not m:
         return None
     name = m.group("name")
     argkey = m.group("argkey")
-    body_start = m.end()
+    body_start = m.end()  # first char of the anchored key's value
+    # Prefix covers any fully-quoted args before the anchored key; it starts
+    # right after the `{` that opens the arguments object (the one immediately
+    # preceding the anchored key), so the slice holds `"path": "...",` pairs.
+    brace = raw.rfind("{", 0, body_start)
+    if brace < 0:
+        return None
+    head = brace + 1
     stripped = raw.rstrip()
     if not stripped.endswith("}}"):
         return None
     close = stripped.rindex('"')
     if close < body_start:
         return None
+
+    # The prefix ends with the anchored key's own `"<argkey>": "` fragment
+    # (the regex consumed up to its opening quote). Drop that trailing fragment
+    # so only complete preceding `"key": "value",` pairs remain.
+    prefix = raw[head:body_start]
+    anchor_frag = '"' + argkey + '"'
+    anchor_pos = prefix.rfind(anchor_frag)
+    if anchor_pos >= 0:
+        prefix = prefix[:anchor_pos]
+    prefix_args = _parse_complete_string_args(prefix)
+    if prefix_args is None:
+        return None
+
     value = raw[body_start:close]
     try:
         value = json.loads('"' + value + '"')
@@ -477,7 +559,8 @@ def _salvage_single_string_arg(raw: str):
             value = json.loads('"' + escaped + '"')
         except Exception:
             return None
-    return {"name": name, "arguments": {argkey: value}}
+    prefix_args[argkey] = value
+    return {"name": name, "arguments": prefix_args}
 
 
 def _repair_json_quotes(raw: str) -> Optional[Any]:
@@ -658,7 +741,7 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             # 标准解析失败；退回尽力修复（见 _repair_json_quotes）。
             data = _repair_json_quotes(raw)
             if data is None:
-                salvaged = _salvage_single_string_arg(raw)
+                salvaged = _salvage_string_args(raw)
                 if salvaged is not None:
                     calls.append(salvaged)
                 return
@@ -698,6 +781,14 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             # 平衡扫描失败：多半是值边界多/少了一个引号，导致字符串状态错乱、
             # depth 回不到 0。先用边界引号归一化再扫一遍。
             objs = list(_iter_balanced_objects(_strip_redundant_value_quotes(segment)))
+        if not objs:
+            # 值内出现裸 `{`（如 markdown 里的 {"a":1}）会让字符串状态提前错乱，
+            # 平衡扫描切不出完整对象。改用锚点式 salvage：按 name/arguments/首个
+            # 键定位，一直取到对象收尾，绕开括号配对。
+            salvaged = _salvage_string_args(segment)
+            if salvaged is not None:
+                calls.append(salvaged)
+                continue
         for obj in objs:
             _consume(obj, allow_bare_object=True)
             break

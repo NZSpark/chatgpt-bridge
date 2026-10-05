@@ -114,6 +114,7 @@ class ChatGPTWebDriver(PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIO
             raise
         self.page = await self.context.new_page()
         await self._restore_session_on_startup()
+        await self._warn_if_blocked(self.page)
 
     # ---------- 会话上下文 -> 单条 prompt ----------
     @staticmethod

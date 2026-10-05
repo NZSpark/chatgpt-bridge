@@ -88,7 +88,11 @@ OUTPUT_MAX_AGE_DAYS = env_float("OUTPUT_MAX_AGE_DAYS", 0)
 
 
 # ==================== 运行模式 / 调试 ====================
-# 无显示环境（CI / 服务器）可用 HEADLESS=1 启动；首次登录仍需有头模式
+# 实测（2026-10）：HEADLESS=1 时 ChatGPT 会把请求挡在 Cloudflare 挑战页
+# （title="Just a moment..."，body 为空、按钮数 0、composer 不渲染），
+# 于是 _find_input / _open_new_chat 全部落空，表现为「找不到输入框/新建对话」。
+# 因此**默认必须有头运行**（HEADLESS=false）。无显示服务器请用 xvfb-run 包一层
+# 有头 Chromium，而不是设 HEADLESS=1。
 HEADLESS = env_bool("HEADLESS")
 # 打开后每轮轮询都打印一行状态，便于定位「为什么一直判不到结束」（CHATGPT_DEBUG=1）
 DEBUG = env_bool("CHATGPT_DEBUG")
@@ -171,12 +175,24 @@ PARALLEL_BUCKETS = env_bool("PARALLEL_BUCKETS")
 BUCKET_LOCK_TIMEOUT_S = env_float("BUCKET_LOCK_TIMEOUT_S", 0)
 # 新建/恢复页面后等待输入框就绪的超时（毫秒）
 READY_TIMEOUT_MS = env_int("READY_TIMEOUT_MS", 15000)
+# 单次 fill() 填充输入框的超时（毫秒）。React 重挂载时旧句柄会失效，
+# 这里给一个较短超时，由调用方重新定位输入框并重试，而不是干等 30s。
+FILL_TIMEOUT_MS = env_int("FILL_TIMEOUT_MS", 10000)
+# fill 的重试次数（每次都会重新定位输入框，规避 React 替换导致的失效句柄）。
+FILL_RETRIES = env_int("FILL_RETRIES", 3)
 # 播种（新会话时重放历史）的最大字符数预算；超出时保留最近的消息
 SEED_MAX_CHARS = env_int("SEED_MAX_CHARS", 12000)
 # 播种时**单条 system 消息**的最大字符数。harness（Codex / Pi）每轮都会把
 # 完整的系统提示作为 system 消息发来，动辄上万字；播种时若原样重放，
 # 会把简单请求灌成一大段系统提示。超出即截断。0 = 不限制（不推荐）。
 SEED_SYSTEM_MAX_CHARS = env_int("SEED_SYSTEM_MAX_CHARS", 2000)
+# 单条 tool 结果（role=="tool"）注入 prompt 时的最大字符数。
+# Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆 ChatGPT 网页版输入框
+# （Playwright fill 超时）。超出即截断并标注。0 = 不限制（不推荐）。
+TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 20000)
+# 单次 fill() 入参（整段 prompt）的最大字符数硬上限，兜底防止输入框溢出。
+# 这是发送侧最后一道护栏：无论上游怎么拼 prompt，都不超过它。0 = 不限制。
+PROMPT_MAX_CHARS = env_int("PROMPT_MAX_CHARS", 100000)
 # 网页会话超过以下任一阈值后，下一轮自动轮转到新会话（0 表示禁用该维度）
 SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 60)
 SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 60000)
@@ -229,41 +245,60 @@ TASK_RECENT_ITEM_MAX_CHARS = env_int("TASK_RECENT_ITEM_MAX_CHARS", 500)
 # ==================== DOM 选择器 ====================
 # 统一集中在这里，网页版改版时只需改这一处（也可用 .env 覆盖而无需改代码）。
 # 回复节点的候选选择器（逗号分隔的 CSS 列表，直接交给 query_selector_all）
+# 实测（真实 DOM）：助手回复节点是 [data-message-author-role="assistant"]，
+# 旧的 message-content / .model-response-text 已不存在；.markdown 作兜底。
+# 注意：本值直接喂 page.query_selector_all()，必须是**逗号分隔**的 CSS 列表，
+# 不能用 "||"（那是 INPUT/SEND 这类逐条 wait_for_selector 的分隔符）。
 RESPONSE_SELECTORS = env_str(
     "RESPONSE_SELECTORS",
-    'message-content, .model-response-text, .markdown, div[class*="response"]',
+    '[data-message-author-role="assistant"], message-content, .markdown',
 )
 # 输入框候选选择器（.env 中用 "||" 分隔多个候选）
+# 实测（真实 DOM）：composer 是 ProseMirror 的 ``div#prompt-textarea``
+# （contenteditable=true, role=textbox, aria-label="Chat with ChatGPT"）。
+# 旧的 ``rich-textarea`` 已不存在；且该元素常被判定为 not visible，
+# 因此定位必须用 state="attached"（见 chat_io._find_input）。
 INPUT_SELECTORS = [
     s.strip()
     for s in env_str(
         "INPUT_SELECTORS",
-        'rich-textarea [contenteditable="true"]||div[contenteditable="true"]||'
-        'textarea[placeholder*="Ask"]||textarea',
+        '#prompt-textarea||div.ProseMirror[contenteditable="true"]||'
+        'div[contenteditable="true"][role="textbox"]||textarea',
     ).split("||")
     if s.strip()
 ]
 # 发送按钮候选选择器（.env 中用 "||" 分隔多个候选）。
-# 优先用 DOM 事件发送（见 chat_io._submit_prompt），只有派发事件无效时才点它。
+# 提交优先走真实键盘 Enter，其次合成 DOM 事件，只有都无效时才点它
+# （见 chat_io._submit_prompt）。
+# 实测（真实 DOM）：发送按钮是 button[data-testid="send-button"]
+# （aria-label="Send prompt", type=submit）。
 SEND_BUTTON_SELECTORS = [
     s.strip()
     for s in env_str(
         "SEND_BUTTON_SELECTORS",
-        'button[aria-label*="Send"]||button[aria-label*="send"]||'
-        'button[aria-label*="发送"]||button[data-test-id*="send"]||'
+        'button[data-testid="send-button"]||'
+        'button[aria-label="Send prompt"]||button[aria-label*="Send"]||'
         'button[type="submit"]',
     ).split("||")
     if s.strip()
 ]
 # 页面就绪（输入框出现）用的选择器
+# 实测：composer 是 #prompt-textarea / .ProseMirror；回复节点用 author-role。
 READY_SELECTOR = env_str(
-    "READY_SELECTOR", 'rich-textarea, [contenteditable="true"], textarea'
+    "READY_SELECTOR",
+    '#prompt-textarea, div.ProseMirror, [data-message-author-role="assistant"]',
 )
 # 新建对话入口：每桶首次请求与轮转时点击，确保从干净会话开始。
+# 新建对话入口：每桶首次请求与轮转时点击，确保从干净会话开始。
+# 2024+ 改版后「新建对话」是 <a data-testid="create-new-chat-button">，
+# 且主入口 aria-label 可能为空（文案在 innerText="New chat"）。因此按
+# 稳定性排序：testid > aria-label（a/button 都试）> href="/" 兜底。
 NEW_CHAT_SELECTOR = env_str(
     "NEW_CHAT_SELECTOR",
-    'button[aria-label*="New chat"]||button[aria-label*="new chat"]||'
-    'button[aria-label*="新对话"]||button[aria-label*="新聊天"]',
+    'a[aria-label="New chat"]||a[aria-label="新对话"]||a[aria-label="新聊天"]||'
+    'button[aria-label="New chat"]||button[aria-label="新对话"]||'
+    'button[aria-label="新聊天"]||'
+    '[data-testid="create-new-chat-button"]||a[href="/"]',
 )
 # 代码块 DOM
 CODE_BLOCK_SELECTOR = env_str("CODE_BLOCK_SELECTOR", "pre")

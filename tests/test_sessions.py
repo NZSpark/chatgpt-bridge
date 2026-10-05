@@ -58,5 +58,61 @@ class SessionCacheEvictionTests(unittest.TestCase):
             self.assertEqual(len(self.driver._sessions), 10)
 
 
+class SeedShrinkOnRepeatedCapTests(unittest.TestCase):
+    """连续“到顶”时应压缩播种 prompt，避免死循环（见 chat_io.send_chat）。"""
+
+    def setUp(self):
+        self.driver = ChatGPTWebDriver(user_data_dir="/tmp/chatgpt-test-noprofile")
+        self._patch = mock.patch.object(config, "SESSION_FILE", Path("/tmp/chatgpt-test-state2.json"))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        Path("/tmp/chatgpt-test-state2.json").unlink(missing_ok=True)
+
+    def test_incremental_prompt_never_shrunk(self):
+        self.driver._state(DEFAULT_SESSION_KEY).cap_failures = 5
+        prompt = "x" * 5000
+        out = self.driver._shrink_seed_if_repeated_cap(
+            DEFAULT_SESSION_KEY, prompt, is_seed=False
+        )
+        self.assertEqual(out, prompt)
+
+    def test_seed_below_threshold_unchanged(self):
+        self.driver._state(DEFAULT_SESSION_KEY).cap_failures = 1
+        prompt = "x" * 5000
+        out = self.driver._shrink_seed_if_repeated_cap(
+            DEFAULT_SESSION_KEY, prompt, is_seed=True
+        )
+        self.assertEqual(out, prompt)
+
+    def test_seed_shrunk_after_two_failures(self):
+        self.driver._state(DEFAULT_SESSION_KEY).cap_failures = 2
+        prompt = "HEAD" + ("x" * 20000) + "TAIL"
+        out = self.driver._shrink_seed_if_repeated_cap(
+            DEFAULT_SESSION_KEY, prompt, is_seed=True
+        )
+        self.assertLess(len(out), len(prompt))
+        self.assertTrue(out.startswith("HEAD"))
+        self.assertTrue(out.endswith("TAIL"))
+        self.assertIn("压缩中段", out)
+
+    def test_shrink_has_floor(self):
+        self.driver._state(DEFAULT_SESSION_KEY).cap_failures = 20
+        prompt = "x" * 100000
+        out = self.driver._shrink_seed_if_repeated_cap(
+            DEFAULT_SESSION_KEY, prompt, is_seed=True
+        )
+        # 下限 2000（外加少量分隔标记），不会被压到近乎空
+        self.assertGreaterEqual(len(out), 2000)
+
+    def test_cap_failures_roundtrip_and_reset_on_success(self):
+        from chatgpt_web.session_store import SessionState
+
+        s = SessionState(cap_failures=3)
+        self.assertEqual(SessionState.from_payload(s.to_payload()).cap_failures, 3)
+        self.assertEqual(SessionState.from_payload({}).cap_failures, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -64,11 +64,12 @@ class SeedPromptInflationTests(unittest.TestCase):
         prompt = prompting.build_prompt(
             _codex_like_messages(), seed=True, seed_max_chars=12000
         )
-        limit = config.SEED_SYSTEM_MAX_CHARS
-        # 巨型 system 被截断，且带有截断标记
+        # 巨型 system 被截断，且带有截断标记。
+        # 不写死 SEED_SYSTEM_MAX_CHARS 的具体值：它是可调配置（.env 可覆盖），
+        # 只断言「被截断后远小于原始」且「整段 prompt 受 seed_max_chars 约束」。
         self.assertIn("系统提示已截断", prompt)
         self.assertLess(len(prompt), len(BIG_SYSTEM))
-        self.assertLessEqual(limit, 12000)
+        self.assertLess(len(prompt), 12000)
 
     def test_delta_prompt_only_sends_new_user_message(self):
         # 非播种（已有会话）时只发增量：不应包含任何系统提示

@@ -88,6 +88,13 @@ def _render_message(message: ChatMessage) -> str:
     raw = _content_to_text(message.content)
     if message.role == "tool":
         tag = f" {message.tool_call_id}" if message.tool_call_id else ""
+        limit = config.TOOL_RESULT_MAX_CHARS
+        if limit and len(raw) > limit:
+            dropped = len(raw) - limit
+            raw = (
+                raw[:limit]
+                + f"\n…（工具结果过长，已截断 {dropped} 字符）"
+            )
         return f"[工具执行结果{tag}]\n{raw}"
     content = raw.strip()
     if message.role == "system":
@@ -165,15 +172,19 @@ def _seed_messages(messages: List[ChatMessage], max_chars: int):
     system_used = 0
     for message in systems:
         text = _content_to_text(message.content)
-        if per_system_limit and len(text) > per_system_limit:
-            text = text[:per_system_limit] + "…（系统提示已截断）"
-            truncated = True
-        size = len(text)
-        if kept_systems and system_used + size > system_budget:
+        # 剩余可用预算：既要满足单条 SEED_SYSTEM_MAX_CHARS，也不能突破 system_budget。
+        # 取两者较小值，保证第一条巨型 system 也会被截断（而不是无条件放行或整条丢弃）。
+        remaining = system_budget - system_used
+        limit = per_system_limit or len(text)
+        limit = min(limit, remaining) if remaining > 0 else 0
+        if limit <= 0:
             truncated = True
             break
+        if len(text) > limit:
+            text = text[:limit] + "…（系统提示已截断）"
+            truncated = True
         kept_systems.append(ChatMessage(role="system", content=text))
-        system_used += size
+        system_used += len(text)
     kept_systems.reverse()
 
     kept: List[ChatMessage] = []
@@ -222,23 +233,24 @@ def build_prompt(
 
     use_tools = bool(tools) and tool_choice != "none"
     if seed and use_tools:
-        # 新 bucket / 重置后的第一轮：把带围栏示例的格式强调块放在播种开头，
-        # 模型最容易在这种时候退回原生 DSML 标记，双保险。
+        # 新 bucket / 重置后的第一轮：把格式强调块放在播种开头，
+        # 模型最容易在这种时候退回原生 DSML 标记或干脆无视工具，双保险。
         parts.insert(1, format_tool_call_emphasis())
 
-    prompt = "\n\n".join(part for part in parts if part).strip()
-
+    # 工具说明放在**用户任务之前**：模型先看到「有哪些工具、必须调用、怎么调用」，
+    # 再看到具体请求，显著降低「无视工具、直接凭知识作答」的概率。
     # 去重：入站 system 消息可能已带 [工具调用说明]（harness 会内联一份），
     # 再追加一遍会造成同一 prompt 出现两份说明、互相干扰。
-    if use_tools and "[工具调用说明]" not in prompt:
-        prompt = (prompt + "\n\n" + format_tools_instruction(tools)).strip()
+    if use_tools and not any("[工具调用说明]" in p for p in parts):
+        parts.insert(1 if not (seed and use_tools) else 2,
+                     format_tools_instruction(tools))
 
     if use_tools and any(
         (t.get("function", t) or {}).get("name") == "edit_markdown" for t in tools
     ):
         from .toolcalls import edit_markdown_spec
 
-        if "[edit_markdown 说明]" not in prompt:
-            prompt = (prompt + "\n\n" + edit_markdown_spec()).strip()
+        if not any("[edit_markdown 说明]" in p for p in parts):
+            parts.append(edit_markdown_spec())
 
-    return prompt
+    return "\n\n".join(part for part in parts if part).strip()

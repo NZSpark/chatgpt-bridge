@@ -13,7 +13,7 @@
 - **不丢任务**：会话轮转时按任务快照 + 历史播种，任务目标不被字符预算截断。
 - **登录态持久化**：浏览器 profile 落在 `user_data/`，登录一次即可复用。
 - **纯本地**：默认只监听 `127.0.0.1`。
-- **无头防失焦**：有头模式下窗口失焦会被系统降级为后台标签，ChatGPT 懒渲染卸载输入框导致发送失败；推荐 `HEADLESS=1`。
+- **有头运行（必须）**：实测 `HEADLESS=1` 会被 Cloudflare 挑战页拦截（页面停在 `Just a moment...`，输入框/按钮都不渲染），因此默认且有义务使用有头模式 `HEADLESS=false`；无显示服务器用 `xvfb-run` 包一层。
 
 ## 环境要求
 
@@ -28,11 +28,14 @@ playwright install chromium
 ## 快速开始
 
 ```bash
-# 1. 首次登录：有头模式手动登录 ChatGPT，登录态存入 user_data/
+# 首次登录：有头模式手动登录 ChatGPT，登录态存入 user_data/
 HEADLESS=0 python chatgpt_api_server.py
 
-# 2. 之后可无头运行
+# 之后继续用有头模式（.env 已默认 HEADLESS=false）
 python chatgpt_api_server.py
+
+# 无显示服务器：用 xvfb 包一层有头 Chromium（不要设 HEADLESS=1）
+# xvfb-run -a python chatgpt_api_server.py
 ```
 
 服务默认监听 `http://127.0.0.1:8002`。冒烟测试：
@@ -140,7 +143,7 @@ codex --profile chatgpt
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HOST` / `PORT` | `127.0.0.1` / `8002` | 监听地址 |
-| `HEADLESS` | `false` | 无头模式，推荐正式运行时设为 `1`；首次登录需 `false` |
+| `HEADLESS` | `false` | **必须保持 `false`（有头）**：`true` 会被 Cloudflare 挑战页拦截，输入框/按钮不渲染。无显示服务器用 `xvfb-run` |
 | `CHATGPT_DEBUG` | `false` | 打印轮询状态、开放 `/debug/dom` |
 
 **结束判定与超时**
@@ -167,6 +170,8 @@ codex --profile chatgpt
 | `PARALLEL_BUCKETS` | `false` | 各桶并行页面 |
 | `BUCKET_LOCK_TIMEOUT_S` | `0` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
+| `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
+| `PROMPT_MAX_CHARS` | `100000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
 | `SESSION_MAX_TURNS` | `60` | 轮数到顶阈值（0 禁用） |
 | `SESSION_MAX_TOKENS` | `60000` | 估算 token 到顶阈值（0 禁用） |
 
@@ -246,11 +251,11 @@ user_data/                浏览器 profile 与状态（gitignore）
 | --- | --- |
 | 一直判不到结束 | 设 `CHATGPT_DEBUG=1` 看轮询日志；确认 `RESPONSE_SELECTORS` 命中 |
 | 工具调用参数被截断（如 JSON 只剩半截） | ChatGPT 逐 token 显现动画会让 `inner_text()` 取不到未显现的 token；代码已改为 `_complete_text`（去动画类后取全文）并在 `.pending` 清空前不收尾。若仍出现，检查页面是否新增了别的动画类名 |
-| 登录态失效 | `HEADLESS=0` 手动重登，profile 存在 `user_data/`；登录完成后设 `HEADLESS=1` 长跑 |
+| 登录态失效 | `HEADLESS=0` 手动重登，profile 存在 `user_data/`；登录后**继续用 `HEADLESS=0`**（无头会被 Cloudflare 拦截） |
 | profile 被占用 | 同一时间只允许一个实例，先 `pkill` 旧进程 |
 | Codex 连接断开 | 调大客户端 `stream_idle_timeout_ms`，或调小 `RESPONSES_KEEPALIVE_S` |
 | 抓不到回复节点 | `/debug/dom` 定位，改 `.env` 里的选择器 |
-| 有头模式下报「无法找到对话输入框」/ 输入焦点丢失 | 有头 Chromium 是真实窗口，切到其它 App 会失焦，甚至被系统挂起或降级为后台标签。后台标签的 `requestAnimationFrame` 被节流，ChatGPT 懒渲染会卸载或延迟挂载输入框，`chat_io.py` 的 `wait_for_selector(INPUT_SELECTORS, timeout=3000)` 三个候选全部超时，于是抛「无法找到对话输入框」；窗口不在前台时 `fill()` + `press("Enter")` 的按键也会落到别的窗口。对策：在 `.env` 设 `HEADLESS=1`（解析器认 `1`/`true`/`yes`/`on`），无头不参与窗口焦点竞争，首次登录仍用有头，之后切无头；仍用有头时，发送前先 `page.bring_to_front()` 并 `focus()` 输入框，给定位加整体重试（如 3 次 × 2s，期间 `bring_to_front()`），并可加 `--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows` 缓解后台节流 |
+| 报「找不到输入框 / 新建对话」 | 先看启动日志里的 `[启动告警]`：若为 `命中 Cloudflare 挑战页`（title=`Just a moment...`），说明当前是无头模式，改 `HEADLESS=false`（无显示服务器用 `xvfb-run -a`）。若页面正常但仍定位失败，用 `CHATGPT_DEBUG=true` 触发 `/debug/dom` 看真实 DOM，并对照 `INPUT_SELECTORS` / `NEW_CHAT_SELECTOR` 修正选择器 |
 
 ## 安全
 
