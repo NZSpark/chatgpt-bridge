@@ -34,6 +34,8 @@ class CompletionMixin:
         await self.page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._open_new_chat(self.page)
         await self._wait_ready(self.page)
+        # 新会话默认选中「思考模式」，否则网页版回复过于简单
+        await self._select_think_mode(self.page)
         # 页面刚从空白对话开始，必须播种完整上下文
         self.session_has_history = False
         self.session_turns = 0
@@ -73,6 +75,74 @@ class CompletionMixin:
                 + "  若仍未登录，请先 HEADLESS=false 手动登录一次，"
                 + "登录态会存入 user_data/。\n"
             )
+
+    async def _select_think_mode(self, page) -> bool:
+        """在新建 / 轮转后的对话上选中「思考模式」；成功或已选中返回 True。
+
+        网页版默认可能落在简版模型上，回复过于简单。Think 模式是 composer 上
+        的一个 pill 按钮（``button.__composer-pill``，文本含 "Think"），选中后
+        ``aria-pressed="true"``。这里按「选择器 + 文本」双重匹配，避免点错其它 pill。
+
+        失败不抛异常：选中失败不应阻断对话（只是回复质量可能下降），仅打印告警。
+        """
+        if not config.THINK_MODE_DEFAULT:
+            return False
+        want = [t.strip().lower() for t in config.THINK_MODE_TEXTS.split("||") if t.strip()]
+        # pill 可能比输入框稍晚渲染；给一小段等待，避免「刚就绪时点空」。
+        # 每轮发送前都会调用它（见 _send_chat_locked），因此这里的重试不影响正确性，
+        # 只是提高首次命中率。
+        for attempt in range(3):
+            if await self._try_select_think_once(page, want):
+                return True
+            await asyncio.sleep(0.4 * (attempt + 1))
+        if config.DEBUG:
+            print("[会话] 未找到思考模式按钮，按默认模式继续。")
+        return False
+
+    async def _try_select_think_once(self, page, want) -> bool:
+        """单次尝试：定位 Think pill 并（在需要时）点选。已选中/点选成功返回 True。"""
+        for selector in config.THINK_MODE_SELECTOR.split("||"):
+            selector = selector.strip()
+            if not selector:
+                continue
+            try:
+                buttons = await page.query_selector_all(selector)
+            except Exception:  # noqa: BLE001
+                continue
+            for button in buttons:
+                try:
+                    text = ((await button.inner_text()) or "").strip().lower()
+                except Exception:  # noqa: BLE001
+                    text = ""
+                if want and not any(w in text for w in want):
+                    continue
+                try:
+                    pressed = (await button.get_attribute("aria-pressed")) or ""
+                except Exception:  # noqa: BLE001
+                    pressed = ""
+                if pressed.lower() == "true":
+                    if config.DEBUG:
+                        print(f"[会话] 思考模式已处于选中态（{text!r}）。")
+                    return True
+                try:
+                    try:
+                        await button.click(timeout=3000)
+                    except Exception:  # noqa: BLE001
+                        # pill 常被相邻元素覆盖导致 click 被拦截，退回 JS 原生 click
+                        await button.evaluate("(el) => el.click()")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[会话] 选中思考模式失败（{text!r}）：{exc!r}")
+                    continue
+                await asyncio.sleep(0.3)
+                try:
+                    now = (await button.get_attribute("aria-pressed")) or ""
+                except Exception:  # noqa: BLE001
+                    now = ""
+                if now.lower() == "true":
+                    print(f"[会话] 已选中思考模式（{text!r}），本轮起回复将更深入。")
+                    return True
+                print(f"[会话] 思考模式点击后仍未选中（{text!r}，aria-pressed={now!r}）。")
+        return False
 
     async def _open_new_chat(self, page) -> None:
         """点击「新建对话」，确保从干净会话开始（点不到就沿用当前页）。
@@ -120,6 +190,8 @@ class CompletionMixin:
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._open_new_chat(page)
         await self._wait_ready(page)
+        # 新会话默认选中「思考模式」，否则网页版回复过于简单
+        await self._select_think_mode(page)
         state = self._state(key)
         state.has_history = False
         state.turns = 0

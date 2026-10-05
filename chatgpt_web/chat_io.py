@@ -601,6 +601,11 @@ class ChatIOMixin:
                 before_text = ""
 
             prompt = self._clamp_prompt(prompt)
+            # 关键顺序：必须在填充 prompt **之前**选中「思考模式」。
+            # 网页版的模式选择是 composer 上的 pill，只有在发送前处于选中态，
+            # 这一轮才会以思考模型作答。若放在发送之后再选，只影响下一轮（或无效）。
+            # 这里每次都确保一次（已选中则跳过），覆盖新 bucket / 轮转 / 复用全部路径。
+            await self._select_think_mode(page)
             # 用带「重新定位 + 非空校验」的重试填充，规避 React 重挂载后
             # 旧句柄失效导致的 fill 超时（新会话首轮尤其常见）。
             filled = await self._fill_prompt(page, prompt)

@@ -130,6 +130,11 @@ class FakePage:
         return self._input
 
     async def query_selector_all(self, selector):
+        # 只有「回复节点」选择器才走脚本；其它选择器（如 Think 模式的
+        # __composer-pill）在真实 DOM 里是另一批元素，这里返回空，避免
+        # 误消耗脚本步进、干扰结束判定的回归断言。
+        if "author-role" not in selector and "message-content" not in selector:
+            return []
         index = self.query_calls
         self.query_calls += 1
         if index == 0:

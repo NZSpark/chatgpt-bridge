@@ -300,6 +300,20 @@ NEW_CHAT_SELECTOR = env_str(
     'button[aria-label="新聊天"]||'
     '[data-testid="create-new-chat-button"]||a[href="/"]',
 )
+# ---- 默认开启「思考模式」----
+# 每次新建对话 / 轮转会话后，自动选中 composer 上的 Think 模式，否则网页版
+# 会以简版模型作答（回复过于简单）。实测该控件是 composer 上的 pill：
+#   <button class="__composer-pill ..." aria-pressed="false">Think</button>
+# 选中后 aria-pressed="true"。选择器用「类名 + 文本」双条件匹配（见 completion.py）。
+THINK_MODE_DEFAULT = env_bool("THINK_MODE_DEFAULT", True)
+# Think 按钮的候选选择器（"||" 分隔，逐个尝试）
+THINK_MODE_SELECTOR = env_str(
+    "THINK_MODE_SELECTOR",
+    'button.__composer-pill||button[class*="__composer-pill"]',
+)
+# 判定为「思考模式」按钮的文本关键词（大小写不敏感，"||" 分隔）
+THINK_MODE_TEXTS = env_str("THINK_MODE_TEXTS", "think||思考")
+
 # 代码块 DOM
 CODE_BLOCK_SELECTOR = env_str("CODE_BLOCK_SELECTOR", "pre")
 CODE_TAG_SELECTOR = env_str("CODE_TAG_SELECTOR", "code")

@@ -174,5 +174,7 @@ class PagePoolMixin:
             await page.goto(HOME_URL, wait_until="domcontentloaded")
             await self._open_new_chat(page)
             await self._wait_ready(page)
+            # 新会话默认选中「思考模式」；发送前 _send_chat_locked 还会再确认一次
+            await self._select_think_mode(page)
             state.has_history = False
         print(f"[会话] 已为 key={bucket} 创建独立会话页面（{HOME_URL}）")
