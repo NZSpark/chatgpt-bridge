@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import re
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -18,6 +20,59 @@ from . import config
 from .models import FunctionCall, ToolCall
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallRequest:
+    """Normalized internal representation of one model-emitted tool call.
+
+    ``source_span`` is populated only when a parser can identify an exact source
+    range without guessing; malformed/repaired DOM output therefore uses ``None``.
+    ``raw_text`` is retained solely for diagnostics and must not be consumed by
+    execution code.
+    """
+
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+    source_span: Optional[tuple[int, int]] = None
+    raw_text: str = ""
+
+    @classmethod
+    def from_mapping(
+        cls,
+        call: Dict[str, Any],
+        *,
+        raw_text: str = "",
+        source_span: Optional[tuple[int, int]] = None,
+    ) -> "ToolCallRequest":
+        if not isinstance(call, dict):
+            raise TypeError("tool call must be a mapping")
+        name = call.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("tool call name is required")
+        arguments = call.get("arguments", {})
+        if not isinstance(arguments, dict):
+            raise ValueError("tool call arguments must be an object")
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = f"call_{uuid.uuid4().hex[:16]}"
+        return cls(
+            id=call_id,
+            name=name,
+            arguments=dict(arguments),
+            source_span=source_span,
+            raw_text=raw_text,
+        )
+
+    def as_mapping(self) -> Dict[str, Any]:
+        """Return the legacy dict shape used by the compatibility facade."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "arguments": dict(self.arguments),
+        }
+
 
 # 历史载体（仍兼容，不再是注入格式）：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
 # 2026-10-06 起注入格式改为 ```tool_call 代码围栏（原因：网页版把纯文本行当 markdown
@@ -1112,6 +1167,31 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     return calls
 
 
+def parse_tool_call_requests(
+    text: str, valid_names: Optional[set] = None
+) -> List[ToolCallRequest]:
+    """Parse model output into the typed internal tool-call representation.
+
+    ``parse_tool_calls`` remains the compatibility facade returning dictionaries;
+    new execution code should consume this typed boundary instead of raw text.
+    """
+    calls = parse_tool_calls(text, valid_names)
+    requests: List[ToolCallRequest] = []
+    for call in calls:
+        try:
+            requests.append(ToolCallRequest.from_mapping(call))
+        except (TypeError, ValueError) as exc:
+            logger.warning("忽略无效工具调用：%r", exc)
+    return requests
+
+
+def tool_call_request_mappings(
+    requests: List[ToolCallRequest],
+) -> List[Dict[str, Any]]:
+    """Compatibility conversion for call sites that still require dictionaries."""
+    return [request.as_mapping() for request in requests]
+
+
 def _call_args_sane(call: Dict[str, Any]) -> bool:
     """对 shell 类调用做最低限度健全性检查（当前：命令引号配对）。"""
     name = (call.get("name") or "").lower()
@@ -1127,13 +1207,19 @@ def _call_args_sane(call: Dict[str, Any]) -> bool:
     return True
 
 
-def to_tool_call_models(calls: List[Dict[str, Any]]) -> List[ToolCall]:
+def to_tool_call_models(
+    calls: List[Dict[str, Any] | ToolCallRequest],
+) -> List[ToolCall]:
     return [
         ToolCall(
+            id=call.id if isinstance(call, ToolCallRequest) else call.get("id") or f"call_{uuid.uuid4().hex[:16]}",
             function=FunctionCall(
-                name=call["name"],
-                arguments=json.dumps(call["arguments"], ensure_ascii=False),
-            )
+                name=call.name if isinstance(call, ToolCallRequest) else call["name"],
+                arguments=json.dumps(
+                    call.arguments if isinstance(call, ToolCallRequest) else call["arguments"],
+                    ensure_ascii=False,
+                ),
+            ),
         )
         for call in calls
     ]

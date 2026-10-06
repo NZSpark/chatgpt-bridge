@@ -8,9 +8,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from chatgpt_web.toolcalls import (  # noqa: E402
+    ToolCallRequest,
     _normalize_tool_entry,
     _tool_names,
     format_tools_instruction,
+    parse_tool_call_requests,
     parse_tool_calls,
     to_tool_call_models,
 )
@@ -500,6 +502,61 @@ tool_call
 
 
 
+class ToolCallRequestTests(unittest.TestCase):
+    def test_from_mapping_normalizes_and_generates_id(self):
+        request = ToolCallRequest.from_mapping(
+            {"name": "f", "arguments": {"a": 1}},
+            raw_text='{"name":"f"}',
+        )
+        self.assertTrue(request.id.startswith("call_"))
+        self.assertEqual(request.name, "f")
+        self.assertEqual(request.arguments, {"a": 1})
+        self.assertEqual(request.raw_text, '{"name":"f"}')
+        self.assertEqual(request.source_span, None)
+
+    def test_from_mapping_preserves_explicit_id_and_span(self):
+        request = ToolCallRequest.from_mapping(
+            {"id": "call_123", "name": "f", "arguments": {}},
+            source_span=(10, 20),
+        )
+        self.assertEqual(request.id, "call_123")
+        self.assertEqual(request.source_span, (10, 20))
+
+    def test_from_mapping_rejects_non_object_arguments(self):
+        with self.assertRaises(ValueError):
+            ToolCallRequest.from_mapping({"name": "f", "arguments": "bad"})
+
+    def test_as_mapping_keeps_legacy_shape(self):
+        request = ToolCallRequest(
+            id="call_123",
+            name="f",
+            arguments={"a": 1},
+            source_span=(1, 2),
+            raw_text="raw",
+        )
+        self.assertEqual(
+            request.as_mapping(),
+            {"id": "call_123", "name": "f", "arguments": {"a": 1}},
+        )
+
+
+class TypedParserTests(unittest.TestCase):
+    def test_parse_tool_call_requests_returns_typed_objects(self):
+        text = '```tool_call\n{"name": "get_weather", "arguments": {"city": "SF"}}\n```'
+        requests = parse_tool_call_requests(text, {"get_weather"})
+        self.assertEqual(len(requests), 1)
+        self.assertIsInstance(requests[0], ToolCallRequest)
+        self.assertEqual(requests[0].name, "get_weather")
+        self.assertEqual(requests[0].arguments, {"city": "SF"})
+
+    def test_parse_tool_call_requests_drops_invalid_entries(self):
+        requests = parse_tool_call_requests(
+            '```tool_call\n{"name": "real", "arguments": {}}\n```',
+            {"real"},
+        )
+        self.assertEqual([request.name for request in requests], ["real"])
+
+
 class ToToolCallModelsTests(unittest.TestCase):
     def test_arguments_serialized_as_json_string(self):
         calls = [{"name": "f", "arguments": {"a": 1}}]
@@ -510,6 +567,17 @@ class ToToolCallModelsTests(unittest.TestCase):
     def test_id_prefix(self):
         models = to_tool_call_models([{"name": "f", "arguments": {}}])
         self.assertTrue(models[0].id.startswith("call_"))
+
+    def test_accepts_typed_request_and_preserves_id(self):
+        request = ToolCallRequest(
+            id="call_fixed",
+            name="f",
+            arguments={"a": 1},
+        )
+        models = to_tool_call_models([request])
+        self.assertEqual(models[0].id, "call_fixed")
+        self.assertEqual(models[0].function.name, "f")
+        self.assertEqual(json.loads(models[0].function.arguments), {"a": 1})
 
 
 if __name__ == "__main__":
