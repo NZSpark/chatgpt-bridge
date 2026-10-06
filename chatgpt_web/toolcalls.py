@@ -76,6 +76,8 @@ EMPHASIS_HEADER = "[Output Format Emphasis]"
 EDIT_MD_HEADER = "[edit_markdown notes]"
 # 首轮未调用工具时追加的纠偏指令块（见 T1.1）
 RETRY_HEADER = "[Tool Call Correction]"
+# 同一命令被重复调用且每次都是空输出时的点名提醒（防死循环，见 prompting）
+REPEAT_HEADER = "[Repeated Empty Tool Call]"
 
 
 # ==================== 内置工具：edit_markdown ====================
@@ -272,6 +274,32 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
     return result
 
 
+def format_repeat_call_hint(repeats: List[tuple]) -> str:
+    """同一命令已重复调用（且每次都是空输出）时的点名提醒。
+
+    背景（用户实测死循环）：客户端把空 stdout 渲染成 ``(no output)``，模型以为
+    命令没生效，把同一条命令反复重发——每次都是同样的空输出。逐条说明（见
+    ``prompting.EMPTY_TOOL_RESULT_NOTE``）已经给出正确理解，这里再针对**重复**行为
+    直接点名：报出命令与次数，并明说再发一遍永远不会得到输出。
+
+    :param repeats: ``[(命令签名, 出现次数)]``，来自 ``prompting._repeated_empty_calls``。
+    """
+    lines = [
+        f"{REPEAT_HEADER} You have already issued the SAME tool call more than once, and it",
+        "returned EMPTY output every time:",
+    ]
+    for signature, count in repeats:
+        lines.append(f"- called {count}x, always empty: {signature}")
+    lines += [
+        "An empty result means the command SUCCEEDED and printed nothing. Running it again will",
+        "NEVER produce output — repeating it is an infinite loop and the task will fail.",
+        "Do NOT repeat any call listed above. Either use a DIFFERENT command that prints the state",
+        "you need (another flag, a narrower path, or an explicit echo), or stop and summarise what",
+        "you already know as the final answer.",
+    ]
+    return "\n".join(lines)
+
+
 def format_tool_retry_nudge() -> str:
     """首轮回复没有调用工具时，追加到同一网页会话的纠偏指令（T1.1）。
 
@@ -386,6 +414,10 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "  tools, issue one call, wait for its result, then issue the next in your next reply.",
         "- When you call a tool, output ONLY the single TOOL_CALL line: no explanation, no preamble.",
         "- Only if the task needs no tool at all, answer directly with no TOOL_CALL line.",
+        "- If a tool result is EMPTY (e.g. shows \"(no output)\"), the command SUCCEEDED and",
+        "  genuinely printed nothing. That is a valid result, not a failure: move on to the NEXT",
+        "  command or give the final answer. Never re-run the exact same command and never assume",
+        "  the tool failed — repeating it loops forever.",
         "- Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter> — they will not be executed.",
     ]
     return "\n".join(lines)

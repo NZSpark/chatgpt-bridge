@@ -337,6 +337,52 @@ composer 排除）、`test_end_detection`（零节点诊断一次性 + 首帧不
 （`Python\nRun\nprint('pong')`）——这是「读消息节点 innerText」的既有行为
 （旧版同样会带 `Copy` / `Download` 行），代码块提取已改为只读正文节点、不再受影响。
 
+### 2.11（已修复）工具空输出导致模型反复重发同一条命令（死循环）
+
+**现象（用户实测）**：客户端执行 `git status --short` 没有任何输出时，bridge 发给网页版的
+prompt 里是：
+
+```
+[工具执行结果 call_b17e8c60238e4095]
+(no output)
+```
+
+模型把「没有输出」理解成「命令没生效 / 工具坏了」，于是把它刚才发过的同一条命令**原样再发
+一遍**；客户端再执行一次、又是一样的空输出 —— 用户侧看到同一条命令被反复执行
+（实测连续 4 次 `$ git status --short` / `(no output)` / `Took 0.0s`）。
+
+**根因**：空输出只有「客户端渲染出的歧义文字」，没有任何语义说明（`_render_message`
+除截断外原样透传 tool 结果）。模型在一个“看起来失败”的信号上无法前进，只能重试。
+
+**关于「干脆不发新 prompt」**：**不可行**。HTTP 请求必须有响应，不给模型下一步客户端
+就一直等；而且在 agent 流程里空输出恰恰是**最常见的成功形态**（`git add`、`mv`、`cp`、
+`mkdir`、干净的 `git status`……）——跳过等于让每个写操作都卡住。正确做法是「照发，
+但把空输出说清楚 + 重复时点名」（即本次修复）。
+
+**修复（全部在 prompt 侧，不改响应契约）**：
+
+1. `prompting._is_empty_tool_output`：识别「空输出等价形态」——空白内容、`(no output)` /
+   `(空输出)` 之类空标记，以及客户端外壳行（`$ cmd` 命令回显、`Took 0.0s`、`Wall time:`、
+   `Process exited with code 0`、`Original token count: 0`、空 `Output:`、分隔线）。
+   只有「除外壳与空标记外什么都不剩」才算空；**非空结果仍逐字节保留**
+   （edit 工具 oldText 精确匹配的前提，已用 5 种形态的单测锁定）。
+2. `prompting._render_message`：空输出替换为显式说明（`EMPTY_TOOL_RESULT_NOTE`）：
+   「本命令已执行完毕、退出正常，但没有任何输出：空输出是有效的正常结果，既不是失败，
+   也不代表工具异常或命令未生效。请直接给出下一条指令或最终结论；不要重复执行同一条命令」。
+   歧义原文（`(no output)`）不再交给模型。
+3. `toolcalls.format_tools_instruction`：新增规则——工具结果为空 = 命令成功且确实没有输出，
+   继续下一步；**绝不重发同一条命令**（重复就是死循环）。
+4. **重复点名（硬防线）**：`prompting._repeated_empty_calls` 用 `tool_call_id` 把空结果映射
+   回发起它的 assistant 调用，再按「命令签名」（工具名 + 规范化 JSON 参数）统计历史出现
+   次数；≥2 次时在 prompt 末尾追加 `toolcalls.format_repeat_call_hint`：
+   `called 2x, always empty: bash|{"command": "git status --short"}`，并明说再发永远不会
+   有输出，要求换命令或直接收尾。
+
+**验证**：`tests/test_prompting.py` 新增 9 条单测（空白 / `(no output)` / Codex 风格空结果
+均被解释；5 种非空形态逐字节不变；单次不点名、重复点名、不同命令不点名、非空结果不点名；
+工具说明含空输出规则），并把真实场景的整段 prompt 打印出来人工核对。
+`pytest` → **337 passed / 17 skipped**，`ruff` / `mypy` 干净。
+
 ---
 
 ## 3. 静态分析发现（与 E2E 无关的既有问题）

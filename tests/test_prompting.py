@@ -26,6 +26,145 @@ class ToolResultFidelityTests(unittest.TestCase):
         self.assertTrue(body.startswith("\n\n# Title"))
 
 
+class EmptyToolResultTests(unittest.TestCase):
+    """空输出必须被显式说明（用户实测：`(no output)` 让模型反复重发同一条命令）。
+
+    背景：命令成功但没有 stdout 时，客户端会渲染成 ``$ cmd`` + ``(no output)`` +
+    ``Took 0.0s``。模型把这句理解成「命令没生效」，于是把同一条命令再发一遍，
+    形成死循环。修复：把空输出等价形态替换成「已完成、无输出、请给下一条指令」。
+
+    同时必须保证**非空**结果逐字节保留——edit 工具的 oldText 精确匹配依赖它。
+    """
+
+    @staticmethod
+    def _body(content, tool_call_id="call_1"):
+        from chatgpt_web.models import ChatMessage
+        from chatgpt_web.prompting import _render_message
+
+        message = ChatMessage(role="tool", content=content, tool_call_id=tool_call_id)
+        rendered = _render_message(message)
+        header, _, body = rendered.partition("\n")
+        return header, body
+
+    def test_blank_result_is_explained(self):
+        _, body = self._body("   \n")
+        self.assertIn("没有任何输出", body)
+        self.assertIn("下一条指令", body)
+        self.assertIn("不是失败", body)
+
+    def test_harness_no_output_rendering_is_explained(self):
+        raw = "$ git status --short\n\n(no output)\n\nTook 0.0s\n"
+        header, body = self._body(raw)
+        self.assertIn("call_1", header)
+        self.assertIn("没有任何输出", body)
+        # 歧义原文不再交给模型
+        self.assertNotIn("(no output)", body)
+
+    def test_codex_style_empty_result_is_explained(self):
+        raw = (
+            "Chunk ID: 20e42e\nWall time: 0.001 seconds\n"
+            "Process exited with code 0\nOriginal token count: 0\nOutput:\n"
+        )
+        _, body = self._body(raw)
+        self.assertIn("没有任何输出", body)
+
+    def test_real_output_is_never_rewritten(self):
+        # 关键回归：含真实内容的输出必须逐字节保留，否则 edit 的 oldText 匹配会失败。
+        for raw in (
+            "1  # Title\n2  \n3  ## Section\n4  text\n",   # 带行号的文件内容
+            "$HOME\n",                                        # 真实输出以 $ 开头（不是回显）
+            "no output here, just text\n",                    # 含关键词但非空标记
+            "(no output)\nmore real text\n",                  # 标记 + 真实内容
+            "Took 5.2s\nmodified: a.py\n",                    # 外壳 + 真实内容
+        ):
+            with self.subTest(raw=raw):
+                _, body = self._body(raw)
+                self.assertEqual(body, raw)
+
+
+class _ToolHistoryBuilder:
+    """构造「assistant 工具调用 → tool 空结果」的历史。"""
+
+    TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+
+    @staticmethod
+    def messages(commands):
+        from chatgpt_web.models import ChatMessage, FunctionCall, ToolCall
+
+        msgs = [ChatMessage(role="user", content="看看仓库状态")]
+        for index, command in enumerate(commands):
+            call = ToolCall(
+                id=f"call_{index}",
+                function=FunctionCall(
+                    name="bash", arguments='{"command": "%s"}' % command
+                ),
+            )
+            msgs.append(ChatMessage(role="assistant", content="", tool_calls=[call]))
+            msgs.append(
+                ChatMessage(
+                    role="tool",
+                    content="$ %s\n(no output)\nTook 0.0s" % command,
+                    tool_call_id=call.id,
+                )
+            )
+        return msgs
+
+
+class RepeatedEmptyToolCallTests(unittest.TestCase):
+    """死循环硬防线：同一条命令已重复（且每次空输出）时直接点名禁止重发。"""
+
+    def _prompt(self, commands):
+        from chatgpt_web.prompting import build_prompt
+
+        msgs = _ToolHistoryBuilder.messages(commands)
+        return build_prompt(msgs, tools=_ToolHistoryBuilder.TOOLS)
+
+    def test_repeated_identical_command_is_called_out(self):
+        prompt = self._prompt(["git status --short", "git status --short"])
+        self.assertIn("[Repeated Empty Tool Call]", prompt)
+        self.assertIn("called 2x", prompt)
+        self.assertIn("git status --short", prompt)
+        self.assertIn("NEVER produce output", prompt)
+
+    def test_single_call_is_not_flagged(self):
+        prompt = self._prompt(["git status --short"])
+        self.assertNotIn("[Repeated Empty Tool Call]", prompt)
+        # 但逐条说明仍必须在（空输出的正确解读）
+        self.assertIn("没有任何输出", prompt)
+
+    def test_different_commands_are_not_flagged(self):
+        prompt = self._prompt(["git status --short", "git log --oneline -1"])
+        self.assertNotIn("[Repeated Empty Tool Call]", prompt)
+
+    def test_non_empty_result_is_not_flagged(self):
+        from chatgpt_web.models import ChatMessage, FunctionCall, ToolCall
+        from chatgpt_web.prompting import build_prompt
+
+        first = ToolCall(function=FunctionCall(name="bash", arguments='{"command": "ls"}'))
+        second = ToolCall(function=FunctionCall(name="bash", arguments='{"command": "ls"}'))
+        msgs = [
+            ChatMessage(role="user", content="看看目录"),
+            ChatMessage(role="assistant", content="", tool_calls=[first]),
+            ChatMessage(role="tool", content="a.py\nb.py", tool_call_id=first.id),
+            ChatMessage(role="assistant", content="", tool_calls=[second]),
+            ChatMessage(role="tool", content="a.py\nb.py", tool_call_id=second.id),
+        ]
+        prompt = build_prompt(msgs, tools=_ToolHistoryBuilder.TOOLS)
+        self.assertNotIn("[Repeated Empty Tool Call]", prompt)
+        self.assertIn("a.py", prompt)
+
+
 class ToolsInstructionDesignTests(unittest.TestCase):
     """工具调用指令的设计不变量（真实联网回归的固化）。
 
@@ -128,6 +267,18 @@ class ToolsInstructionDesignTests(unittest.TestCase):
             self.assertIn("ONE TOOL_CALL", text)
             self.assertNotIn("several TOOL_CALL", text)
             self.assertNotIn("multiple tools at once", text)
+
+    def test_instruction_explains_empty_output(self):
+        """工具说明必须写明「空输出 = 成功，不要重发同一条命令」
+        （用户实测死循环的第一道防线）。"""
+        from chatgpt_web.toolcalls import format_tools_instruction
+
+        text = format_tools_instruction(self.TOOLS)
+        self.assertIn("EMPTY", text)
+        self.assertIn("no output", text)
+        self.assertIn("Never re-run the exact same command", text)
+        self.assertIn("loops forever", text)
+        self.assertIn("move on to the NEXT", text)
 
     def test_example_placeholder_is_not_angle_bracket(self):
         """示例里的占位符不能用 <command> 这种形式。

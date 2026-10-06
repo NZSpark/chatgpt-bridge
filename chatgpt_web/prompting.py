@@ -1,12 +1,15 @@
 """把客户端的消息数组转换成网页输入框里的一整段文本，以及若干纯文本工具函数。"""
 
-from typing import Any, Dict, List, Optional
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
 from .models import ChatMessage
 from .toolcalls import (
     EDIT_MD_HEADER,
     TOOLCALL_HEADER,
+    format_repeat_call_hint,
     format_tool_call_emphasis,
     format_tools_instruction,
 )
@@ -14,6 +17,124 @@ from .toolcalls import (
 # 播种 prompt 的上下文重建头（去重 / 泄漏检测共用同一份，见 toolcalls 里的标题常量说明）。
 CONTEXT_REBUILD_HEADER = "[上下文重建]"
 ENV_NOTE_HEADER = "[环境说明]"
+
+# ==================== 工具结果「没有输出」的识别与说明 ====================
+# 背景（用户实测死循环）：命令成功但没有任何 stdout 时，客户端（Pi / Codex）会把
+# 结果渲染成 ``$ git status --short`` + ``(no output)`` + ``Took 0.0s`` 这类文字。
+# 模型看到「没有输出」会理解成「命令没生效 / 工具坏了」，于是把**同一条命令原样
+# 再发一遍**；客户端再执行一次、又是一样的空输出——死循环，用户侧只看到同一条
+# 命令被反复执行。
+#
+# 因此空输出必须被**显式**说明（而不是把 ``(no output)`` 原样扔给模型）：
+#   1. 逐条结果：替换成「已完成、无输出、请给下一条指令」（见 EMPTY_TOOL_RESULT_NOTE）；
+#   2. 同一命令已重复 ≥2 次时再追加点名提醒（见 build_prompt / format_repeat_call_hint）。
+EMPTY_TOOL_RESULT_NOTE = (
+    "（本命令已执行完毕、退出正常，但**没有任何输出**：空输出是有效的正常结果，"
+    "既不是失败，也不代表工具异常或命令未生效。）\n"
+    "请直接给出**下一条指令**或最终结论；不要重复执行同一条命令——"
+    "同样的命令只会再次得到空输出。若确实需要看到内容，请换一条会打印状态的命令。"
+)
+
+# 空输出的等价写法（均为括号/尖括号包裹形式，避免把真实输出里的普通句子误判成空）
+_EMPTY_TOOL_OUTPUT_MARKERS = (
+    "(no output)", "(no stdout)", "(empty output)", "(empty)",
+    "(no output produced)", "(空输出)", "(无输出)", "<no output>", "[no output]",
+)
+
+# 客户端外壳行：耗时、退出码、token 统计、空 Output: 块、分隔线。
+# 只有「除了外壳与空标记之外什么都没有」才判定为「没有输出」；
+# 真实输出里出现这些字样不受影响。
+_TOOL_CHROME_RES = (
+    re.compile(r"^took\s+[\d.]+\s*s$", re.IGNORECASE),      # Took 0.0s
+    re.compile(r"^wall time:\s*\S.*$", re.IGNORECASE),      # Wall time: 2.9 seconds
+    re.compile(r"^chunk id:\s*\S+$", re.IGNORECASE),
+    re.compile(r"^process exited with code\s+\d+$", re.IGNORECASE),
+    re.compile(r"^original token count:\s*\d+$", re.IGNORECASE),
+    re.compile(r"^output:\s*$", re.IGNORECASE),             # Codex 的 “Output:” 空块
+    re.compile(r"^[-=_*~#]{3,}$"),                          # ---- / ===== 分隔线
+)
+# 命令回显：harness 会把执行过的命令回显在第一行（"$ git status --short"）。
+# 只在**首行**识别，避免把「输出本身以 $ 开头」误判成外壳。
+_TOOL_ECHO_RE = re.compile(r"^\$\s+\S.*$")
+
+
+def _is_empty_tool_output(raw: str) -> bool:
+    """工具结果是否等价于「命令执行完成，但确实没有任何输出」。
+
+    判定方式：去掉外壳行（命令回显 / 耗时 / 退出码 / token 统计 / 分隔线）与空标记后，
+    是否什么都不剩。这样 ``git status --short``（干净）与空白内容都算空，
+    而任何含真实内容的输出都会被逐字节保留（edit 工具的 oldText 匹配依赖这一点）。
+    """
+    text = (raw or "").replace("\r\n", "\n").strip()
+    if not text:
+        return True
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    if lines and _TOOL_ECHO_RE.match(lines[0]):
+        lines = lines[1:]
+    return all(_is_tool_chrome_or_marker(line) for line in lines)
+
+
+def _is_tool_chrome_or_marker(line: str) -> bool:
+    if line.lower() in _EMPTY_TOOL_OUTPUT_MARKERS:
+        return True
+    return any(pattern.match(line) for pattern in _TOOL_CHROME_RES)
+
+
+def _tool_call_signature(call: Any) -> str:
+    """把一条 assistant 工具调用归一化成「命令签名」（用于识别重复调用）。
+
+    客户端回传的 arguments 是 JSON 字符串，键序 / 空白可能不同，因此先解析再用
+    ``sort_keys`` 重新序列化；解析失败就退回原文（宁可不判重，也不要误判）。
+    """
+    if isinstance(call, dict):
+        name = call.get("name")
+        args = call.get("arguments")
+    else:
+        fn = getattr(call, "function", None)
+        name = getattr(fn, "name", None)
+        args = getattr(fn, "arguments", None)
+    if not name:
+        return ""
+    if isinstance(args, str):
+        try:
+            args = json.dumps(json.loads(args), ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(args, (dict, list)):
+        args = json.dumps(args, ensure_ascii=False, sort_keys=True)
+    return f"{name}|{args if args is not None else ''}"
+
+
+def _repeated_empty_calls(
+    messages: List[ChatMessage], empty_call_ids: List[Optional[str]]
+) -> List[Tuple[str, int]]:
+    """找出「同一命令已调用 ≥2 次」且本轮结果为空的那几条，返回 [(签名, 次数)]。
+
+    靠 ``tool_call_id`` 把 tool 结果映射回发起它的 assistant 调用，再对历史里
+    所有 assistant 工具调用按签名计数——只有真的重复过才提醒，不会误伤首次执行。
+    """
+    signature_of: Dict[str, str] = {}
+    counts: Dict[str, int] = {}
+    for message in messages:
+        for call in message.tool_calls or []:
+            signature = _tool_call_signature(call)
+            if not signature:
+                continue
+            counts[signature] = counts.get(signature, 0) + 1
+            call_id = getattr(call, "id", None)
+            if call_id:
+                signature_of[str(call_id)] = signature
+    out: List[Tuple[str, int]] = []
+    for call_id in empty_call_ids:
+        if not call_id:
+            continue
+        matched = signature_of.get(str(call_id))
+        if matched and counts.get(matched, 0) >= 2:
+            pair = (matched, counts[matched])
+            if pair not in out:
+                out.append(pair)
+    return out
 
 
 def _content_to_text(content: Any) -> str:
@@ -104,6 +225,11 @@ def _render_message(message: ChatMessage) -> str:
                 raw[:limit]
                 + f"\n…（工具结果过长，已截断 {dropped} 字符）"
             )
+        if _is_empty_tool_output(raw):
+            # 空输出必须显式说明（见 EMPTY_TOOL_RESULT_NOTE 的背景）：把
+            # "(no output)" 原样交给模型，它会以为命令没生效而反复重发同一条命令。
+            # 真实（非空）结果仍逐字节保留——那是 edit 工具 oldText 匹配的前提。
+            return f"[工具执行结果{tag}]\n{EMPTY_TOOL_RESULT_NOTE}"
         return f"[工具执行结果{tag}]\n{raw}"
     content = raw.strip()
     if message.role == "system":
@@ -258,9 +384,10 @@ def build_prompt(
     # 历史（播种）或增量消息从这里开始追加；工具说明要插在它们**内部**。
     history_start = len(parts)
     if seed:
-        rendered = [_render_message(m) for m in systems + kept]
+        used_messages = systems + kept
     else:
-        rendered = [_render_message(m) for m in _run_messages(messages)]
+        used_messages = _run_messages(messages)
+    rendered = [_render_message(m) for m in used_messages]
     parts.extend(rendered)
 
     # 去重只看**入站消息**（harness 可能已内联一份说明）；不能用 parts 整体判定，
@@ -292,5 +419,18 @@ def build_prompt(
 
         if EDIT_MD_HEADER not in inbound:
             parts.append(edit_markdown_spec())
+
+    # 死循环防护（用户实测：同一条命令被反复执行）：本轮工具结果为空、且该调用在
+    # 历史里已经出现过 ≥2 次时，直接点名这条命令并禁止重发。放在 prompt 末尾，
+    # 紧贴模型的下一步动作（近因效应），是比“逐条说明”更硬的一道保险。
+    empty_call_ids = [
+        m.tool_call_id
+        for m in used_messages
+        if m.role == "tool" and _is_empty_tool_output(_content_to_text(m.content))
+    ]
+    if empty_call_ids:
+        repeats = _repeated_empty_calls(messages, empty_call_ids)
+        if repeats:
+            parts.append(format_repeat_call_hint(repeats))
 
     return "\n\n".join(part for part in parts if part).strip()
