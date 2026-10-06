@@ -284,31 +284,8 @@ class ChatIOMixin:
         return "\n".join(lines[start:end])
 
     async def _extract_code_blocks(self, element) -> List[dict]:
-        """从某条回复的 DOM 节点中提取代码块（语言 + 纯代码文本）。"""
-        extracted: List[dict] = []
-        if element is None:
-            return extracted
-        code_elements = await element.query_selector_all(config.CODE_BLOCK_SELECTOR)
-        for code_el in code_elements:
-            code_tag = await code_el.query_selector(config.CODE_TAG_SELECTOR)
-            lang = "txt"
-            if code_tag:
-                # 新版 DOM：代码正文是 CodeMirror 的 div.cm-content，语言写在
-                # data-language（如 "python"）；旧版 DOM：<code class="language-python">。
-                lang_attr = (await code_tag.get_attribute('data-language') or "").strip()
-                if lang_attr:
-                    lang = lang_attr.lower()
-                else:
-                    class_attr = await code_tag.get_attribute('class') or ""
-                    lang_match = re.search(r'language-(\w+)', class_attr)
-                    if lang_match:
-                        lang = lang_match.group(1)
-
-            code_content = await self._complete_text(code_tag or code_el)
-            clean_code = self._strip_code_noise(code_content, lang)
-
-            extracted.append({"lang": lang, "code": clean_code})
-        return extracted
+        """兼容 facade：代码块提取统一由 DOM adapter 负责。"""
+        return await self.dom.extract_code_blocks(element)
 
     # 读取回复节点完整文本的 JS：ChatGPT 把流式回复按 token 渲染成一串
     # <span class="animating">，带逐字显现动画。Playwright 的 inner_text() 遵循
@@ -346,60 +323,12 @@ class ChatIOMixin:
     """
 
     async def _complete_text(self, node) -> str:
-        """读取回复节点的完整文本（绕过 ChatGPT 逐 token 显现动画导致的截断）。
-
-        T4.2 优化：先探测节点里是否真的存在 ``.animating/.pending/.revealing``。
-        没有动画时 ``inner_text`` 已经完整，直接返回——避开「克隆整棵子树 +
-        屏幕外挂载」这些为绕过逐 token 动画才需要的昂贵操作（轮询期间每轮都跑）。
-
-        失败时退回 text_content（无块级换行但一定完整），再退回 inner_text。
-        """
-        if node is None:
-            return ""
-        animated: Optional[bool]
-        try:
-            animated = bool(await node.evaluate(self._ANIMATED_JS))
-        except Exception:
-            animated = True  # 探测失败时保守走克隆路径
-        if not animated:
-            try:
-                text = await node.inner_text()
-                if text and text.strip():
-                    return text
-            except Exception:
-                pass
-        try:
-            text = await node.evaluate(self._COMPLETE_TEXT_JS)
-            if text and text.strip():
-                return text
-        except Exception:
-            pass
-        try:
-            text = await node.text_content()
-            if text and text.strip():
-                return text
-        except Exception:
-            pass
-        try:
-            return await node.inner_text()
-        except Exception:
-            return ""
+        """兼容 facade：完整文本读取统一由 DOM adapter 负责。"""
+        return await self.dom.complete_text(node)
 
     async def _has_pending_tokens(self, node) -> bool:
-        """回复节点里是否还有尚未显现的 token（span.pending 等）。
-
-        ChatGPT 流式渲染时，未显现 token 带 .pending / .animating 类，
-        虽已进入 DOM 但 inner_text 取不到。停止按钮消失不代表这些 token
-        已经显现完毕——若此时收尾，会拿到被截断的半截 JSON。
-        """
-        if node is None:
-            return False
-        try:
-            return bool(await node.evaluate(
-                "(n) => !!n.querySelector('.pending, .animating')"
-            ))
-        except Exception:
-            return False
+        """兼容 facade：pending-token 检测统一由 DOM adapter 负责。"""
+        return await self.dom.has_pending_tokens(node)
 
     _ENTER_JS = """
     (el) => {
@@ -445,50 +374,12 @@ class ChatIOMixin:
             return False
 
     async def _click_send_button(self, page) -> bool:
-        """兜底：对发送按钮派发 DOM click（同样不碰 OS 焦点）。"""
-        if page is None:
-            return False
-        for selector in config.SEND_BUTTON_SELECTORS:
-            try:
-                button = await page.query_selector(selector)
-                if not button:
-                    continue
-                await button.dispatch_event("click")
-                return True
-            except Exception:
-                continue
-        return False
+        """兼容 facade：发送按钮定位/点击统一由 DOM adapter 负责。"""
+        return await self.dom.click_send_button(page)
 
     async def _find_input(self, page):
-        """按 INPUT_SELECTORS 回退链定位输入框；找不到返回 None。
-
-        调试要点：这里所有失败都必须**打印**，否则 _fill_prompt 报
-        "多次重试后仍为空" 时完全无法区分是「定位不到输入框」还是
-        「fill 后读到空」。真实环境的 composer 可能是 shadow DOM /
-        iframe，或选择器全部落空。
-        """
-        errors = []
-        for selector in config.INPUT_SELECTORS:
-            try:
-                # 关键：用 state="attached" 而非默认的 "visible"。
-                # 实测 ChatGPT 的 ProseMirror composer（div#prompt-textarea）
-                # 经常被判定为 not visible（y 为大幅负值、高度异常），
-                # 用默认 "visible" 会永远等不到、直接超时。
-                el = await page.wait_for_selector(
-                    selector, timeout=2000, state="attached"
-                )
-                if el:
-                    if config.DEBUG:
-                        logger.debug(f"[输入] 命中选择器：{selector}")
-                    return el
-                errors.append(f"{selector}: 未命中")
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{selector}: {exc}")
-                continue
-        logger.warning("[输入] 未找到输入框，尝试过的选择器：")
-        for line in errors:
-            logger.info(f"        - {line}")
-        return None
+        """兼容 facade：输入框定位统一由 DOM adapter 负责。"""
+        return await self.dom.find_input(page)
 
     async def _fill_prompt(self, page, prompt: str):
         """填充输入框并返回可用的句柄；成功返回句柄，失败返回 None。
@@ -671,23 +562,7 @@ class ChatIOMixin:
         全为 0 基本可判定是网页版改版（需要重新校准选择器），
         而选择器有命中却不等于回复，则是渲染/时序问题。
         """
-        lines: List[str] = []
-        for selector in config.RESPONSE_SELECTORS.split(","):
-            selector = selector.strip()
-            if not selector:
-                continue
-            try:
-                count = len(await page.query_selector_all(selector))
-            except Exception as exc:  # noqa: BLE001
-                lines.append(f"{selector}: {exc!r}")
-                continue
-            lines.append(f"{selector}: {count}")
-        try:
-            page_text_len = await page.evaluate(
-                "() => (document.body ? document.body.innerText.length : 0)"
-            )
-        except Exception:  # noqa: BLE001
-            page_text_len = -1
+        lines, page_text_len = await self.dom.reply_diagnostics(page)
         logger.warning(
             "[诊断] 页面仍在生成，但 RESPONSE_SELECTORS 一个回复节点都没命中"
             "（nodes=0）：网页版可能已改版，助手回复换了容器。逐条命中数："
@@ -730,7 +605,7 @@ class ChatIOMixin:
             before_text = ""
             before_count = 0
             try:
-                before_nodes = await page.query_selector_all(config.RESPONSE_SELECTORS)
+                before_nodes = await self.dom.find_assistant_messages(page)
                 before_count = len(before_nodes)
                 if before_nodes:
                     before_text = (await self._complete_text(before_nodes[-1])).strip()
@@ -786,7 +661,7 @@ class ChatIOMixin:
 
             while True:
                 poll += 1
-                responses = await page.query_selector_all(config.RESPONSE_SELECTORS)
+                responses = await self.dom.find_assistant_messages(page)
                 current_text = ""
                 generating = None
                 # 取「最后一个有正文的回复节点」而不是裸的 responses[-1]：

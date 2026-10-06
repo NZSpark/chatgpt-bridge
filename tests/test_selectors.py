@@ -219,6 +219,36 @@ class CodeBlockExtractionTests(unittest.TestCase):
         self.assertIn(":not([data-language])", joined)
 
 
+class _FakeStopPage:
+    def __init__(self, handles) -> None:
+        self.handles = list(handles)
+
+    async def query_selector_all(self, selector: str):
+        return list(self.handles)
+
+
+class _FakeReplyNode:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    async def evaluate(self, script: str):
+        return self.text
+
+    async def inner_text(self) -> str:
+        return self.text
+
+    async def text_content(self) -> str:
+        return self.text
+
+
+class _FakeReplyPage:
+    def __init__(self, nodes) -> None:
+        self.nodes = list(nodes)
+
+    async def query_selector_all(self, selector: str):
+        return list(self.nodes)
+
+
 class _FakeEmptyNodesPage:
     """所有回复选择器都落空、但仍能报告页面文本长度的页面替身。"""
 
@@ -232,6 +262,29 @@ class _FakeEmptyNodesPage:
 
     async def evaluate(self, script: str):
         return len(self.page_text)
+
+
+class DOMAdapterFacadeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.driver = ChatGPTWebDriver(user_data_dir="/tmp/chatgpt-test-noprofile")
+        self.adapter = self.driver.dom
+
+    def test_extract_latest_reply_returns_last_non_empty_node(self) -> None:
+        page = _FakeReplyPage([
+            _FakeReplyNode("old answer"),
+            _FakeReplyNode(""),
+            _FakeReplyNode("latest answer"),
+        ])
+        reply = asyncio.run(self.adapter.extract_latest_reply(page))
+        self.assertEqual(reply, "latest answer")
+
+    def test_find_stop_button_skips_hidden_and_unrelated_controls(self) -> None:
+        hidden = _FakeHandle("hidden", visible=False, text="Stop")
+        unrelated = _FakeHandle("other", visible=True, text="Submit")
+        stop = _FakeHandle("stop", visible=True, text="Stop generating")
+        page = _FakeStopPage([hidden, unrelated, stop])
+        found = asyncio.run(self.adapter.find_stop_button(page))
+        self.assertIs(found, stop)
 
 
 class EmptyReplyNodeDiagnosticsTests(unittest.TestCase):

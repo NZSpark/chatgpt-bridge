@@ -6,10 +6,8 @@
 
 
 import asyncio
-import json
 import logging
 import re
-import time
 from typing import List, Optional
 
 from . import config
@@ -26,6 +24,53 @@ _NEW_CHAT_SEARCH_TIMEOUT_S = 8.0
 _NEW_CHAT_POLL_INTERVAL_S = 0.4
 
 class CompletionMixin:
+    # Kept here as a compatibility contract for regression tests and callers that
+    # inspect the generation-detection JavaScript directly.
+    _STOP_TOKEN_PATTERN = r"(^|[-_])stop([-_]|$)"
+    _GENERATING_JS = r'''() => {
+      const stopRe = /(^|[-_])stop([-_]|$)/i;
+      const words = ['\\u505c\\u6b62', 'stop', 'Stop', 'STOP'];
+      const nodes = document.querySelectorAll(
+        '[data-testid*="stop"], button, [role="button"],'
+        + ' div[class*="stop"], span[class*="stop"], svg[class*="stop"]'
+      );
+      for (const el of nodes) {
+        const testid = el.getAttribute('data-testid') || '';
+        const label = [
+          testid,
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('title') || '',
+          (el.textContent || '').slice(0, 40),
+        ].join(' ');
+        const byClass = stopRe.test(el.className || '');
+        if (words.some((w) => label.includes(w)) || byClass) return true;
+      }
+      return false;
+    }'''
+    _STOP_CANDIDATES_JS = r'''() => {
+      const stopRe = /(^|[-_])stop([-_]|$)/i;
+      const words = ['\\u505c\\u6b62', 'stop', 'Stop', 'STOP'];
+      const nodes = document.querySelectorAll(
+        '[data-testid*="stop"], button, [role="button"],'
+        + ' div[class*="stop"], span[class*="stop"], svg[class*="stop"]'
+      );
+      return [...nodes].map((el) => {
+        const testid = el.getAttribute('data-testid') || '';
+        const label = [
+          testid,
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('title') || '',
+          (el.textContent || '').slice(0, 40),
+        ].join(' ');
+        const cls = el.className || '';
+        const byClass = stopRe.test(cls);
+        const r = el.getBoundingClientRect();
+        const visible = r.width > 0 && r.height > 0;
+        const bottomHalf = r.top >= window.innerHeight / 2;
+        return { label, className: cls, visible, bottomHalf,
+          matches: words.some((w) => label.includes(w)) || byClass };
+      }).filter((x) => x.matches);
+    }'''
     async def _restore_session_on_startup(self) -> None:
         """启动时一律新开对话（不做 URL 恢复）。
 
@@ -85,199 +130,29 @@ class CompletionMixin:
             )
 
     async def _select_think_mode(self, page) -> bool:
-        """在新建 / 轮转后的对话上选中「思考模式」；成功或已选中返回 True。
-
-        网页版默认可能落在简版模型上，回复过于简单。Think 模式是 composer 上
-        的一个 pill 按钮（``button.__composer-pill``，文本含 "Think"），选中后
-        ``aria-pressed="true"``。这里按「选择器 + 文本」双重匹配，避免点错其它 pill。
-
-        失败不抛异常：选中失败不应阻断对话（只是回复质量可能下降），仅打印告警。
-        """
+        """兼容 facade：Think Mode 定位/点击统一由 DOM adapter 负责。"""
         if not config.THINK_MODE_DEFAULT:
             return False
         want = [t.strip().lower() for t in config.THINK_MODE_TEXTS.split("||") if t.strip()]
-        # pill 可能比输入框稍晚渲染；给一小段等待，避免「刚就绪时点空」。
-        # 每轮发送前都会调用它（见 _send_chat_locked），因此这里的重试不影响正确性，
-        # 只是提高首次命中率。
         for attempt in range(3):
-            if await self._try_select_think_once(page, want):
+            if await self.dom.find_think_mode(page, want):
                 return True
             await asyncio.sleep(0.4 * (attempt + 1))
         if config.DEBUG:
             logger.warning("[会话] 未找到思考模式按钮，按默认模式继续。")
         return False
 
-    # 兜底 JS（2026-10-06 线上回归修复）：pill 的类名可能随网页改版变化
-    # （如 __composer-pill 被改名），而「文本含 Think / 思考」且带 aria-pressed 的
-    # 按钮就是它。按「带 aria-pressed 且可见 > 带 aria-pressed > 可见」排序。
-    _THINK_FALLBACK_JS = """
-    (want) => {
-      const textOf = (el) => ((el.innerText || el.textContent || '').trim().toLowerCase());
-      const boxed = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-      const hits = [...document.querySelectorAll('button, [role="button"]')]
-        .filter((el) => want.some((w) => textOf(el).includes(w)));
-      return hits.find((el) => el.hasAttribute('aria-pressed') && boxed(el))
-        || hits.find((el) => el.hasAttribute('aria-pressed'))
-        || hits.find(boxed)
-        || null;
-    }
-    """
-
     async def _try_select_think_once(self, page, want) -> bool:
-        """单次尝试：定位 Think pill 并（在需要时）点选。已选中/点选成功返回 True。"""
-        for selector in config.THINK_MODE_SELECTOR.split("||"):
-            selector = selector.strip()
-            if not selector:
-                continue
-            try:
-                buttons = await page.query_selector_all(selector)
-            except Exception:  # noqa: BLE001
-                continue
-            for button in buttons:
-                if await self._press_think_button(button, want):
-                    return True
-        # 兜底：类名选择器全部落空时，按文本扫描页面按钮（见 _THINK_FALLBACK_JS）
-        element = None
-        try:
-            handle = await page.evaluate_handle(self._THINK_FALLBACK_JS, want)
-            element = handle.as_element()
-        except Exception:  # noqa: BLE001
-            element = None
-        if element is not None:
-            return await self._press_think_button(element, want)
-        return False
-
-    async def _press_think_button(self, button, want) -> bool:
-        """读取文本 / 选中态并按需点选单个候选按钮；成功（或已选中）返回 True。"""
-        try:
-            text = ((await button.inner_text()) or "").strip().lower()
-        except Exception:  # noqa: BLE001
-            text = ""
-        if want and not any(w in text for w in want):
-            return False
-        try:
-            pressed = (await button.get_attribute("aria-pressed")) or ""
-        except Exception:  # noqa: BLE001
-            pressed = ""
-        if pressed.lower() == "true":
-            if config.DEBUG:
-                logger.debug(f"[会话] 思考模式已处于选中态（{text!r}）。")
-            return True
-        try:
-            try:
-                await button.click(timeout=3000)
-            except Exception:  # noqa: BLE001
-                # pill 常被相邻元素覆盖导致 click 被拦截，退回 JS 原生 click
-                await button.evaluate("(el) => el.click()")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[会话] 选中思考模式失败（{text!r}）：{exc!r}")
-            return False
-        await asyncio.sleep(0.3)
-        try:
-            now = (await button.get_attribute("aria-pressed")) or ""
-        except Exception:  # noqa: BLE001
-            now = ""
-        if now.lower() == "true":
-            logger.info(f"[会话] 已选中思考模式（{text!r}），本轮起回复将更深入。")
-            return True
-        logger.warning(f"[会话] 思考模式点击后仍未选中（{text!r}，aria-pressed={now!r}）。")
-        return False
-
-    @staticmethod
-    async def _rank_new_chat_candidate(handle) -> int:
-        """候选排序（越小越优先）：可见且非当前会话项 > 可见 > 非当前 > 其它。
-
-        现网侧边栏里同一个 ``button[aria-label="New chat"]`` 会匹配到多个节点，
-        其中当前会话项带 ``aria-current="page"``、折叠态的节点尺寸为 0；
-        旧实现只取第一个并要求可见，于是整轮超时。
-        """
-        try:
-            visible = await handle.is_visible()
-        except Exception:  # noqa: BLE001
-            visible = False
-        try:
-            current = (await handle.get_attribute("aria-current")) == "page"
-        except Exception:  # noqa: BLE001
-            current = False
-        if visible and not current:
-            return 0
-        if visible:
-            return 1
-        if not current:
-            return 2
-        return 3
-
-    @staticmethod
-    async def _click_new_chat_candidate(handle, visible: bool) -> bool:
-        """真点击；失败退回 JS 原生 click（侧边栏图标常被相邻 <svg> 覆盖）。
-
-        ``visible=False``（折叠态零尺寸节点）直接走 JS click：Playwright 对不可见
-        元素的 ``click()`` 必定等满超时，纯浪费总预算。
-        """
-        if visible:
-            try:
-                await handle.click(timeout=3000)
-                return True
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            await handle.evaluate("(el) => el.click()")
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        """向旧测试/调用方保留一次 Think-mode 选择的兼容入口。"""
+        return (await self.dom.find_think_mode(page, want)) is not None
 
     async def _open_new_chat(self, page) -> None:
-        """点击「新建对话」，确保从干净会话开始（点不到就沿用当前页）。
-
-        2026-10-06 线上回归修复：旧实现用 ``page.wait_for_selector(selector)``
-        ——默认语义是「等到**第一个**匹配且**可见**」，而现网侧边栏同一选择器
-        会先匹配到当前会话项（aria-current=page）或折叠态零尺寸节点，于是明明
-        有可点的按钮也会整轮超时（实测 9 个选择器 × 3s 全部落空）。
-
-        现改为：
-        1. 在**总**预算内轮询 ``query_selector_all``（只要 attached，不要求可见）；
-        2. 跨选择器收集候选并排序：可见且非当前项 > 可见 > 非当前 > 其它；
-        3. 真点击失败再退回 JS 原生 click；候选存在但都点不动时继续轮询。
-        """
-        deadline = time.monotonic() + _NEW_CHAT_SEARCH_TIMEOUT_S
-        errors: List[str] = []
-        while True:
-            errors = []
-            candidates = []
-            for order, selector in enumerate(config.NEW_CHAT_SELECTOR.split("||")):
-                selector = selector.strip()
-                if not selector:
-                    continue
-                try:
-                    handles = await page.query_selector_all(selector)
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{selector}: {exc!r}")
-                    continue
-                if not handles:
-                    errors.append(f"{selector}: 未命中")
-                    continue
-                for handle in handles:
-                    rank = await self._rank_new_chat_candidate(handle)
-                    candidates.append((rank, order, selector, handle))
-            if candidates:
-                candidates.sort(key=lambda item: (item[0], item[1]))
-                # 只尝试排序最靠前的几个，给单轮一个时间上界
-                for rank, _order, selector, handle in candidates[:5]:
-                    if await self._click_new_chat_candidate(handle, visible=rank <= 1):
-                        await asyncio.sleep(0.5)
-                        if config.DEBUG:
-                            logger.debug(
-                                "[会话] 已点击新建对话：%s（rank=%d，候选 %d 个）",
-                                selector, rank, len(candidates),
-                            )
-                        return
-                    errors.append(f"{selector}: 点击失败（rank={rank}）")
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(_NEW_CHAT_POLL_INTERVAL_S)
-        logger.warning("[会话] 未找到新建对话按钮，沿用当前会话页。尝试过的选择器：")
-        for line in errors:
-            logger.info(f"        - {line}")
+        """兼容 facade：New Chat 定位/点击统一由 DOM adapter 负责。"""
+        # The original implementation kept these knobs in this module; mirror
+        # them into the adapter so existing tests/callers can still patch them.
+        self.dom.NEW_CHAT_SEARCH_TIMEOUT_S = _NEW_CHAT_SEARCH_TIMEOUT_S
+        self.dom.NEW_CHAT_POLL_INTERVAL_S = _NEW_CHAT_POLL_INTERVAL_S
+        await self.dom.open_new_chat(page)
 
     async def _start_new_session(self, key: Optional[str] = None) -> None:
         """轮转到新会话，并重置会话状态（调用方必须使用“播种”prompt）。"""
@@ -300,13 +175,6 @@ class CompletionMixin:
         await asyncio.to_thread(self._save_session_state, key)
         logger.info("[轮转] 已开启新的网页会话（本轮会用完整历史播种上下文）。")
 
-    _CAP_CHECK_JS_TEMPLATE = (
-        "() => { let text = document.body ? (document.body.innerText || '') : '';"
-        " for (const node of document.querySelectorAll(%s)) {"
-        " const t = node.innerText || ''; if (t) text = text.replace(t, ' '); }"
-        " return text; }"
-    )
-
     async def _page_shows_context_limit(self, key: Optional[str] = None) -> bool:
         """页面是否出现“对话长度上限”类提示。
 
@@ -316,9 +184,8 @@ class CompletionMixin:
         page = self._page_for(key)
         if page is None:
             return False
-        js = self._CAP_CHECK_JS_TEMPLATE % json.dumps(config.RESPONSE_SELECTORS)
         try:
-            page_text = await page.evaluate(js)
+            page_text = await self.dom.page_text_without_replies(page)
         except Exception:
             return False
         for pattern in config.CAP_NOTICE_PATTERNS:
@@ -363,47 +230,6 @@ class CompletionMixin:
             logger.warning(f"[恢复] 重开会话失败: {exc}")
             return False
 
-    # 「类名里出现 stop 词」的严格口径（主判定与诊断共用）。
-    #
-    # 2026-10-06 线上回归：旧实现用裸的 /stop/i.test(cls)，而现网侧边栏会话标题
-    # 带 ``stopAtEnd-<hash>`` 类（截断用的样式类）。于是可见、位于视口下半部的
-    # 侧边栏标题被当成「停止生成」控件 → generating 恒为 True → 结束判定永远
-    # 等不到「页面落定」，每轮都空转到总超时（日志里 generating=True 全程不变）。
-    # 收紧成「独立 stop 词」：stop / stop-button / _stop_ 命中，stopAtEnd / stopwatch 不命中。
-    # 该正则源（含锚点）同时给下面的 JS 用，见 _GENERATING_JS 的 /STOP_TOKEN_PATTERN/i。
-    _STOP_TOKEN_PATTERN = r"(^|[-_])stop([-_]|$)"
-
-    # 主判定所用的 JS：扫描页面上可见的「停止生成」控件
-    _GENERATING_JS = """
-    () => {
-      const stopRe = /STOP_TOKEN_PATTERN/i;
-      const words = ['\\u505c\\u6b62', 'stop', 'Stop', 'STOP'];
-      const nodes = document.querySelectorAll(
-        '[data-testid*="stop"], button, [role="button"],'
-        + ' div[class*="stop"], span[class*="stop"], svg[class*="stop"]'
-      );
-      for (const el of nodes) {
-        const testid = el.getAttribute('data-testid') || '';
-        const label = [
-          testid,
-          el.getAttribute('aria-label') || '',
-          el.getAttribute('title') || '',
-          (el.textContent || '').slice(0, 40),
-        ].join(' ');
-        const cls = typeof el.className === 'string' ? el.className : '';
-        const byClass = stopRe.test(cls) || stopRe.test(testid);
-        if (!words.some((w) => label.includes(w)) && !byClass) continue;
-        const rect = el.getBoundingClientRect();
-        // 必须可见，且位于视口下半部（停止按钮就在底部输入框区域），
-        // 避免把正文里含有 stop / 停止 字样的元素误判成生成中
-        if (rect.width > 0 && rect.height > 0 && rect.top > window.innerHeight * 0.5) {
-          return true;
-        }
-      }
-      return false;
-    }
-    """.replace("STOP_TOKEN_PATTERN", _STOP_TOKEN_PATTERN)
-
     async def _page_is_generating(self, key: Optional[str] = None) -> Optional[bool]:
         """检测页面是否仍在生成回复。
 
@@ -413,52 +239,11 @@ class CompletionMixin:
         page = self._page_for(key)
         if page is None:
             return None
-        try:
-            return bool(await page.evaluate(self._GENERATING_JS))
-        except Exception:
-            return None
-
-    _STOP_CANDIDATES_JS = """
-    () => {
-      const stopRe = /STOP_TOKEN_PATTERN/i;
-      const words = ['\\u505c\\u6b62', 'stop', 'Stop', 'STOP'];
-      const nodes = document.querySelectorAll(
-        '[data-testid*="stop"], button, [role="button"],'
-        + ' div[class*="stop"], span[class*="stop"], svg[class*="stop"], [aria-label]'
-      );
-      const out = [];
-      for (const el of nodes) {
-        const testid = el.getAttribute('data-testid') || '';
-        const aria = el.getAttribute('aria-label') || '';
-        const title = el.getAttribute('title') || '';
-        const text = (el.textContent || '').slice(0, 40);
-        const cls = typeof el.className === 'string' ? el.className : '';
-        const label = [testid, aria, title, text].join(' ');
-        const byClass = stopRe.test(cls) || stopRe.test(testid);
-        if (!words.some((w) => label.includes(w)) && !byClass) continue;
-        const r = el.getBoundingClientRect();
-        out.push({
-          tag: el.tagName,
-          cls: cls.slice(0, 120),
-          aria,
-          title,
-          text: text.slice(0, 40),
-          visible: r.width > 0 && r.height > 0,
-          top: Math.round(r.top),
-          vh: window.innerHeight,
-        });
-        if (out.length >= 20) break;
-      }
-      return out;
-    }
-    """.replace("STOP_TOKEN_PATTERN", _STOP_TOKEN_PATTERN)
+        return await self.dom.is_generating(page)
 
     async def debug_stop_candidates(self, key: Optional[str] = None) -> List[dict]:
-        """诊断用：列出页面上所有「可能表示生成中」的控件及其位置。"""
+        """兼容 facade：停止控件诊断统一由 DOM adapter 负责。"""
         page = self._page_for(key)
         if page is None:
             return []
-        try:
-            return await page.evaluate(self._STOP_CANDIDATES_JS)
-        except Exception as exc:  # noqa: BLE001
-            return [{"error": str(exc)}]
+        return await self.dom.stop_diagnostics(page)

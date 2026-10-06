@@ -35,6 +35,7 @@ from . import (  # noqa: F401
 )
 from .chat_io import ChatIOMixin
 from .completion import CompletionMixin
+from .dom_adapter import ChatGPTDOMAdapter
 from .errors import (  # noqa: F401  (re-export)
     DEFAULT_SESSION_KEY,
     HOME_URL,
@@ -79,6 +80,8 @@ class ChatGPTWebDriver(PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIO
         # 正在处理请求（已拿到锁、正在生成）的会话桶，供 /healthz 观察多 Agent 占用。
         # 不能用“锁是否被持有”来推断：串行模式下所有桶共用一把锁，会把所有桶都算成忙。
         self._active_buckets: set = set()
+        # 所有 ChatGPT Web DOM 查询集中经过这一 adapter；mixin 仅保留兼容 facade。
+        self.dom = ChatGPTDOMAdapter()
 
     async def init(self):
         """初始化浏览器实例"""

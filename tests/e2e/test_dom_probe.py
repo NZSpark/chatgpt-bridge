@@ -152,11 +152,20 @@ class DomProbe(unittest.TestCase):
         pw = sync_playwright().start()
         context = None
         try:
-            context = pw.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE),
-                headless=not E2E_HEADED,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            try:
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir=str(PROFILE),
+                    headless=not E2E_HEADED,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc)
+                if "Opening in existing browser session" in message:
+                    self.skipTest(
+                        f"测试 profile 正被其他 Chromium 实例占用：{PROFILE}；"
+                        "请关闭占用该 profile 的实例后重跑真实 DOM 黄金回归"
+                    )
+                raise
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(4000)
