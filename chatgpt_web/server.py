@@ -457,7 +457,16 @@ async def chat_completions(
     # usage 用真正发出去的 prompt 估算（driver 可能选了播种版 / 中途轮转过）。
     # 按会话桶读取，并发时不会拿到别的 Agent 的 prompt；回退到预判值兼容假 driver。
     sent_prompt = driver.sent_prompt(session_key) or prompt
-    tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+    parsed_tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+    events = completion_events(reply_content, parsed_tool_calls)
+    tool_calls = [
+        {
+            "id": event.tool_call_id,
+            "name": event.name,
+            "arguments": event.arguments,
+        }
+        for event in event_tool_calls(events)
+    ]
     # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
     tool_calls = await asyncio.to_thread(run_local_edit_markdown, tool_calls)
 
@@ -476,6 +485,7 @@ async def chat_completions(
             ),
         )
 
+    final_text = event_final_text(events) or reply_content
     saved_files = []
     # None = 客户端未指定，回落到 config.SAVE_FILES（默认 false）；显式传入才覆盖
     save_files = config.SAVE_FILES if request.save_files is None else request.save_files
@@ -489,7 +499,7 @@ async def chat_completions(
         model=request.model,
         choices=[Choice(
             index=0,
-            message=ChoiceMessage(role="assistant", content=reply_content),
+            message=ChoiceMessage(role="assistant", content=final_text),
             finish_reason="stop",
         )],
         usage=Usage(

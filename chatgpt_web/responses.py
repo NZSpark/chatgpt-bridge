@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, ConfigDict
 
 from . import config, tasks
+from .events import completion_events, event_final_text, event_tool_calls
 from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTBusyError,
@@ -304,9 +305,19 @@ async def run_chat(
             request.messages, request.tools, request.tool_choice
         ),
     )
-    tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
+    parsed_tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
+    events = completion_events(reply, parsed_tool_calls)
+    tool_calls = [
+        {
+            "id": event.tool_call_id,
+            "name": event.name,
+            "arguments": event.arguments,
+        }
+        for event in event_tool_calls(events)
+    ]
+    final_text = event_final_text(events) or reply
     sent_prompt = driver.sent_prompt(session_key) or prompt
-    return reply, blocks, tool_calls, sent_prompt
+    return final_text, blocks, tool_calls, sent_prompt
 
 
 # ==================== 非流式入口 ====================
