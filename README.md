@@ -212,9 +212,37 @@ codex --profile chatgpt
 | `TASK_GOAL_MAX_CHARS` | `2000` | 任务目标保留上限 |
 | `TASK_KEEP_MESSAGES` | `8` | 滚动保留的最近消息数 |
 
+**本地 Markdown 编辑（edit_markdown）**
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `EDIT_MARKDOWN_LOCAL` | `false` | 是否允许桥接层本地执行模型发出的 edit_markdown |
+| `EDIT_MARKDOWN_WRITE` | `false` | 是否允许真正落盘；`false` 时即便模型传 `write=true` 也只返回 diff |
+| `EDIT_MARKDOWN_BACKUP_DIR` | `output/backups` | 落盘前的备份目录 |
+| `EDIT_MARKDOWN_ROOT` | 项目根（沙箱，不可关闭） | 模型给的相对路径必须落在此目录内；绝对路径与 `..` 一律拒绝 |
+
 **DOM 选择器**（网页版改版时改这里）
 
 `RESPONSE_SELECTORS`、`INPUT_SELECTORS`、`READY_SELECTOR`、`NEW_CHAT_SELECTOR`、`CODE_BLOCK_SELECTOR`、`CODE_TAG_SELECTOR`、`CAP_NOTICE_PATTERNS`。
+
+改版自检（2026-10-06 实测踩过：助手回复容器换名后，轮询会一直 `nodes=0`
+空转到超时，客户端拿不到任何内容）：
+
+```bash
+# 1) 运行时逐条命中数（需 CHATGPT_DEBUG=1 启动）
+curl -s http://127.0.0.1:8002/_debug/selectors | python3 -m json.tool
+
+# 2) 一次性重启自检：日志里搜「[诊断]」——连续 3 轮零节点且页面仍在生成时，
+#    bridge 会打印每条 RESPONSE_SELECTORS 的命中数与页面文本长度
+
+# 3) 真实 DOM 探测（有头，打开最近一条会话并给出建议）
+CHATGPT_E2E=1 E2E_HEADED=1 .venv/bin/python -m unittest tests.e2e.test_dom_probe -v
+```
+
+要点：助手回复正文现在是 `[data-markdown-text-style]`（容器 class 为
+`MarkdownRoot-<hash>`）；用户消息是 `[data-user-message-bubble]`，**不要**选进
+`RESPONSE_SELECTORS`。代码块是 `[class*="CodeBlock"]` + `[data-language]`
+（不再有 `pre`/`code`）。
 
 ## 项目结构
 
@@ -235,8 +263,12 @@ chatgpt_web/
   responses.py            Responses API 映射
   tasks.py                会话桶任务快照
   server.py               FastAPI 应用与路由
-doc/design.md             设计文档
+  end_detection.py        回复结束判定的纯函数状态机
+  errors.py               异常类型与默认值常量
+  logging_setup.py        统一日志配置与 request_id
 doc/tasks.md              任务分解与验收标准
+doc/update.md             项目分析与改进建议（含真实 E2E 结果）
+doc/e2e_test_design.md    E2E 对等测试设计（判定矩阵 / 开关 / 前置条件）
 output/                   回复与代码块落盘（gitignore）
 user_data/                浏览器 profile 与状态（gitignore）
 ```
@@ -254,18 +286,23 @@ user_data/                浏览器 profile 与状态（gitignore）
 
 项目提供 tests/ 自动化测试，覆盖配置漂移、Markdown / 工具调用解析、会话管理、流式输出、Responses / Chat 路由等核心逻辑。建议修改后运行：
 
-bash
-pytest -q
+```bash
+python -m pip install -e ".[dev]"   # 一次性：安装项目与 ruff / mypy / pytest
+ruff check .                         # 静态检查（规则集与豁免清单见 pyproject.toml）
+mypy chatgpt_web                     # 类型检查
+pytest -q                            # 单元测试（e2e 默认 skip）
+```
 
-
-端到端浏览器行为还需要实际登录 ChatGPT 网页环境验证；自动化测试通过不代表当前网页 DOM 仍与选择器完全兼容。
+CI（`.github/workflows/ci.yml`）在 push / PR 上运行同样三条检查。端到端浏览器行为还需实际登录 ChatGPT 网页环境验证（设计见 `doc/e2e_test_design.md`）；自动化测试通过不代表当前网页 DOM 仍与选择器完全兼容。
 
 ## 安全
 
 - 默认仅监听 `127.0.0.1`，不要暴露到公网。
+- **本服务不提供鉴权（设计如此）**：客户端 `api_key` 随便填即可，`/v1/models` 与 `/v1/chat/completions` 对任意（或不带）认证头都照常服务。把 `HOST` 改成 `0.0.0.0` 之类的非回环地址会让**任何能访问该地址的人**都能用你的 ChatGPT 登录态与额度——启动时会打醒目告警，但该用法不受支持；需要远程访问请用 SSH 端口转发 / VPN 等外部手段，不要期望在服务内加 API Key。
 - `.env`、`user_data/`（含登录 cookie）、`output/` 均不提交。
 - `user_data/` **不要备份 / 同步**（iCloud、Dropbox 等会带走登录态）；DEBUG 日志不含消息正文。
+- **`edit_markdown` 是模型可控的写文件工具**：只接受沙箱（`EDIT_MARKDOWN_ROOT`，默认项目根）内的相对路径，绝对路径与 `..` 一律拒绝；默认 **dry-run**，只有显式设置 `EDIT_MARKDOWN_WRITE=true` 才会真正落盘（写前自动备份到 `EDIT_MARKDOWN_BACKUP_DIR`）。
 
 ## 状态
 
-配置、模型、prompting、toolcalls、driver、streaming、responses、server 均已实现；测试套件与文档仍在补全（见 `doc/tasks.md`）。
+配置、模型、prompting、toolcalls、driver、streaming、responses、server 均已实现；单测见 `tests/`（`pytest -q`），真实网页验证见 `doc/e2e_test_design.md`，任务分解与验收标准见 `doc/tasks.md`。

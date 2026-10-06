@@ -257,7 +257,7 @@ class ParseToolCallsTests(unittest.TestCase):
         text = (
             'TOOL_CALL: {"name": "edit", "arguments": {"edits": [{"oldText": '
             '"- `READY_SELECTOR`：`textarea, [contenteditable="true"]`，判定可输入。"}], '
-            '"path": "doc/design.md"}}'
+            '"path": "doc/update.md"}}'
         )
         calls = parse_tool_calls(text)
         self.assertEqual(len(calls), 1)
@@ -265,7 +265,7 @@ class ParseToolCallsTests(unittest.TestCase):
             calls[0]["arguments"]["edits"][0]["oldText"],
             '- `READY_SELECTOR`：`textarea, [contenteditable="true"]`，判定可输入。',
         )
-        self.assertEqual(calls[0]["arguments"]["path"], "doc/design.md")
+        self.assertEqual(calls[0]["arguments"]["path"], "doc/update.md")
 
     def test_body_quote_with_raw_newlines_repaired(self):
         # 裸引号 + 真实换行（多行 Markdown 未转义）叠加：仍应完整还原。
@@ -347,7 +347,7 @@ class ShellGuardTests(unittest.TestCase):
 
 
 class ToolCallLineContractTests(unittest.TestCase):
-    """首选形态 TOOL_CALL: 的“一行一调用”契约与重复消费回归（update_codex §2.3）。"""
+    """首选形态 TOOL_CALL: 的“一行一调用”契约与重复消费回归（对照 README「Codex CLI 接入」）。"""
 
     def test_multi_line_multi_calls(self):
         text = (

@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chatgpt_web import config, prompting  # noqa: E402
 from chatgpt_web.models import ChatMessage  # noqa: E402
 
-
 BIG_SYSTEM = "You are a coding agent running in the Codex CLI. " * 2000
 TITLE_META = (
     "Generate a concise, single-line task title of at most 36 characters. "
@@ -172,7 +171,6 @@ class ResumeBlockSanitizesPollutedGoalTests(unittest.TestCase):
     def test_polluted_goal_is_dropped(self):
         import json
         import tempfile
-        from pathlib import Path
         from unittest import mock
 
         from chatgpt_web import tasks

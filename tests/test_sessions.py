@@ -1,5 +1,6 @@
-"""会话状态内存缓存的有界化（对照 doc/update_codex.md §2.4）。"""
+"""会话状态内存缓存的有界化 + 桶忙闲语义（T2.4）。"""
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -56,6 +57,76 @@ class SessionCacheEvictionTests(unittest.TestCase):
                 self.driver._page_last_used[f"b{i}"] = float(i)
                 self.driver._state(f"b{i}")
             self.assertEqual(len(self.driver._sessions), 10)
+
+
+class _FakePage:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class BucketBusySemanticsTests(unittest.TestCase):
+    """T2.4：忙闲判断必须反映**真实桶**，而不是共享锁的状态。
+
+    旧实现用 ``_lock_for(bucket).locked()``：在 ``PARALLEL_BUCKETS=false``
+    （所有桶共用一把锁）时，只要任意桶在跑，所有桶都被判成忙——于是流式路径
+    把「别的桶在跑」误报成 503，LRU 换页也永远选不出候选。
+    """
+
+    def setUp(self):
+        self.driver = ChatGPTWebDriver(user_data_dir="/tmp/chatgpt-test-noprofile")
+        self._patch = mock.patch.object(
+            config, "SESSION_FILE", Path("/tmp/chatgpt-test-busy.json")
+        )
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        Path("/tmp/chatgpt-test-busy.json").unlink(missing_ok=True)
+
+    def test_only_active_bucket_is_busy_in_serial_mode(self):
+        with mock.patch.object(config, "PARALLEL_BUCKETS", False):
+            self.driver._active_buckets.add("other")
+            self.assertTrue(self.driver.bucket_busy("other"))
+            self.assertFalse(self.driver.bucket_busy("mine"))
+            self.assertFalse(self.driver.bucket_busy())
+            self.assertEqual(self.driver.busy_keys(), ["other"])
+
+    def test_shared_lock_held_by_other_bucket_is_not_busy(self):
+        """串行模式前提校验：锁确实共享，但本桶不应被判忙。"""
+        async def scenario() -> bool:
+            async with self.driver._session_lock("other"):
+                shared = self.driver._lock_for("mine").locked()
+                self.assertTrue(self.driver.bucket_busy("other"))
+                self.assertFalse(self.driver.bucket_busy("mine"))
+                return shared
+
+        with mock.patch.object(config, "PARALLEL_BUCKETS", False), \
+                mock.patch.object(config, "BUCKET_LOCK_TIMEOUT_S", 5):
+            self.assertTrue(asyncio.run(scenario()), "前提：串行模式下锁是共享的")
+        # 锁释放后全部空闲
+        self.assertFalse(self.driver.bucket_busy("other"))
+
+    def test_lru_eviction_picks_candidate_while_other_bucket_is_busy(self):
+        """别的桶忙、本桶空闲时，LRU 换页仍能选出候选（旧实现永远选不出来）。"""
+        busy_page, idle_page = _FakePage(), _FakePage()
+        self.driver._pages["busy"] = busy_page
+        self.driver._pages["idle"] = idle_page
+        self.driver._page_last_used.update({"busy": 1.0, "idle": 2.0})
+
+        async def scenario() -> bool:
+            async with self.driver._session_lock("busy"):
+                return await self.driver._evict_lru_page(exclude="new")
+
+        with mock.patch.object(config, "PARALLEL_BUCKETS", False), \
+                mock.patch.object(config, "BUCKET_LOCK_TIMEOUT_S", 5):
+            self.assertTrue(asyncio.run(scenario()))
+        self.assertTrue(idle_page.closed)
+        self.assertFalse(busy_page.closed, "正在生成的桶不得被淘汰")
+        self.assertIn("busy", self.driver._pages)
+        self.assertNotIn("idle", self.driver._pages)
 
 
 class SeedShrinkOnRepeatedCapTests(unittest.TestCase):

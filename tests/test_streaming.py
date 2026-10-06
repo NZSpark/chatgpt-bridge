@@ -5,11 +5,9 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chatgpt_web import config  # noqa: E402
 from chatgpt_web.models import ChatCompletionRequest  # noqa: E402
 from chatgpt_web.streaming import _chunk_text, _stream_chat_completion  # noqa: E402
 
@@ -36,8 +34,13 @@ def _events(lines):
 class FakeDriver:
     def __init__(self, reply="hello there"):
         self.reply = reply
+        self.validate_calls = []
 
-    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
+    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None,
+                        validate_reply=None):
+        # 生产代码在工具模式下会传纠偏判定；fake 记录它，但不重试
+        # （纠偏重试的行为由 tests/test_tool_injection.py 用假 page 覆盖）。
+        self.validate_calls.append(validate_reply)
         if on_delta:
             await on_delta(self.reply)
         return self.reply, []

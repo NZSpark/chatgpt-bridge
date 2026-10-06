@@ -84,7 +84,20 @@ class DefaultValueTests(unittest.TestCase):
         )
 
     def test_response_selectors_are_chatgpt(self):
+        # 老版 DOM 钩子保留（部分账号/灰度仍是旧 UI），新版钩子必须有：
+        # 2026-10-06 线上改版后助手回复容器是 <div class="MarkdownRoot-<hash>"
+        # data-markdown-text-style>，旧属性（author-role / message-content /
+        # .markdown）逐条命中数全为 0 → 轮询 nodes=0 空转到超时、拿不到回复。
         self.assertIn("message-content", config.RESPONSE_SELECTORS)
+        self.assertIn("[data-markdown-text-style]", config.RESPONSE_SELECTORS)
+        self.assertIn('class*="MarkdownRoot"', config.RESPONSE_SELECTORS)
+        # 用户消息容器（[data-user-message-bubble] / *-user-message）绝不能选进来，
+        # 否则会把用户自己发的内容当成回复。
+        self.assertNotIn("user-message", config.RESPONSE_SELECTORS)
+        # 直接喂 page.query_selector_all：逗号分隔的 CSS 列表，不能混入 "||"。
+        self.assertNotIn("||", config.RESPONSE_SELECTORS)
+        for selector in config.RESPONSE_SELECTORS.split(","):
+            self.assertTrue(selector.strip(), config.RESPONSE_SELECTORS)
 
     def test_new_chat_selector_has_fallback_chain(self):
         self.assertIn("||", config.NEW_CHAT_SELECTOR)

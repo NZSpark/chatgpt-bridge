@@ -6,8 +6,8 @@ class ToolResultFidelityTests(unittest.TestCase):
     """工具执行结果必须逐字节保留，供 edit 工具做 oldText 精确匹配。"""
 
     def test_tool_result_preserves_trailing_newline(self):
-        from chatgpt_web.prompting import _render_message
         from chatgpt_web.models import ChatMessage
+        from chatgpt_web.prompting import _render_message
 
         raw = "1  # Title\n2  \n3  ## Section\n4  text\n"
         m = ChatMessage(role="tool", content=raw, tool_call_id="call_1")
@@ -16,8 +16,8 @@ class ToolResultFidelityTests(unittest.TestCase):
         self.assertEqual(body, raw)
 
     def test_tool_result_preserves_leading_blank_lines(self):
-        from chatgpt_web.prompting import _render_message
         from chatgpt_web.models import ChatMessage
+        from chatgpt_web.prompting import _render_message
 
         raw = "\n\n# Title\n"
         m = ChatMessage(role="tool", content=raw)
@@ -91,8 +91,8 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         self.assertIn('"required"', text)
 
     def test_tool_instructions_come_before_user_task(self):
-        from chatgpt_web.prompting import build_prompt
         from chatgpt_web.models import ChatMessage
+        from chatgpt_web.prompting import build_prompt
 
         msgs = [ChatMessage(role="user", content="请查看当前目录")]
         prompt = build_prompt(msgs, tools=self.TOOLS, seed=True)
@@ -117,8 +117,8 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         明确禁止多调用，且不得再出现旧版「可以一次调用多个工具」的措辞。
         """
         from chatgpt_web.toolcalls import (
-            format_tools_instruction,
             format_tool_call_emphasis,
+            format_tools_instruction,
         )
 
         for text in (

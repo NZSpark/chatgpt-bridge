@@ -1,15 +1,13 @@
-"""Responses 流式事件：item id / call_id / output_index 一致性（对照 doc/update_codex.md §2.2）。"""
+"""Responses 流式事件：item id / call_id / output_index 一致性（对照 README「Codex CLI 接入」；真实 E2E 结论见 doc/update.md §2.8）。"""
 
 import asyncio
 import json
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chatgpt_web import config  # noqa: E402
 from chatgpt_web.models import ChatCompletionRequest, ChatMessage  # noqa: E402
 from chatgpt_web.responses import stream_responses  # noqa: E402
 
@@ -48,7 +46,9 @@ class FakeDriver:
     def sent_prompt(self, key=None):
         return "prompt"
 
-    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
+    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None,
+                        validate_reply=None):
+        # validate_reply：生产代码在工具模式下传的纠偏判定（仅供签名兼容）。
         if on_delta:
             await on_delta(self.reply)
         return self.reply, []

@@ -1,8 +1,10 @@
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
-import json
+from unittest.mock import MagicMock, patch
+
 from fastapi.testclient import TestClient
+
 from chatgpt_web.server import app
+
 
 class ChatRouteTests(unittest.TestCase):
     def setUp(self):
@@ -14,6 +16,8 @@ class ChatRouteTests(unittest.TestCase):
         mock_driver.session_stats.return_value = {}
         mock_driver.session_keys.return_value = []
         mock_driver.cluster_stats.return_value = {}
+        # healthz 会带出「桶 → 页面/会话」映射（T3.1）；假 driver 返回空表
+        mock_driver.bucket_map.return_value = {}
         mock_driver.init_error = None
 
         res = self.client.get('/healthz')
@@ -21,6 +25,7 @@ class ChatRouteTests(unittest.TestCase):
         data = res.json()
         self.assertEqual(data.get('status'), 'ok')
         self.assertIn('cluster', data)
+        self.assertEqual(data.get('buckets'), {})
 
     @patch('chatgpt_web.server.driver')
     def test_healthz_endpoint_degraded(self, mock_driver):
@@ -28,6 +33,7 @@ class ChatRouteTests(unittest.TestCase):
         mock_driver.session_stats.return_value = {}
         mock_driver.session_keys.return_value = []
         mock_driver.cluster_stats.return_value = {}
+        mock_driver.bucket_map.return_value = {}
         mock_driver.init_error = "Browser failed to start"
 
         res = self.client.get('/healthz')

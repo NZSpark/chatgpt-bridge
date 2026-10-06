@@ -5,9 +5,9 @@ ProseMirror 的 keymap 忽略合成事件（isTrusted=false），提交失败。
 真实键盘 Enter（chat_io._keyboard_enter）。本用例直接驱动 ChatGPTWebDriver
 走真实网络，验证：
 
-* T1 单行 prompt 提交并收到回复；
-* T2 多行 prompt（含换行 / 代码块）提交并收到回复——**核心回归**；
-* T3 输入框残留草稿会被清空，新 prompt 不被拼接（发送前 prefill 一段旧文本）。
+* T1 多行 prompt（含换行 / 代码块）提交并收到回复——**核心回归**；
+  单行提交是它的子集（同一 `send_chat` 链路），不再单列用例（2026-10-06 收敛）；
+* T2 输入框残留草稿会被清空，新 prompt 不被拼接（发送前 prefill 一段旧文本）。
 
 默认不运行：需 CHATGPT_E2E=1（真实访问 ChatGPT）。运行：
 
@@ -77,10 +77,6 @@ class PromptSubmitE2ETests(unittest.TestCase):
                     await driver.playwright.stop()
             except Exception:  # noqa: BLE001
                 pass
-
-    def test_single_line_prompt_submits(self):
-        text = asyncio.run(self._run_case("只回复两个字：收到"))
-        self.assertTrue(text.strip(), "单行 prompt 提交后未收到任何回复")
 
     def test_multiline_prompt_submits(self):
         """核心回归：多行 prompt（含换行 / 代码块）必须能提交成功。"""

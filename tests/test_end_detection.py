@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import logging
 import sys
 import unittest
 import unittest.mock
@@ -19,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chatgpt_web import config  # noqa: E402
+from chatgpt_web import chat_io, config  # noqa: E402
 from chatgpt_web.driver import ChatGPTTimeoutError, ChatGPTWebDriver  # noqa: E402
 
 
@@ -310,6 +311,51 @@ class TimeoutExtensionTests(EndDetectionTestCase):
                 with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1):
                     with self.assertRaises(ChatGPTTimeoutError):
                         self.run_chat(driver)
+
+
+class EmptyReplyNodeDiagnosticsTests(EndDetectionTestCase):
+    """2026-10-06 回归：回复节点始终为 0 且页面仍在生成时，打印一次诊断。
+
+    网页版改版导致 RESPONSE_SELECTORS 失效时，轮询只能空转到超时，
+    日志里什么线索都没有。这里锁定「一次性逐条命中数」的接线。
+    """
+
+    def test_diagnostic_is_logged_exactly_once(self):
+        # baseline/script 都是空：RESPONSE_SELECTORS 永远一个节点都命中不了，
+        # 而页面一直“生成中”——正是选择器失效的指纹。
+        page = FakePage(baseline=[], script=[[]], generating=[True])
+        driver = self.driver_for(page)
+        with unittest.mock.patch.object(config, "RESPONSE_TIMEOUT_S", 0.05), \
+                unittest.mock.patch.object(config, "RESPONSE_TIMEOUT_EXTEND_S", 0.1), \
+                unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1), \
+                unittest.mock.patch.object(chat_io, "_EMPTY_NODE_REPORT_AFTER", 1):
+            with self.assertLogs("chatgpt_web.chat_io", level="INFO") as captured:
+                with self.assertRaises(ChatGPTTimeoutError):
+                    self.run_chat(driver)
+        log = "\n".join(captured.output)
+        banners = [line for line in captured.output if "[诊断]" in line]
+        self.assertEqual(len(banners), 1, log)
+        # 逐条命中数（最少要能看到新版的语义钩子）
+        self.assertIn("[data-markdown-text-style]: 0", log)
+        self.assertIn("可见文本长度", log)
+
+    def test_grace_period_avoids_first_frame_false_alarm(self):
+        # 正常请求的首轮也会 nodes=0（助手节点晚一帧渲染）+ generating=True，
+        # 阈值大于 1 时不得报警，否则每次真实请求都刷一条误导性的「改版」告警。
+        page = FakePage(baseline=[], script=[[], ["迟到的回复"], ["迟到的回复"],
+                                           ["迟到的回复"], ["迟到的回复"]],
+                        generating=[True, False, False, False, False])
+        driver = self.driver_for(page)
+        messages = []
+        handler = logging.Handler()
+        handler.emit = lambda record: messages.append(record.getMessage())  # type: ignore[method-assign]
+        log_target = logging.getLogger("chatgpt_web.chat_io")
+        log_target.addHandler(handler)
+        self.addCleanup(log_target.removeHandler, handler)
+        with unittest.mock.patch.object(chat_io, "_EMPTY_NODE_REPORT_AFTER", 5):
+            text, _ = self.run_chat(driver)
+        self.assertEqual(text, "迟到的回复")
+        self.assertFalse([m for m in messages if "[诊断]" in m], messages)
 
 
 class PendingTokenTests(EndDetectionTestCase):

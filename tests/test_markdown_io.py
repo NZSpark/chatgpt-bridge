@@ -7,7 +7,6 @@ from chatgpt_web.markdown_io import (
     MarkdownError,
     parse_md,
     read_md,
-    scan_fences,
     text_lines,
 )
 
@@ -23,7 +22,7 @@ class ReadMdTests(unittest.TestCase):
         d = parse_md("# T" + NL + "x")
         self.assertEqual(d.newline, NL)
         self.assertFalse(d.trailing_newline)
-        self.assertEqual([l.text for l in d.lines], ["# T", "x"])
+        self.assertEqual([line.text for line in d.lines], ["# T", "x"])
         self.assertEqual(d.text, "# T" + NL + "x")
 
     def test_lf_trailing(self):
@@ -149,6 +148,7 @@ if __name__ == "__main__":
 from chatgpt_web.markdown_io import (  # noqa: E402
     Anchor,
     LocateError,
+    _safe_fence,
     apply_edit,
     backup_md,
     generate_edit,
@@ -157,7 +157,6 @@ from chatgpt_web.markdown_io import (  # noqa: E402
     rollback_md,
     verify,
     write_md,
-    _safe_fence,
 )
 
 DOC = (
@@ -254,6 +253,26 @@ class ApplyEditTests(unittest.TestCase):
         doc = parse_md("a" + NL + "b" + NL)
         edited = apply_edit(doc, 1, 1, F + "json" + NL + "{}" + NL + F)
         self.assertEqual([(f.start, f.end, f.lang) for f in edited.fences], [(1, 3, "json")])
+
+    def test_replace_fence_block_keeps_sibling_langs(self):
+        # 自 e2e 收敛（原 test_e2e_fence_block_replace_keeps_lang）：
+        # 整块替换一个围栏后，其余围栏的语言标签与结构不变
+        doc = parse_md(
+            "intro" + NL + F + "json" + NL + '{"v": 1}' + NL + F + NL
+            + "text" + NL + F + "bash" + NL + "ls" + NL + F + NL
+        )
+        edited = apply_edit(doc, 2, 4, F + "json" + NL + '{"v": 2}' + NL + F)
+        self.assertEqual([f.lang for f in edited.fences], ["json", "bash"])
+        self.assertIn('"v": 2', edited.text)
+        self.assertEqual(verify(edited), [])
+
+    def test_append_at_end_keeps_langs(self):
+        # 自 e2e 收敛（原 test_e2e_edit_keeps_fences_paired）：
+        # 末尾追加小节后，原有围栏仍然成对、语言标签不变
+        doc = parse_md(F + "json" + NL + "{}" + NL + F + NL)
+        edited = apply_edit(doc, 3, 3, F + NL + "## 许可" + NL + "一行正文")
+        self.assertEqual([f.lang for f in edited.fences], ["json"])
+        self.assertEqual(verify(edited), [])
 
 
 class WriteMdTests(unittest.TestCase):

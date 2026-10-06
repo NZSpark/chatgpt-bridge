@@ -23,7 +23,7 @@ from chatgpt_web import config
 from chatgpt_web.models import ChatMessage
 from chatgpt_web.prompting import build_prompt
 
-from .bridge import BridgeClient, BridgeServer, PROJECT_ROOT
+from .bridge import PROJECT_ROOT, BridgeClient, BridgeServer
 from .direct import DirectChatGPTClient
 
 GATE = os.environ.get("CHATGPT_E2E") == "1"
@@ -83,9 +83,30 @@ def _ensure_direct() -> DirectChatGPTClient:
     return DIRECT
 
 
+def _cleanup_module() -> None:
+    """模块级回收（幂等）。
+
+    用 ``unittest.addModuleCleanup`` 注册：它在 setUpModule **抛错时依然执行**，
+    而 ``tearDownModule`` 不会——这正是 T2.2 修善的泄漏路径。
+    """
+    global SERVER, DIRECT, BRIDGE
+    if DIRECT is not None:
+        try:
+            DIRECT.close()
+        except Exception:  # noqa: BLE001
+            pass
+        DIRECT = None
+    if SERVER is not None:
+        SERVER.stop()
+        SERVER = None
+    BRIDGE = None
+
+
 def setUpModule() -> None:
     if not GATE:
         return
+    # 先注册回收，再做任何可能失败/泄漏的步骤
+    unittest.addModuleCleanup(_cleanup_module)
     _copy_profile()
 
     global SERVER, BRIDGE
@@ -102,10 +123,7 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
-    if DIRECT is not None:
-        DIRECT.close()
-    if SERVER is not None:
-        SERVER.stop()
+    _cleanup_module()
     if _TIMINGS:
         print("\n[E2E 耗时汇总]（bridge/direct 比值 > 3 视为可疑，仅提示）")
         by_case: Dict[str, Dict[str, float]] = {}
