@@ -176,6 +176,7 @@ codex --profile chatgpt
 | `BUCKET_LOCK_TIMEOUT_S` | `120` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
 | `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
+| `TOOL_NUDGE_UNTIL_FIRST_CALL` | `true` | 工具纠偏只在本轮还没调用过任何工具时生效；`false` = 完全不纠偏（桥绝不自行追发 prompt） |
 | `PROMPT_MAX_CHARS` | `1000000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
 | `SESSION_MAX_TURNS` | `120` | 轮数到顶阈值（0 禁用） |
 | `SESSION_MAX_TOKENS` | `10000000` | 估算 token 到顶阈值（0 禁用） |
@@ -279,6 +280,7 @@ user_data/                浏览器 profile 与状态（gitignore）
 - 每轮任务重播：不依赖恢复旧网页会话，而是按会话历史重新播种任务；同时由 tasks.py 保存任务目标，避免轮转或上下文压缩导致目标丢失。
 - 结束判定偏保守：结合内容 / 长度双阈值，并在回复节点仍存在 .pending / .animating token 时继续等待，降低读到半截回复的概率。
 - 工具调用单独解析：tools 不直接交给网页端，而是先注入结构化提示，再从模型文本中解析 TOOL_CALL: {...}；解析失败时回退为普通文本。
+- **桥不自行追发 prompt**：工具纠偏只在本轮任务「一次工具都还没调用过」时生效（`TOOL_NUDGE_UNTIL_FIRST_CALL`）。历史里一旦出现工具结果 / 工具调用，无指令的纯文本回复就作为最终答案返回，由客户端判定任务结束——避免「ChatGPT 已收尾、桥又追发一条 prompt、模型被迫再吐新指令」这种收不了尾的情形。
 - 会话隔离与资源回收：通过 X-ChatGPT-Session、user、User-Agent 建立会话桶，并配合 LRU 与页面池控制浏览器资源。
 - 配置与 DOM 解耦：选择器、轮询阈值、会话数量、任务快照和 Responses API 开关集中在 .env，网页版改版时优先调整配置。
 

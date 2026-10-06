@@ -383,6 +383,57 @@ prompt 里是：
 工具说明含空输出规则），并把真实场景的整段 prompt 打印出来人工核对。
 `pytest` → **337 passed / 17 skipped**，`ruff` / `mypy` 干净。
 
+### 2.12（已修复）任务已结束后仍追发 prompt，模型被迫再吐新指令
+
+**现象（用户实测）**：ChatGPT 已经把任务做完、用纯文本收尾（例如「工作区是干净的，任务完成」），
+bridge 却**紧接着又往输入框发了一条 prompt**，于是 ChatGPT 又生成了一条新指令，任务永远收不了尾。
+
+**根因**：T1.1 的工具纠偏（`chat_io.send_chat(validate_reply=...)`）在**任何**工具模式下都会触发：
+只要模型这次的回复里没有解析出 `TOOL_CALL`，判定就返回 False → 立刻在同一会话追发
+`format_tool_retry_nudge()`。而「没有工具调用」有两种完全不同的含义，旧实现把它们混为一谈：
+
+| 场景 | 真实含义 | 旧行为 | 现行为 |
+| --- | --- | --- | --- |
+| 本轮任务**一次工具都没调用过**（首轮） | 模型可能完全无视工具、凭自身知识编了个结果（C1/C2 失败） | 追发纠偏 | **保留**（T1.1 的原始目标） |
+| 历史里已有 tool 结果 / assistant `tool_calls` | 任务早已进入执行阶段，这次的纯文本是**收尾** | 追发纠偏 → 把结论重新推成一条新命令 | **不追发**，纯文本即最终答案 |
+
+**关于「无指令反馈就等待下一条指令，超时则判定任务结束」**：桥是一个 HTTP 服务，**没有能力
+自行收到 ChatGPT 的后续消息**——网页版不会在无人发 prompt 时主动说话，所以「等」在桥侧只有两种
+落地方式，二者都已具备：
+
+1. **不主动制造新 prompt**（本次修复）：无指令的回复原样作为最终答案返回，客户端（Codex / Pi）
+   看到没有 `tool_calls` 即判定任务结束；「预定时间」由客户端自己的循环负责。
+2. **回复可能还没说完时继续等**（既有能力）：模型分段输出、停止按钮短暂消失后**又**补出
+   `TOOL_CALL` 的情况，由 `end_detection.evaluate_poll` 的静默窗口（`RESUME_QUIET_POLLS` ×
+   `POLL_INTERVAL_S`，默认 ≈6s）继续等到内容出现或静默结束，
+   回归测试：`tests/test_end_detection.py::GeneratingStateTests::test_transient_pause_then_tool_call_is_not_truncated`。
+
+**修复内容**：
+
+1. `config.TOOL_NUDGE_UNTIL_FIRST_CALL`（默认 `true`）：纠偏只在本轮任务**还没调用过任何工具**时生效；
+   设为 `false` = **完全不纠偏**（桥绝不自行追发任何 prompt，模型没调用工具时直接返回纯文本）。
+2. `prompting.has_prior_tool_use(messages)`：历史里出现 `role == "tool"` 或带 `tool_calls` 的
+   assistant 消息即认为任务已进入执行阶段（两条路径都覆盖：`/v1/chat/completions` 的原始 messages，
+   以及 `/v1/responses` 由 `function_call` / `function_call_output` 转换来的消息）。
+3. `prompting.tool_nudge_predicate(messages, tools, tool_choice)`：返回 `None`（不纠偏）或判定函数；
+   与三个入口的 `wants_tools = bool(tools) and tool_choice != "none"` 口径一致。
+4. 三处接线统一改为 `tool_nudge_predicate(...)`：`server.py`（非流式）、`streaming.py`（chat SSE）、
+   `responses.py`（`run_chat`，流式 / 非流式共用）。
+
+**验证**：新增 17 条单测——
+
+* `prompting` 侧（首轮仍纠偏、有 tool 结果 / 有 `tool_calls` 即不纠偏、无 tools /
+  `tool_choice="none"` 不纠偏、配置关掉即完全不纠偏）；
+* 两条调用链的**接线**断言（`tests/test_streaming.py::NudgePredicateWiringTests`、
+  `tests/test_responses.py::RunChatNudgePredicateTests` 直接断言传给 driver 的 `validate_reply`
+  是 `None` 还是判定函数）；
+* **驱动层**回归（`tests/test_tool_injection.py::ToolRetryTests::test_task_end_sends_no_second_prompt`）：
+  用「输入框里最后一次被填充的文本」作为判据，断言收尾场景下桥**没有**再发任何 prompt。
+  该用例有真实区分力——把 `validate_reply` 换回旧的 `tool_call_predicate` 会立刻复现故障
+  （实测输出「桥又发了一条 prompt: True / 模型被迫吐出新指令: True」）。
+`.env` / `.env.example` / README 同步新增该配置项（`tests/test_config_drift.py` 强制模板不落后）。
+`pytest` → **354 passed / 17 skipped**，`ruff` / `mypy` 干净。
+
 ---
 
 ## 3. 静态分析发现（与 E2E 无关的既有问题）
