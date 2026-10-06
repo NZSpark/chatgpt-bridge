@@ -203,17 +203,23 @@ ToolCallRequest
 
 ## PI-008 ToolCall 标准流水线
 
-状态：TODO｜优先级：P1｜依赖：PI-007
+状态：DONE｜优先级：P1｜依赖：PI-007
 
-固定流程：
+固定流程已建立：
 
 text
 parse → validate → normalize → deduplicate → policy check → execute → serialize result
 
+实现了 typed `ToolCallRequest` 边界、阶段化异常（parse / validation / policy / execution / serialization）、工具参数 validator、调用 ID 去重、allow-list policy、注入式 executor 与 JSON serialization boundary；保留现有 `parse_tool_calls()` dict facade 以兼容旧调用方。
 
 ### 验收
 
-parse error、policy error、execution error 必须能明确区分。
+- parse error、policy error、execution error、serialization error 均有明确独立异常类型；
+- 同一 `tool_call_id` 在 pipeline 内只保留首次调用；
+- tool allow-list 在执行前检查；
+- executor 通过显式注入边界调用；
+- 结果在返回前经过 JSON serialization 校验；
+- `tests/test_toolcalls.py` 新增 pipeline 回归覆盖，现有 tool calling 测试全部通过。
 
 ## PI-009 Tool execution ledger
 

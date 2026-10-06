@@ -1185,6 +1185,168 @@ def parse_tool_call_requests(
     return requests
 
 
+class ToolCallPipelineError(RuntimeError):
+    """Base error for the explicit parse/validate/policy/execute pipeline."""
+
+    stage = "pipeline"
+
+
+class ToolCallParseError(ToolCallPipelineError):
+    stage = "parse"
+
+
+class ToolCallValidationError(ToolCallPipelineError):
+    stage = "validate"
+
+
+class ToolCallPolicyError(ToolCallPipelineError):
+    stage = "policy"
+
+
+class ToolCallExecutionError(ToolCallPipelineError):
+    stage = "execute"
+
+
+class ToolCallSerializationError(ToolCallPipelineError):
+    stage = "serialize"
+
+
+def validate_tool_call_requests(
+    requests: List[ToolCallRequest],
+    validators: Optional[Dict[str, Callable[[Dict[str, Any]], Any]]] = None,
+) -> List[ToolCallRequest]:
+    """Validate the typed boundary and optional per-tool argument validators."""
+    validators = validators or {}
+    validated: List[ToolCallRequest] = []
+    for request in requests:
+        if not isinstance(request, ToolCallRequest):
+            raise ToolCallValidationError("tool call must be a ToolCallRequest")
+        if not request.id.strip():
+            raise ToolCallValidationError("tool call id is required")
+        if not request.name.strip():
+            raise ToolCallValidationError("tool call name is required")
+        if not isinstance(request.arguments, dict):
+            raise ToolCallValidationError(
+                f"tool call arguments must be an object: {request.name}"
+            )
+        validator = validators.get(request.name)
+        if validator is not None:
+            try:
+                accepted = validator(dict(request.arguments))
+            except Exception as exc:  # noqa: BLE001
+                raise ToolCallValidationError(
+                    f"invalid arguments for tool {request.name}: {exc}"
+                ) from exc
+            if accepted is False:
+                raise ToolCallValidationError(
+                    f"invalid arguments for tool {request.name}"
+                )
+        validated.append(request)
+    return validated
+
+
+def normalize_tool_call_requests(
+    requests: List[ToolCallRequest],
+) -> List[ToolCallRequest]:
+    """Normalize names and copy arguments without changing tool semantics."""
+    return [
+        ToolCallRequest(
+            id=request.id.strip(),
+            name=request.name.strip(),
+            arguments=dict(request.arguments),
+            source_span=request.source_span,
+            raw_text=request.raw_text,
+        )
+        for request in requests
+    ]
+
+
+def deduplicate_tool_call_requests(
+    requests: List[ToolCallRequest],
+) -> List[ToolCallRequest]:
+    """Drop repeated call ids while preserving distinct parallel calls."""
+    seen_ids: set[str] = set()
+    unique: List[ToolCallRequest] = []
+    for request in requests:
+        if request.id in seen_ids:
+            logger.warning(
+                "重复 tool_call 被丢弃：tool_call_id=%s tool=%s",
+                request.id,
+                request.name,
+            )
+            continue
+        seen_ids.add(request.id)
+        unique.append(request)
+    return unique
+
+
+def check_tool_call_policy(
+    requests: List[ToolCallRequest],
+    allowed_tools: Optional[set[str]] = None,
+) -> List[ToolCallRequest]:
+    """Apply the current allow-list policy after parsing and normalization."""
+    if allowed_tools is None:
+        return requests
+    denied = [request.name for request in requests if request.name not in allowed_tools]
+    if denied:
+        names = ", ".join(sorted(set(denied)))
+        raise ToolCallPolicyError(f"tools not allowed: {names}")
+    return requests
+
+
+def execute_tool_call_requests(
+    requests: List[ToolCallRequest],
+    executor: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+) -> List[Dict[str, Any]]:
+    """Execute the typed batch through an injected executor boundary."""
+    mappings = tool_call_request_mappings(requests)
+    if executor is None:
+        return mappings
+    try:
+        result = executor(mappings)
+    except Exception as exc:  # noqa: BLE001
+        raise ToolCallExecutionError(f"tool execution failed: {exc}") from exc
+    if not isinstance(result, list):
+        raise ToolCallExecutionError("tool executor must return a list")
+    return result
+
+
+def serialize_tool_call_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate JSON serializability and return detached result mappings."""
+    try:
+        return [json.loads(json.dumps(result, ensure_ascii=False)) for result in results]
+    except (TypeError, ValueError) as exc:
+        raise ToolCallSerializationError(
+            f"tool result is not JSON serializable: {exc}"
+        ) from exc
+
+
+def run_tool_call_pipeline(
+    text: str,
+    *,
+    allowed_tools: Optional[set[str]] = None,
+    validators: Optional[Dict[str, Callable[[Dict[str, Any]], Any]]] = None,
+    executor: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+) -> List[Dict[str, Any]]:
+    """Run parse → validate → normalize → deduplicate → policy → execute → serialize."""
+    requests = parse_tool_call_requests(text)
+    if not requests:
+        marker = bool(
+            _TOOL_CALL_LINE_RE.search(text or "")
+            or _TOOL_CALL_FENCE_RE.search(text or "")
+            or re.search(r"(?m)^\s*tool[-_]?call(?:\s|$)", text or "", re.IGNORECASE)
+        )
+        if marker:
+            raise ToolCallParseError("tool call marker was present but no valid call was parsed")
+        return []
+    requests = validate_tool_call_requests(requests, validators)
+    requests = normalize_tool_call_requests(requests)
+    requests = deduplicate_tool_call_requests(requests)
+    requests = check_tool_call_policy(requests, allowed_tools)
+    results = execute_tool_call_requests(requests, executor)
+    return serialize_tool_call_results(results)
+
+
 def tool_call_request_mappings(
     requests: List[ToolCallRequest],
 ) -> List[Dict[str, Any]]:

@@ -9,12 +9,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from chatgpt_web.toolcalls import (  # noqa: E402
     ToolCallRequest,
+    ToolCallExecutionError,
+    ToolCallParseError,
+    ToolCallPolicyError,
+    ToolCallSerializationError,
+    ToolCallValidationError,
     _normalize_tool_entry,
     _tool_names,
+    check_tool_call_policy,
+    deduplicate_tool_call_requests,
+    execute_tool_call_requests,
     format_tools_instruction,
+    normalize_tool_call_requests,
     parse_tool_call_requests,
     parse_tool_calls,
+    run_tool_call_pipeline,
+    serialize_tool_call_results,
     to_tool_call_models,
+    validate_tool_call_requests,
 )
 
 TOOLS = [
@@ -555,6 +567,81 @@ class TypedParserTests(unittest.TestCase):
             {"real"},
         )
         self.assertEqual([request.name for request in requests], ["real"])
+
+
+class ToolCallPipelineTests(unittest.TestCase):
+    def _request(self, call_id="call_1", name="f", arguments=None):
+        return ToolCallRequest(call_id, name, arguments or {})
+
+    def test_validate_accepts_typed_requests(self):
+        request = self._request()
+        self.assertEqual(validate_tool_call_requests([request]), [request])
+
+    def test_validate_rejects_bad_request_type(self):
+        with self.assertRaises(ToolCallValidationError):
+            validate_tool_call_requests([{"name": "f", "arguments": {}}])
+
+    def test_validate_runs_per_tool_validator(self):
+        request = self._request(arguments={"x": 1})
+        validate_tool_call_requests([request], {"f": lambda args: args["x"] == 1})
+        with self.assertRaises(ToolCallValidationError):
+            validate_tool_call_requests([request], {"f": lambda args: False})
+
+    def test_normalize_strips_name_and_id(self):
+        request = self._request(" call_1 ", " f ", {"x": 1})
+        normalized = normalize_tool_call_requests([request])[0]
+        self.assertEqual(normalized.id, "call_1")
+        self.assertEqual(normalized.name, "f")
+
+    def test_deduplicate_keeps_first_call_id(self):
+        calls = [self._request(arguments={"x": 1}), self._request(arguments={"x": 2}), self._request("call_2")]
+        result = deduplicate_tool_call_requests(calls)
+        self.assertEqual([call.arguments for call in result], [{"x": 1}, {}])
+
+    def test_policy_rejects_denied_tool(self):
+        with self.assertRaises(ToolCallPolicyError):
+            check_tool_call_policy([self._request()], {"other"})
+
+    def test_execute_wraps_executor_error(self):
+        with self.assertRaises(ToolCallExecutionError):
+            execute_tool_call_requests([self._request()], lambda calls: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    def test_execute_uses_injected_executor(self):
+        result = execute_tool_call_requests(
+            [self._request()],
+            lambda calls: [{**calls[0], "result": {"ok": True}}],
+        )
+        self.assertEqual(result[0]["result"], {"ok": True})
+
+    def test_serialize_rejects_non_json_result(self):
+        with self.assertRaises(ToolCallSerializationError):
+            serialize_tool_call_results([{"result": object()}])
+
+    def test_pipeline_runs_in_order_and_serializes(self):
+        seen = []
+        text = '```tool_call\n{"id":"call_1","name":"f","arguments":{"x":1}}\n```'
+
+        def validate(args):
+            seen.append(("validate", dict(args)))
+            return True
+
+        def execute(calls):
+            seen.append(("execute", calls[0]["name"], calls[0]["arguments"]))
+            return [{"ok": True, "name": calls[0]["name"]}]
+
+        result = run_tool_call_pipeline(
+            text,
+            allowed_tools={"f"},
+            validators={"f": validate},
+            executor=execute,
+        )
+        self.assertEqual(result, [{"ok": True, "name": "f"}])
+        self.assertEqual(seen[0][0], "validate")
+        self.assertEqual(seen[1][0], "execute")
+
+    def test_pipeline_parse_error_is_distinct(self):
+        with self.assertRaises(ToolCallParseError):
+            run_tool_call_pipeline("```tool_call\n{not json}\n```")
 
 
 class ToToolCallModelsTests(unittest.TestCase):
