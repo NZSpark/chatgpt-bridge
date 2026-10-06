@@ -5,9 +5,14 @@
 这样测试可以直接 ``patch.object(config, "NAME", value)`` 生效。
 """
 
+
+import ipaddress
+import logging
 import os
-import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
 
 # ==================== 0. 配置加载 (.env) ====================
 # 所有可调参数集中在项目根目录的 .env（模板见 .env.example）。
@@ -24,7 +29,7 @@ def _load_env_file(path: Path) -> None:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except Exception as exc:  # noqa: BLE001
-        print(f"[配置] 读取 {path} 失败，将使用默认值：{exc}")
+        logger.warning(f"[配置] 读取 {path} 失败，将使用默认值：{exc}")
         return
     for raw in lines:
         line = raw.strip()
@@ -68,6 +73,24 @@ def env_bool(key: str, default: bool = False) -> bool:
 # ==================== 服务监听 ====================
 HOST = env_str("HOST", "127.0.0.1")
 PORT = env_int("PORT", 8002)
+
+
+def is_loopback_host(host: str) -> bool:
+    """HOST 是否只对本机可见（纯函数，便于单测与启动告警）。
+
+    空串/``localhost`` 视为回环（与默认值 ``127.0.0.1`` 等价）；其余主机名
+    一律按“可能对外”处理——安全告警宁可多喊一声，也不要默认放行。
+    """
+    raw = (host or "").strip().lower()
+    if not raw or raw in ("localhost", "localhost.localdomain"):
+        return True
+    if raw.startswith("[") and raw.endswith("]"):  # [::1]
+        raw = raw[1:-1]
+    try:
+        return ipaddress.ip_address(raw).is_loopback
+    except ValueError:
+        # 主机名（非 IP）：只有明确的本机名才算回环，其余一律按“对外”处理
+        return raw.split(".")[0] in ("localhost", "ip6-localhost")
 
 
 # ==================== 路径 ====================
@@ -244,6 +267,13 @@ RESPONSES_KEEPALIVE_S = env_float("RESPONSES_KEEPALIVE_S", 10.0)
 EDIT_MARKDOWN_LOCAL = env_bool("EDIT_MARKDOWN_LOCAL", False)
 # edit_markdown 落盘前的备份目录。
 EDIT_MARKDOWN_BACKUP_DIR = env_str("EDIT_MARKDOWN_BACKUP_DIR", "output/backups")
+# edit_markdown 的**路径沙箱根目录**：模型给出的相对路径必须解析到该目录之内，
+# 绝对路径与含 `..` 的路径一律拒绝（否则被注入工具的模型可覆盖本机任意文件）。
+# 默认项目根；留空也回退到项目根（不提供“关闭沙箱”的选项）。
+EDIT_MARKDOWN_ROOT = env_str("EDIT_MARKDOWN_ROOT", str(PROJECT_ROOT))
+# 是否允许 edit_markdown 真正落盘。默认 false：即使模型传 `write=true`，
+# 也只返回 unified diff（dry-run），并在结果里说明被降级的原因。
+EDIT_MARKDOWN_WRITE = env_bool("EDIT_MARKDOWN_WRITE", False)
 
 
 # 工具模式下：是否先缓冲整段回复再判断 tool_calls（true = 需要缓冲，
@@ -278,13 +308,24 @@ TASK_RECENT_ITEM_MAX_CHARS = env_int("TASK_RECENT_ITEM_MAX_CHARS", 500)
 # ==================== DOM 选择器 ====================
 # 统一集中在这里，网页版改版时只需改这一处（也可用 .env 覆盖而无需改代码）。
 # 回复节点的候选选择器（逗号分隔的 CSS 列表，直接交给 query_selector_all）
-# 实测（真实 DOM）：助手回复节点是 [data-message-author-role="assistant"]，
-# 旧的 message-content / .model-response-text 已不存在；.markdown 作兜底。
+#
+# 线上实测（2026-10-06，真实 DOM）：网页版改版后助手回复容器不再带
+# [data-message-author-role="assistant"]，message-content / .markdown 也全部落空
+# （逐条命中数都是 0），于是轮询 nodes=0 一路空转到超时、拿不到任何回复内容。
+# 新版 DOM 的助手正文容器是 <div class="MarkdownRoot-<hash>" data-markdown-text-style ...>，
+# 用户消息则是 [data-user-message-bubble]（**不能**选进来，否则会把用户自己发的
+# 内容当成回复）。因此按「语义属性优先 + 老版属性兜底」排列：
+#   [data-markdown-text-style] → 新版助手正文（非哈希属性，改版时最稳）
+#   [class*="MarkdownRoot"]    → 同一容器，class 前缀兜底（哈希后缀会变）
+#   [data-message-author-role="assistant"] / message-content / .markdown → 老版
+# 实测排除项：composer（div.ProseMirror）**不带** data-markdown-text-style，
+# 全新对话页上以上选择器命中数全为 0，不会把输入框/空白页误判成回复。
 # 注意：本值直接喂 page.query_selector_all()，必须是**逗号分隔**的 CSS 列表，
 # 不能用 "||"（那是 INPUT/SEND 这类逐条 wait_for_selector 的分隔符）。
 RESPONSE_SELECTORS = env_str(
     "RESPONSE_SELECTORS",
-    '[data-message-author-role="assistant"], message-content, .markdown',
+    '[data-message-author-role="assistant"], [data-markdown-text-style], '
+    '[class*="MarkdownRoot"], message-content, .markdown',
 )
 # 输入框候选选择器（.env 中用 "||" 分隔多个候选）
 # 实测（真实 DOM）：composer 是 ProseMirror 的 ``div#prompt-textarea``
@@ -296,7 +337,11 @@ INPUT_SELECTORS = [
     for s in env_str(
         "INPUT_SELECTORS",
         '#prompt-textarea||div.ProseMirror[contenteditable="true"]||'
-        'div[contenteditable="true"][role="textbox"]||textarea',
+        # :not([data-language]) 排除新版代码块里的 CodeMirror 编辑器
+        # （div.cm-content 也是 contenteditable + role=textbox，且有 data-language）。
+        # 不排除的话，一旦 composer 选择器落空，_find_input 会把代码块里的
+        # “编辑代码”编辑器当成输入框，把 prompt 写进回复正文。
+        'div[contenteditable="true"][role="textbox"]:not([data-language])||textarea',
     ).split("||")
     if s.strip()
 ]
@@ -322,16 +367,18 @@ READY_SELECTOR = env_str(
     '#prompt-textarea, div.ProseMirror, [data-message-author-role="assistant"]',
 )
 # 新建对话入口：每桶首次请求与轮转时点击，确保从干净会话开始。
-# 新建对话入口：每桶首次请求与轮转时点击，确保从干净会话开始。
-# 2024+ 改版后「新建对话」是 <a data-testid="create-new-chat-button">，
-# 且主入口 aria-label 可能为空（文案在 innerText="New chat"）。因此按
-# 稳定性排序：testid > aria-label（a/button 都试）> href="/" 兜底。
+# 线上实测（2026-10-06）：testid 只在部分版本存在，「同一选择器匹配到多个
+# 节点（当前会话项 / 折叠态零尺寸）」也是常态；选择器只负责「找得到」，
+# 「点得中」由 completion._open_new_chat 的候选排序 + JS click 兜底保证。
 NEW_CHAT_SELECTOR = env_str(
     "NEW_CHAT_SELECTOR",
+    '[data-testid="create-new-chat-button"]||'
     'a[aria-label="New chat"]||a[aria-label="新对话"]||a[aria-label="新聊天"]||'
     'button[aria-label="New chat"]||button[aria-label="新对话"]||'
     'button[aria-label="新聊天"]||'
-    '[data-testid="create-new-chat-button"]||a[href="/"]',
+    # 工作区版本（如 “New chat in Techtorium”）用前缀匹配兜底
+    'button[aria-label*="New chat"]||a[aria-label*="New chat"]||'
+    'a[href="/"]',
 )
 # ---- 默认开启「思考模式」----
 # 每次新建对话 / 轮转会话后，自动选中 composer 上的 Think 模式，否则网页版
@@ -348,5 +395,14 @@ THINK_MODE_SELECTOR = env_str(
 THINK_MODE_TEXTS = env_str("THINK_MODE_TEXTS", "think||思考")
 
 # 代码块 DOM
-CODE_BLOCK_SELECTOR = env_str("CODE_BLOCK_SELECTOR", "pre")
-CODE_TAG_SELECTOR = env_str("CODE_TAG_SELECTOR", "code")
+#
+# 2026-10-06 线上实测：新版网页版把代码块换成 div.CodeBlock-<hash>，内部**没有**
+# pre/code，代码正文交给 CodeMirror 渲染：
+#   div.CodeBlock-<hash>
+#     div[data-markdown-copy="exclude"]        ← 语言名 / Copy / Run code 的头部（非正文）
+#     div.cm-content[data-language="python"]   ← 代码正文（role=textbox）
+# 因此：块容器选 [class*="CodeBlock"]（并保留 pre 兼容旧版），
+# 正文/语言节点选 [data-language]（并保留 code 兼容旧版）——只选正文节点，
+# 语言头就不会混进提取出的代码。
+CODE_BLOCK_SELECTOR = env_str("CODE_BLOCK_SELECTOR", '[class*="CodeBlock"], pre')
+CODE_TAG_SELECTOR = env_str("CODE_TAG_SELECTOR", "[data-language], code")

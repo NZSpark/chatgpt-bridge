@@ -1,0 +1,70 @@
+# 项目元数据与工具配置（doc/tasks.md T4.1）。
+# 本文件由仓库里原有的 `uv init` 骨架合并而来：保留 name/version/readme/requires-python，
+# 补齐运行期依赖（带上下界）、dev extra、pytest / ruff / mypy 配置与构建后端。
+[project]
+name = "chatgptbridge"
+version = "0.1.0"
+description = "把 ChatGPT 网页版桥接成 OpenAI 兼容 API（零配置、无需 API Key）"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    # 带上下界：允许次版本/补丁升级，只挡主版本破坏性变更（T4.1）
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "playwright>=1.45,<2",
+    "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "httpx>=0.27,<1",   # fastapi.testclient 依赖
+    "ruff>=0.6,<1",
+    "mypy>=1.11,<3",
+    "openai>=1,<4",     # e2e B8（SDK 冒烟）用
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["chatgpt_web"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# e2e（tests/e2e/）默认全部 skip，需 CHATGPT_E2E=1 才运行：
+# 判定矩阵与前置条件见 doc/e2e_test_design.md。
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# 规则集刻意收敛（T4.1）：先只锁定「一定不能坏」的四类，后续再逐步扩。
+#   E4/E7/E9  语法级错误；F  pyflakes；I  import 排序
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# driver.py 顶部先定义 `async_playwright = None` 占位、再 import 同包 mixin：
+# 这是「惰性 import Playwright」设计的一部分（见该文件顶部注释），E402 属有意为之。
+"chatgpt_web/driver.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.14"
+# 第三方存根不齐（fastapi / playwright 动态属性多）：先放开缺失导入，逐步收紧。
+ignore_missing_imports = true
+# 其余类型错误一律报出；豁免只放在下面的 overrides，且每条都写明原因（不得静默忽略）。
+
+# 豁免清单（T4.1）：driver 与三个 mixin 模块采用「Mixin 组合」共享宿主类属性
+# （例如 ChatIOMixin 里引用的 _page_is_generating 由 ChatGPTWebDriver 组合后提供），
+# mypy 静态看不到宿主属性 → 只对这些模块关闭 attr-defined，其余错误码照常检查。
+[[tool.mypy.overrides]]
+module = [
+    "chatgpt_web.chat_io",
+    "chatgpt_web.completion",
+    "chatgpt_web.page_pool",
+    "chatgpt_web.session_store",
+]
+disable_error_code = ["attr-defined"]

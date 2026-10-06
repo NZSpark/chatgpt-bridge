@@ -8,10 +8,16 @@ ChatGPT 网页版并不原生支持 OpenAI 的 function calling，因此这里�
 """
 
 import json
+import logging
+import os
 import re
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
+from . import config
 from .models import FunctionCall, ToolCall
+
+logger = logging.getLogger(__name__)
 
 # 当前注入格式：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
 # 只认行首（允许前导空白），避免正文里偶然出现的 "TOOL_CALL:" 被误触发；
@@ -60,6 +66,18 @@ _DSML_GENERIC_NAMES = {
 _SHELL_NAME_KEYWORDS = ("shell", "exec", "bash", "command", "term")
 
 
+# ==================== 注入块标题常量（生成与判定必须同源）====================
+# 这些标题是「去重判定」（prompting.build_prompt：入站 system 已带同类说明时
+# 不再重复追加）与「泄漏检测」（tests/e2e/test_parity.assert_no_injection_leak）
+# 的唯一依据。此前去重用的中文标签与实际生成块首行永不相等，导致去重恒不生效
+# 而检测形同虚设（见 doc/tasks.md T2.3）。只允许从这里取标题。
+TOOLCALL_HEADER = "[Tool Calling Instructions]"
+EMPHASIS_HEADER = "[Output Format Emphasis]"
+EDIT_MD_HEADER = "[edit_markdown notes]"
+# 首轮未调用工具时追加的纠偏指令块（见 T1.1）
+RETRY_HEADER = "[Tool Call Correction]"
+
+
 # ==================== 内置工具：edit_markdown ====================
 # 桥接层内置的 Markdown 锚点编辑工具。模型只需给出行号区间与新文本，
 # 桥接层用 markdown_io 做围栏安全的定位/校验/保真写回，避免整段文本匹配。
@@ -102,7 +120,7 @@ def builtin_tool_names() -> set:
 def edit_markdown_spec() -> str:
     """Usage notes for edit_markdown injected into the prompt (anchors / fences caveats)."""
     return "\n".join([
-        "[edit_markdown notes]",
+        EDIT_MD_HEADER,
         "When editing a Markdown file, prefer edit_markdown over rewriting the whole file and doing plain-text matching:",
         'TOOL_CALL: {"name": "edit_markdown", "arguments": {"path": "README.md", '
         '"start": <int>, "end": <int>, "new_text": "<replacement text>"}}',
@@ -112,18 +130,83 @@ def edit_markdown_spec() -> str:
     ])
 
 
+def resolve_edit_path(path: Any) -> tuple[Optional[Path], Optional[str]]:
+    """把模型给出的 path 解析到沙箱之内，返回 ``(沙箱内的绝对路径, 错误原因)``。
+
+    安全约束（T1.3）：edit_markdown 是**模型可控**的写文件工具，而模型可能
+    被网页内容 / 工具结果注入。因此：
+
+    * 拒绝绝对路径（不管它是否在沙箱内）；
+    * 拒绝含 ``..`` 段的路径；
+    * 解析后必须落在 ``config.EDIT_MARKDOWN_ROOT``（默认项目根）之内。
+
+    返回的第二个值非空时，调用方应直接以 ``{"ok": false, "error": ...}`` 回传。
+    """
+    if not isinstance(path, str) or not path.strip():
+        return None, "edit_markdown 需要 path"
+    raw = Path(path.strip())
+    if raw.is_absolute():
+        return None, f"路径越界（不允许绝对路径）：{path}"
+    if ".." in raw.parts:
+        return None, f"路径越界（不允许 .. 段）：{path}"
+    root = Path(config.EDIT_MARKDOWN_ROOT or config.PROJECT_ROOT).resolve()
+    resolved = (root / raw).resolve()
+    try:
+        inside = resolved.is_relative_to(root)
+    except AttributeError:  # pragma: no cover - Python < 3.9 的兜底
+        inside = str(resolved).startswith(str(root) + os.sep)
+    if not inside:
+        return None, f"路径越界（必须位于 {root} 之内）：{path}"
+    # 返回**解析后的绝对路径**：读写必须落在沙箱解析结果上，
+    # 而不是让 markdown_io 拿相对路径去拼当前工作目录（可能落到沙箱之外）。
+    return resolved, None
+
+
+def run_local_edit_markdown(
+    tool_calls: List[Dict[str, Any]],
+    *,
+    backup_dir: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    """本地执行 edit_markdown：把结果挂回对应调用（server / responses 共用）。
+
+    非 ``edit_markdown`` 的调用原样透传，顺序与内容不变。未开启本地执行或
+    没有调用时原样返回。
+    """
+    if enabled is None:
+        enabled = config.EDIT_MARKDOWN_LOCAL
+    if backup_dir is None:
+        backup_dir = config.EDIT_MARKDOWN_BACKUP_DIR
+    if not enabled or not tool_calls:
+        return tool_calls
+    out: List[Dict[str, Any]] = []
+    for call in tool_calls:
+        if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
+            result = execute_edit_markdown(
+                call.get("arguments") or {}, backup_dir=backup_dir
+            )
+            out.append({**call, "result": result})
+        else:
+            out.append(call)
+    return out
+
+
 def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/backups") -> Dict[str, Any]:
     """桥接层本地执行 edit_markdown。返回可直接回传的结构化结果。
 
+    - 路径沙箱：只接受沙箱内的相对路径（见 :func:`resolve_edit_path`）。
     - 默认 dry-run：只返回统一 diff，不落盘。
-    - write=true 时先备份原文件，再原子写回。
+    - ``write=true`` 仅在 ``EDIT_MARKDOWN_WRITE=true`` 时真正落盘；否则降级为
+      dry-run 并在结果里说明（模型不能自己“申请”写权限）。
     - 任何结构性错误（围栏不配对、行号越界）都作为 error 返回，不抛给上层。
     """
     from . import markdown_io
 
-    path = args.get("path")
-    if not isinstance(path, str) or not path:
-        return {"ok": False, "error": "edit_markdown 需要 path"}
+    requested_path = args.get("path")
+    path, path_error = resolve_edit_path(requested_path)
+    if path_error:
+        return {"ok": False, "error": path_error}
+    assert path is not None
     try:
         start = int(args["start"])
         end = int(args["end"])
@@ -132,7 +215,9 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
     new_text = args.get("new_text", "")
     if not isinstance(new_text, str):
         return {"ok": False, "error": "edit_markdown 的 new_text 必须是字符串"}
-    do_write = bool(args.get("write", False))
+    write_requested = bool(args.get("write", False))
+    do_write = write_requested and config.EDIT_MARKDOWN_WRITE
+    write_refused = write_requested and not do_write
 
     try:
         doc = markdown_io.read_md(path)
@@ -164,18 +249,59 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
             backup = markdown_io.backup_md(path, backup_dir=backup_dir)
             backup_path = str(backup.backup_path)
         except OSError as exc:
+            logger.warning("edit_markdown 备份失败（%s）：未写盘。", path, exc_info=True)
             return {"ok": False, "error": f"备份失败：{exc}"}
 
     diff = markdown_io.write_md(edited, path=path, dry_run=not do_write)
-    return {
+    result: Dict[str, Any] = {
         "ok": True,
-        "path": path,
+        "path": requested_path,
+        "resolved_path": str(path),
         "start": start,
         "end": end,
+        "write_requested": write_requested,
         "written": do_write,
         "backup": backup_path,
         "diff": diff,
     }
+    if write_refused:
+        result["note"] = (
+            "已忽略 write=true：EDIT_MARKDOWN_WRITE=false（默认只做 dry-run，"
+            "不落盘）。需要落盘请在 .env 里显式打开。"
+        )
+    return result
+
+
+def format_tool_retry_nudge() -> str:
+    """首轮回复没有调用工具时，追加到同一网页会话的纠偏指令（T1.1）。
+
+    实测：即便注入了工具说明与格式强调，模型在**播种首轮**仍可能无视工具、
+    直接凭自身知识作答（E2E C1/C2）。此时只把这段短指令作为会话里的后续
+    消息再发一次（不重放历史、不重播种），让模型在已看到自己上一轮回复的
+    上下文里被迫给出结构化调用。整段只重试一次，避免与模型拉锯。
+    """
+    return "\n".join([
+        f"{RETRY_HEADER} Your previous reply did not call any tool.",
+        "You have NO direct access to a shell, filesystem or the internet. Answering from",
+        "your own knowledge instead of calling a tool means the task FAILED.",
+        "Reply now with EXACTLY ONE plain-text line in this form (no code fences, no other text):",
+        'TOOL_CALL: {"name": "<exact tool name>", "arguments": {"<param>": <value>}}',
+    ])
+
+
+def tool_call_predicate(tools: Optional[List[Dict[str, Any]]]) -> Callable[[str], bool]:
+    """构造「回复里是否包含至少一个工具调用」的判定函数。
+
+    供 ``chat_io.send_chat`` 的纠偏重试使用：判定失败就追发一次纠偏指令。
+    与最终解析共用同一个 ``parse_tool_calls``，不会出现「重试判定说不合格、
+    外面却解析出了 tool_calls」的不一致。
+    """
+    names = _tool_names(tools)
+
+    def _has_call(text: str) -> bool:
+        return bool(parse_tool_calls(text or "", names))
+
+    return _has_call
 
 
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
@@ -203,7 +329,7 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
     )
 
     lines = [
-        "[Tool Calling Instructions]",
+        TOOLCALL_HEADER,
         "You are an agent connected to external tools. You have NO direct access to a shell,",
         "filesystem, or the internet — the ONLY way to perform an action or fetch real data is",
         "to emit a TOOL_CALL line. If the task needs a tool and you answer from your own",
@@ -273,14 +399,15 @@ def format_tool_call_emphasis() -> str:
     repeating the mandate + full format is a second safeguard.
     """
     return "\n".join([
-        "[Output Format Emphasis] This is a new session (or one that was just reset); the following rules stay in effect for this whole session:",
+        f"{EMPHASIS_HEADER} This is a new session (or one that was just reset); "
+        "the following rules stay in effect for this whole session:",
         "You MUST use the provided tools whenever the task needs real action or data; never fabricate tool output.",
         "To call a tool, output only the following format as **plain text lines** (no code fences, do not add ```):",
         "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
         "arguments must be valid JSON: escape double quotes inside strings as \\\" and newlines as \\n; never write a bare double quote or a raw newline inside a JSON string.",
         "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
         "to avoid a clash between double quotes in the command and the JSON boundary quotes.",
-        "Use the tool names exactly as listed in [Tool Calling Instructions]; do not invent generic names like bash / shell.",
+        "Use the exact tool names given in the tool instructions; do not invent generic names like bash / shell.",
         "Output EXACTLY ONE TOOL_CALL line per reply - never two or more in the same message.",
         "If you need several tools, call one now and the next only after you receive its result.",
         "Output only the single TOOL_CALL line when calling a tool: no explanation, no preamble.",
@@ -853,26 +980,26 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
         marker_re = re.compile(r"tool[-_]?call(?![A-Za-z0-9_])", re.IGNORECASE)
         pos = 0
         while True:
-            match = marker_re.search(text, pos)
-            if not match:
+            marker_match = marker_re.search(text, pos)
+            if not marker_match:
                 break
-            segment = text[match.end():]
+            segment = text[marker_match.end():]
             # marker 与 JSON 之间可能夹着任意噪声：`">`、`>`、竖线、`` ` ``、
             # "Copy"/"Download" 渲染文字、空白换行……不要逐种枚举，
             # 直接跳到第一个 `{`，从那里起用平衡扫描找 JSON 对象。
             brace = segment.find("{")
             if brace < 0:
-                pos = match.end()
+                pos = marker_match.end()
                 continue
             probe = segment[brace:]
             parsed = False
             for obj in _iter_balanced_objects(probe):
                 _consume(obj, allow_bare_object=True)
-                pos = match.end() + brace + probe.index(obj) + len(obj)
+                pos = marker_match.end() + brace + probe.index(obj) + len(obj)
                 parsed = True
                 break
             if not parsed:
-                pos = match.end()
+                pos = marker_match.end()
 
     # 护栏：若传入了 valid_names，则过滤掉不在其中的幻觉工具名；否则保留全部解析出的工具调用。
     if valid_names is not None:

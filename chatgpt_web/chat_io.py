@@ -4,21 +4,31 @@
 并在结束（或超时）后更新会话状态。重试阶梯与播种逻辑都在这里。
 """
 
+
 import asyncio
+import logging
 import re
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from . import config
+from .end_detection import EndLimits, EndState, evaluate_poll
 from .errors import (
     DEFAULT_SESSION_KEY,
+    ChatGPTBusyError,
     ChatGPTContextLimitError,
     ChatGPTTimeoutError,
 )
 from .prompting import _delta_piece, estimate_tokens
 
+logger = logging.getLogger(__name__)
+
+# 「RESPONSE_SELECTORS 一个节点都没命中」连续多少轮才打印诊断。
+# 必须 >1：助手节点总是晚于提交一帧出现（正常首轮也会 nodes=0 + generating），
+# 只有**持续**零节点才说明选择器失效（网页版改版）。
+_EMPTY_NODE_REPORT_AFTER = 3
 
 def _prune_output_dir(output_dir: str) -> None:
     """按 config 的保留策略清理落盘目录（0 = 不限，出错静默忽略）。"""
@@ -59,6 +69,7 @@ class ChatIOMixin:
         on_delta=None,
         seeded_prompt: Optional[str] = None,
         key: Optional[str] = None,
+        validate_reply: Optional[Callable[[str], bool]] = None,
     ) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应。
 
@@ -67,6 +78,9 @@ class ChatIOMixin:
                               未提供则退回 ``prompt``）
         :param key: 会话桶标识（按任务隔离会话）。不同 key 各自持有一条独立
                     的网页会话与页面，互不污染上下文；None 表示默认桶。
+        :param validate_reply: 可选「回复是否可接受」判定；返回 False 时会
+                    在同一会话追发一次工具纠偏指令（仅一次，见 T1.1）。
+                    调用方需自行保证此时未把首轮回复流式发给客户端。
 
         **重试阶梯**（本项目不做 URL 恢复，重试即重开对话 + 播种）：
 
@@ -94,10 +108,10 @@ class ChatIOMixin:
                 pass
             elif attempt < max_attempts:
                 # 不做 URL 恢复：退避后在同一页面重试一次（页面可能只是慢）
-                print(f"[恢复] 第 {attempt}/{max_attempts} 次重试：等待后重试……")
+                logger.warning(f"[恢复] 第 {attempt}/{max_attempts} 次重试：等待后重试……")
                 await asyncio.sleep(config.RETRY_BACKOFF_S * attempt)
             else:
-                print("[恢复] 重试无效，改为开启新对话并重放历史……")
+                logger.warning("[恢复] 重试无效，改为开启新对话并重放历史……")
                 await self._start_new_session(bucket)
 
             # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文
@@ -113,7 +127,9 @@ class ChatIOMixin:
 
             await self._remember_session(bucket)
             try:
-                return await self._send_chat_locked(active_prompt, on_delta, key=bucket)
+                reply_text, blocks = await self._send_chat_locked(
+                    active_prompt, on_delta, key=bucket
+                )
             except ChatGPTContextLimitError as exc:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
                 last_error = exc
@@ -121,17 +137,42 @@ class ChatIOMixin:
                 state.pending_rotation = True
                 state.cap_failures = getattr(state, "cap_failures", 0) + 1
                 if state.cap_failures >= 2:
-                    print(
+                    logger.warning(
                         f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限"
                         f"（连续 {state.cap_failures} 次，下次将压缩播种内容）。"
                     )
                 else:
-                    print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限。")
+                    logger.warning(f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限。")
             except ChatGPTTimeoutError as exc:
                 # 只有「超时 / 到顶」才可重试；找不到输入框、profile 被占用等不可重试
                 last_error = exc
                 self._state(bucket).last_error = str(exc)
-                print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：等待回复超时。")
+                logger.warning(f"[恢复] 第 {attempt}/{max_attempts} 次失败：等待回复超时。")
+            else:
+                # 首轮回复达标（或调用方没给判定）——直接返回
+                if validate_reply is None or validate_reply(reply_text):
+                    return reply_text, blocks
+                # T1.1 纠偏：模型只给了纯文本、没有调用工具。此时把它当最终答案
+                # 返回，客户端（Pi/Codex）会误以为任务已经完成。这里在同一会话
+                # 追发一次短纠偏指令（只一次），让它重新输出结构化 TOOL_CALL。
+                from .toolcalls import format_tool_retry_nudge
+
+                logger.warning("[工具纠偏] 首轮回复未调用工具，追加一次纠偏指令重发（仅一次）。")
+                try:
+                    # 纠偏是会话内的后续消息：不更新 _last_prompts（usage 仍按
+                    # 客户端真正发来的 prompt 估算），也不实时吐字（首轮内容已
+                    # 可能发给客户端，避免两段文本拼接错乱）。
+                    retry_text, retry_blocks = await self._send_chat_locked(
+                        format_tool_retry_nudge(), None, key=bucket
+                    )
+                except (ChatGPTTimeoutError, ChatGPTContextLimitError,
+                        ChatGPTBusyError) as exc:
+                    logger.warning(f"[工具纠偏] 重发失败（{exc!r}），返回首轮回复。")
+                    return reply_text, blocks
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"[工具纠偏] 重发异常（{exc!r}），返回首轮回复。")
+                    return reply_text, blocks
+                return retry_text, retry_blocks
 
         if last_error is not None:
             raise last_error
@@ -163,7 +204,7 @@ class ChatIOMixin:
         tail = keep - head
         marker = "\n\n…（播种内容因连续到顶已压缩中段，仅保留开头与最近内容）…\n\n"
         shrunk = prompt[:head] + marker + prompt[-tail:]
-        print(
+        logger.warning(
             f"[恢复] 会话连续到顶 {failures} 次，播种 prompt 压缩："
             f"{len(prompt)} -> {len(shrunk)} 字符。"
         )
@@ -224,10 +265,16 @@ class ChatIOMixin:
             code_tag = await code_el.query_selector(config.CODE_TAG_SELECTOR)
             lang = "txt"
             if code_tag:
-                class_attr = await code_tag.get_attribute('class') or ""
-                lang_match = re.search(r'language-(\w+)', class_attr)
-                if lang_match:
-                    lang = lang_match.group(1)
+                # 新版 DOM：代码正文是 CodeMirror 的 div.cm-content，语言写在
+                # data-language（如 "python"）；旧版 DOM：<code class="language-python">。
+                lang_attr = (await code_tag.get_attribute('data-language') or "").strip()
+                if lang_attr:
+                    lang = lang_attr.lower()
+                else:
+                    class_attr = await code_tag.get_attribute('class') or ""
+                    lang_match = re.search(r'language-(\w+)', class_attr)
+                    if lang_match:
+                        lang = lang_match.group(1)
 
             code_content = await self._complete_text(code_tag or code_el)
             clean_code = self._strip_code_noise(code_content, lang)
@@ -240,6 +287,12 @@ class ChatIOMixin:
     # **渲染后**可见性，动画未走完的 token 取不到——表现为文本在引号/冒号处被截断
     # （TOOL_CALL 的 JSON 参数被切掉半截）。这里在克隆节点上移除动画类与 animation
     # 样式，挂到屏幕外再读 innerText，既拿到完整文本，又保留块级换行。
+    # 快速探测：节点内是否还有未显现的 token（动画类）。没有时 inner_text
+    # 已经是完整的，无需克隆节点（克隆 + 屏幕外挂载是明显的额外开销，T4.2）。
+    _ANIMATED_JS = (
+        "(n) => !!n.querySelector('.animating, .pending, .revealing, .fade-in')"
+    )
+
     _COMPLETE_TEXT_JS = """
     (node) => {
       const clone = node.cloneNode(true);
@@ -267,10 +320,26 @@ class ChatIOMixin:
     async def _complete_text(self, node) -> str:
         """读取回复节点的完整文本（绕过 ChatGPT 逐 token 显现动画导致的截断）。
 
+        T4.2 优化：先探测节点里是否真的存在 ``.animating/.pending/.revealing``。
+        没有动画时 ``inner_text`` 已经完整，直接返回——避开「克隆整棵子树 +
+        屏幕外挂载」这些为绕过逐 token 动画才需要的昂贵操作（轮询期间每轮都跑）。
+
         失败时退回 text_content（无块级换行但一定完整），再退回 inner_text。
         """
         if node is None:
             return ""
+        animated: Optional[bool]
+        try:
+            animated = bool(await node.evaluate(self._ANIMATED_JS))
+        except Exception:
+            animated = True  # 探测失败时保守走克隆路径
+        if not animated:
+            try:
+                text = await node.inner_text()
+                if text and text.strip():
+                    return text
+            except Exception:
+                pass
         try:
             text = await node.evaluate(self._COMPLETE_TEXT_JS)
             if text and text.strip():
@@ -382,15 +451,15 @@ class ChatIOMixin:
                 )
                 if el:
                     if config.DEBUG:
-                        print(f"[输入] 命中选择器：{selector}")
+                        logger.debug(f"[输入] 命中选择器：{selector}")
                     return el
                 errors.append(f"{selector}: 未命中")
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{selector}: {exc}")
                 continue
-        print("[输入] 未找到输入框，尝试过的选择器：")
+        logger.warning("[输入] 未找到输入框，尝试过的选择器：")
         for line in errors:
-            print(f"        - {line}")
+            logger.info(f"        - {line}")
         return None
 
     async def _fill_prompt(self, page, prompt: str):
@@ -406,13 +475,13 @@ class ChatIOMixin:
         for attempt in range(retries):
             chat_input = await self._find_input(page)
             if not chat_input:
-                print(f"[输入] 第 {attempt + 1}/{retries} 次重试：未定位到输入框。")
+                logger.warning(f"[输入] 第 {attempt + 1}/{retries} 次重试：未定位到输入框。")
                 await asyncio.sleep(0.5)
                 continue
             try:
                 await self._call_fill(page, chat_input, prompt, timeout)
             except Exception as exc:  # noqa: BLE001
-                print(f"[输入] 第 {attempt + 1}/{retries} 次输入失败：{exc!r}")
+                logger.warning(f"[输入] 第 {attempt + 1}/{retries} 次输入失败：{exc!r}")
                 await asyncio.sleep(0.5)
                 continue
             # contenteditable 的 fill 可能“成功”但内容为空，必须校验。
@@ -420,13 +489,13 @@ class ChatIOMixin:
             try:
                 text = await self._complete_text(chat_input)
             except Exception as exc:  # noqa: BLE001
-                print(f"[输入] 第 {attempt + 1}/{retries} 次读取文本异常：{exc!r}")
+                logger.warning(f"[输入] 第 {attempt + 1}/{retries} 次读取文本异常：{exc!r}")
                 text = ""
             if text and text.strip():
                 if config.DEBUG:
-                    print(f"[输入] fill 成功，读到 {len(text)} 字符。")
+                    logger.debug(f"[输入] fill 成功，读到 {len(text)} 字符。")
                 return chat_input
-            print(
+            logger.warning(
                 f"[输入] fill 第 {attempt + 1}/{retries} 次后内容为空"
                 f"（读到 {text!r}），重试。"
             )
@@ -520,7 +589,7 @@ class ChatIOMixin:
             await asyncio.sleep(0.1)
         leftover = (await ChatIOMixin._read_input_text(chat_input)).strip()
         if leftover:
-            print(
+            logger.warning(
                 f"[输入] 警告：清空输入框后仍读到残留内容（{leftover[:80]!r}），"
                 "新 prompt 可能被拼接。"
             )
@@ -560,6 +629,46 @@ class ChatIOMixin:
             prompt[:head]
             + f"\n\n…（prompt 过长，已省略中间 {dropped} 字符）\n\n"
             + prompt[-tail:]
+        )
+
+    async def _log_empty_reply_nodes(self, page) -> None:
+        """回复节点持续为 0 时，打印每条 RESPONSE_SELECTORS 的命中数。
+
+        背景（2026-10-06 线上回归）：网页版改版后助手回复换了容器，
+        ``data-message-author-role`` / ``message-content`` / ``.markdown`` 全部落空。
+        此时轮询表现为 ``nodes=0`` 一路空转到超时，日志里**没有任何线索**——
+        无法区分「选择器失效」与「消息根本没发出去」。
+
+        这里在首次出现「零节点 + 页面仍在生成」时打印一次逐条命中数：
+        全为 0 基本可判定是网页版改版（需要重新校准选择器），
+        而选择器有命中却不等于回复，则是渲染/时序问题。
+        """
+        lines: List[str] = []
+        for selector in config.RESPONSE_SELECTORS.split(","):
+            selector = selector.strip()
+            if not selector:
+                continue
+            try:
+                count = len(await page.query_selector_all(selector))
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"{selector}: {exc!r}")
+                continue
+            lines.append(f"{selector}: {count}")
+        try:
+            page_text_len = await page.evaluate(
+                "() => (document.body ? document.body.innerText.length : 0)"
+            )
+        except Exception:  # noqa: BLE001
+            page_text_len = -1
+        logger.warning(
+            "[诊断] 页面仍在生成，但 RESPONSE_SELECTORS 一个回复节点都没命中"
+            "（nodes=0）：网页版可能已改版，助手回复换了容器。逐条命中数："
+        )
+        for line in lines:
+            logger.info(f"        - {line}")
+        logger.info(
+            f"        页面可见文本长度={page_text_len}。"
+            "请按此重新校准 .env 的 RESPONSE_SELECTORS（或 curl /_debug/selectors）。"
         )
 
     async def _send_chat_locked(self, prompt: str, on_delta=None,
@@ -623,11 +732,9 @@ class ChatIOMixin:
             last_normalized = ""
             last_len = -1
             streamed = ""            # 已经通过 on_delta 发给客户端的内容
-            stable_count = 0
-            saw_generating = False      # 本轮是否观测到过页面「生成中」状态
             latest_node = None          # 本轮最新的回复节点
             poll = 0
-            deadline = asyncio.get_event_loop().time() + config.RESPONSE_TIMEOUT_S
+            deadline = asyncio.get_running_loop().time() + config.RESPONSE_TIMEOUT_S
             # 总超时到点但页面仍在生成时，允许延长等待的剩余额度（秒）。
             # 用光后不再延长，仍按超时处理，避免无限等待。
             extend_budget = max(0.0, config.RESPONSE_TIMEOUT_EXTEND_S)
@@ -635,15 +742,19 @@ class ChatIOMixin:
 
             cap_check_every = max(1, config.CAP_CHECK_EVERY)
 
-            # 页面「完全卡住」的判定：连续这么多次轮询既无正文、也无生成中信号，
-            # 就不必干等到总超时——直接按超时处理（给出可排查的错误）。
-            stall_limit = max(1, int(config.STALL_POLLS))
-            stalled = 0
-
-            # 内容静默计数：页面「看起来结束」后，仍要求内容连续多次不再变化才收尾。
-            # 用于区分「真的结束」与「分段输出间的短暂停顿」（后者随后会继续吐内容）。
-            quiet_count = 0
-            quiet_polls = max(1, int(config.RESUME_QUIET_POLLS))
+            # 判定状态与阈值：真正的判定逻辑在纯函数 evaluate_poll 里（T4.2），
+            # 这里只维护状态、副作用与日志。
+            end_state = EndState()
+            end_limits = EndLimits(
+                quiet_polls=max(1, int(config.RESUME_QUIET_POLLS)),
+                stable_polls=int(config.STABLE_POLLS),
+                stall_limit=max(1, int(config.STALL_POLLS)),
+                extend_step_s=config.RESPONSE_TIMEOUT_S,
+            )
+            saw_generating = end_state.saw_generating
+            # 零节点诊断：连续 N 轮才打印，且只打印一次（poll 间隔 1.5s）
+            empty_node_polls = 0
+            empty_nodes_reported = False
 
             while True:
                 poll += 1
@@ -684,139 +795,111 @@ class ChatIOMixin:
                 #     但首帧文本尚未渲染出来的信号（否则只能干等到超时）。
                 #     到顶与“真的卡住”在外表上完全一样（页面不再产生新回复），
                 #     不主动看提示语就只能等到超时，而那时已经分不清原因了。
+                # 2.1 探测页面「生成中」状态。True=仍在生成；False=停止按钮已消失。
+                pending = False
                 if not reply_seen:
                     if poll % cap_check_every == 0:
                         if await self._page_shows_context_limit(bucket):
                             self._mark_context_limit(bucket)
                             raise self._context_limit_error()
                     generating = await self._page_is_generating(bucket)
-                    if generating:
-                        saw_generating = True
-
-                if reply_seen:
-                    # 2.1 探测页面「生成中」状态。True=仍在生成；False=停止按钮已消失。
+                else:
                     generating = await self._page_is_generating(bucket)
-                    if generating:
-                        saw_generating = True
-
-                    # 本轮内容相对上一次是否又变了（文本不同 或 长度不同）。
-                    # 分段输出恢复时，这里会变 True，从而把静默计数清零。
-                    content_changed = (
-                        normalized != last_normalized or len(normalized) != last_len
-                    )
-                    if content_changed:
-                        quiet_count = 0
-                    elif generating is True:
-                        # 页面仍在生成（有停止按钮）也算「不安静」，不清零但阻止收尾
-                        quiet_count = 0
-                    else:
-                        quiet_count += 1
-
                     # 停止按钮是否已消失、且无尚未显现的 token。
                     # 注意：**不能据此立即收尾**——ChatGPT 分段输出时停止按钮会
                     # 短暂消失，随后继续吐含 TOOL_CALL 的内容。必须再等静默窗口。
                     pending = await self._has_pending_tokens(latest_node)
-                    settled = (
-                        generating is False
-                        and saw_generating
-                        and bool(normalized)
-                        and not pending
-                    )
 
-                    # 2.2 结束判定（基于内容连续性）：
-                    #   页面已「落定」（停止按钮消失、无 pending），且内容在
-                    #   RESUME_QUIET_POLLS 次轮询里完全不再变化 -> 确认结束。
-                    #   期间任何一次内容变化 / 重新生成中，都会把 quiet_count 清零，
-                    #   从而避免把分段间的短暂停顿误判成结束。
-                    if settled and quiet_count >= quiet_polls:
-                        last_text = current_text
-                        if config.DEBUG:
-                            print(
-                                f"[debug] poll={poll} 页面已落定且内容静默 "
-                                f"{quiet_count} 次，判定结束"
-                            )
-                        break
+                # 1.2 零节点 + 仍在生成：这是「网页版改版导致选择器失效」的典型
+                #     指纹（消息确实发出、模型确实在答，只是我们抓不到节点）。
+                #     连续若干轮都是 0 才打印（避开首帧未渲染的正常情况），
+                #     且只打印一次，避免下次改版又只能从超时反推。
+                empty_node_polls = empty_node_polls + 1 if not responses else 0
+                if (
+                    empty_node_polls >= _EMPTY_NODE_REPORT_AFTER
+                    and generating
+                    and not empty_nodes_reported
+                ):
+                    empty_nodes_reported = True
+                    await self._log_empty_reply_nodes(page)
 
-                    # 2.2b 兜底：停止按钮始终探测不到（generating 恒为 None/False 但
-                    #     从未观测到 True）时，退回纯文本稳定判定，但同样要求静默窗口
-                    #     至少达到 max(STABLE_POLLS, RESUME_QUIET_POLLS)，比旧逻辑更保守。
-                    if not saw_generating and generating is not True:
-                        same_text = bool(normalized) and normalized == last_normalized
-                        if same_text:
-                            stable_count += 1
-                        else:
-                            stable_count = 0
-                        threshold = max(config.STABLE_POLLS, quiet_polls)
-                        if stable_count >= threshold:
-                            last_text = current_text
-                            if config.DEBUG:
-                                print(
-                                    f"[debug] poll={poll} 未观测到生成信号，"
-                                    f"内容稳定 {stable_count} 次，判定结束"
-                                )
-                            break
+                # 判定逻辑全部在纯函数里（生成中不结束 / 停止按钮消失但内容仍在变 /
+                # 分段输出恢复 / 静默窗口满足后结束 / 卡死快速失败 / 超时但仍在生成则延长）
+                past_deadline = asyncio.get_running_loop().time() > deadline
+                verdict = evaluate_poll(
+                    end_state,
+                    limits=end_limits,
+                    reply_seen=reply_seen,
+                    generating=generating,
+                    pending=pending,
+                    normalized=normalized,
+                    last_normalized=last_normalized,
+                    last_len=last_len,
+                    past_deadline=past_deadline,
+                    extend_budget=extend_budget,
+                    has_partial_text=bool(last_text),
+                )
+                end_state = verdict.state
+                saw_generating = end_state.saw_generating
 
-                    # 2.3 生成过程中吐出增量，供 SSE 使用。
-                    #     用「已发送内容」的公共前缀做 diff，即使节点中途重排也不会漏字
-                    if on_delta is not None:
-                        piece, streamed = _delta_piece(streamed, current_text)
-                        if piece:
-                            await on_delta(piece)
-
+                if verdict.action == "finish":
                     last_text = current_text
-                    last_normalized = normalized
-                    last_len = len(normalized)
+                    if past_deadline:
+                        logger.warning("[超时] %s", verdict.note)
+                    elif config.DEBUG and verdict.note:
+                        logger.debug("[debug] poll=%s %s，判定结束", poll, verdict.note)
+                    break
 
-                # 卡死检测：既没有正文，也没有任何「生成中」信号 -> 累计；
-                # 一旦达到阈值即可快速失败，而不是把 180s 全部耗在空转上。
-                if normalized or saw_generating or generating:
-                    stalled = 0
-                else:
-                    stalled += 1
-                if stalled >= stall_limit:
+                if verdict.action == "fail_stalled":
                     await self._remember_session(bucket)
                     if await self._page_shows_context_limit(bucket):
                         self._mark_context_limit(bucket)
                         raise self._context_limit_error()
                     raise ChatGPTTimeoutError(
-                        f"页面连续 {stalled} 次未产生任何回复内容（疑似未登录或会话失效），"
-                        "已提前中止。请检查 ChatGPT 登录状态或 RESPONSE_SELECTORS 配置。"
+                        f"页面连续 {verdict.state.stalled} 次未产生任何回复内容"
+                        "（疑似未登录或会话失效），已提前中止。"
+                        "请检查 ChatGPT 登录状态或 RESPONSE_SELECTORS 配置。"
                     )
 
-                if config.DEBUG:
-                    print(
-                        f"[debug] poll={poll} nodes={len(responses)} len={len(normalized)} "
-                        f"stable={stable_count} generating={generating} saw={saw_generating} "
-                        f"stalled={stalled} before_len={len(before_text)}"
-                    )
+                if verdict.action == "extend":
+                    extend_budget -= verdict.extend_seconds
+                    deadline = asyncio.get_running_loop().time() + verdict.extend_seconds
+                    if not extended_printed:
+                        logger.warning(
+                            "[超时] 页面仍在生成，延长等待 %gs（剩余可延长 %gs），不重发 prompt。",
+                            verdict.extend_seconds, extend_budget,
+                        )
+                        extended_printed = True
+                    continue
 
-                # 总超时判定：若这期间其实已经读到实质回复，就直接返回已产生的内容，
-                # 绝不再把同一句 prompt 重发一遍（避免网页多出一轮、与客户端状态错位）
-                if asyncio.get_event_loop().time() > deadline:
+                if verdict.action == "fail_timeout":
                     await self._remember_session(bucket)
-                    if last_text:
-                        print("[超时] 已读取到回复内容，直接返回，不重发。")
-                        break
-                    # 关键加固：页面**仍在生成**时（思考模式 / 大 prompt 常见），
-                    # 说明这一轮确实已提交并在跑，重发只会让网页多出一轮、与客户端
-                    # 状态错位。此时延长等待而不是抛超时（延长额度用光为止）。
-                    if extend_budget > 0 and await self._page_is_generating(bucket):
-                        wait = min(extend_budget, max(1.0, config.RESPONSE_TIMEOUT_S))
-                        extend_budget -= wait
-                        deadline = asyncio.get_event_loop().time() + wait
-                        if not extended_printed:
-                            print(
-                                f"[超时] 页面仍在生成，延长等待 {wait:g}s"
-                                f"（剩余可延长 {extend_budget:g}s），不重发 prompt。"
-                            )
-                            extended_printed = True
-                        continue
                     # 超时前最后确认一次是否“到顶”，否则错误信息会误导排查方向
                     if await self._page_shows_context_limit(bucket):
                         self._mark_context_limit(bucket)
                         raise self._context_limit_error()
                     raise ChatGPTTimeoutError(
                         f"等待 ChatGPT 响应超时（{int(config.RESPONSE_TIMEOUT_S)}s）。"
+                    )
+
+                # action == "continue"：本轮尚未结束，继续等下一轮。
+                if reply_seen:
+                    # 2.3 生成过程中吐出增量，供 SSE 使用。
+                    #     用「已发送内容」的公共前缀做 diff，即使节点中途重排也不会漏字
+                    if on_delta is not None:
+                        piece, streamed = _delta_piece(streamed, current_text)
+                        if piece:
+                            await on_delta(piece)
+                    last_text = current_text
+                    last_normalized = normalized
+                    last_len = len(normalized)
+
+                if config.DEBUG:
+                    logger.debug(
+                        "[debug] poll=%s nodes=%s len=%s stable=%s generating=%s saw=%s "
+                        "stalled=%s before_len=%s",
+                        poll, len(responses), len(normalized), end_state.stable_count,
+                        generating, saw_generating, end_state.stalled, len(before_text),
                     )
 
                 await asyncio.sleep(config.POLL_INTERVAL_S)
@@ -833,7 +916,7 @@ class ChatIOMixin:
             state.cap_failures = 0
             if self._session_over_budget(bucket):
                 state.pending_rotation = True
-                print(
+                logger.info(
                     f"[轮转] 会话已达预算（轮数={state.turns}，"
                     f"估算 token={state.est_tokens}），"
                     "下一轮将开启新会话并播种上下文。"
@@ -874,7 +957,7 @@ class ChatIOMixin:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(code)
                 saved.append(str(filepath))
-                print(f"[已保存文件] {filepath}")
+                logger.info(f"[已保存文件] {filepath}")
         else:
             filename = f"response_{int(time.time())}_{unique}.md"
             filepath = Path(output_dir) / filename

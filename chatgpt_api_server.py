@@ -50,39 +50,6 @@ from chatgpt_web.config import (  # noqa: F401
     env_str,
 )
 
-# ---- 数据模型 ----
-from chatgpt_web.models import (  # noqa: F401
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatMessage,
-    Choice,
-    ChoiceMessage,
-    FunctionCall,
-    ModelCard,
-    ModelListResponse,
-    SUPPORTED_MODELS,
-    ToolCall,
-    Usage,
-)
-
-# ---- 工具调用 ----
-from chatgpt_web.toolcalls import (  # noqa: F401
-    _iter_balanced_objects,
-    _normalize_tool_entry,
-    _tool_names,
-    format_tools_instruction,
-    parse_tool_calls,
-    to_tool_call_models,
-)
-
-# ---- 提示词与文本工具 ----
-from chatgpt_web.prompting import (  # noqa: F401
-    _content_to_text,
-    _delta_piece,
-    build_prompt,
-    estimate_tokens,
-)
-
 # ---- Driver / 流式 / 路由 ----
 from chatgpt_web.driver import (  # noqa: F401
     DEFAULT_SESSION_KEY,
@@ -92,7 +59,33 @@ from chatgpt_web.driver import (  # noqa: F401
     ChatGPTWebDriver,
     SessionState,
 )
-from chatgpt_web.streaming import _chunk_text, _stream_chat_completion  # noqa: F401
+
+# 统一日志入口：无论以 ``python chatgpt_api_server.py`` 运行，还是被
+# uvicorn 以 ``chatgpt_api_server:app`` 导入，都在模块加载时配置一次（幂等）。
+from chatgpt_web.logging_setup import configure_logging  # noqa: E402
+
+# ---- 数据模型 ----
+from chatgpt_web.models import (  # noqa: F401
+    SUPPORTED_MODELS,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+    Choice,
+    ChoiceMessage,
+    FunctionCall,
+    ModelCard,
+    ModelListResponse,
+    ToolCall,
+    Usage,
+)
+
+# ---- 提示词与文本工具 ----
+from chatgpt_web.prompting import (  # noqa: F401
+    _content_to_text,
+    _delta_piece,
+    build_prompt,
+    estimate_tokens,
+)
 from chatgpt_web.server import (  # noqa: F401
     _session_key,
     app,
@@ -105,6 +98,19 @@ from chatgpt_web.server import (  # noqa: F401
     reset_session,
     root,
 )
+from chatgpt_web.streaming import _chunk_text, _stream_chat_completion  # noqa: F401
+
+# ---- 工具调用 ----
+from chatgpt_web.toolcalls import (  # noqa: F401
+    _iter_balanced_objects,
+    _normalize_tool_entry,
+    _tool_names,
+    format_tools_instruction,
+    parse_tool_calls,
+    to_tool_call_models,
+)
+
+configure_logging()
 
 
 if __name__ == "__main__":

@@ -4,36 +4,41 @@ Codex CLI 只发送 ``POST /v1/responses``（Responses API），不再支持 cha
 这里把 Responses 请求翻译成本项目内部的 Chat 语义，复用现有 driver / 会话分桶 /
 工具解析，再把结果包装回 Responses 对象或命名 SSE 事件。
 
-设计依据：doc/codex_support.md（§2 请求映射 / §3 响应映射 / §9 Pi 兼容性保障）。
-硬约束：不改动 /v1/chat/completions，不修改共享组件的签名与行为。
+设计依据：README 的「Codex CLI 接入」一节；请求/响应映射细节以本模块实现与
+tests/test_responses.py 的回归断言为准。硬约束：不改动 /v1/chat/completions，
+不修改共享组件的签名与行为。
 """
 
+
+import asyncio
 import json
+import logging
 import time
 import traceback
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
-from . import config
+from . import config, tasks
 from .driver import (
+    DEFAULT_SESSION_KEY,
     ChatGPTBusyError,
     ChatGPTContextLimitError,
     ChatGPTTimeoutError,
 )
-from .driver import DEFAULT_SESSION_KEY
-from .models import ChatCompletionRequest, ChatMessage, ToolCall
+from .models import ChatCompletionRequest, ChatMessage, FunctionCall, ToolCall
 from .prompting import build_prompt, estimate_tokens
-from . import tasks
 from .toolcalls import (
-    _tool_names,
     EDIT_MARKDOWN_TOOL,
     EDIT_MARKDOWN_TOOL_NAME,
-    execute_edit_markdown,
+    _tool_names,
     parse_tool_calls,
+    run_local_edit_markdown,
+    tool_call_predicate,
 )
 
+logger = logging.getLogger(__name__)
 
 # ==================== 请求模型（宽松接收）====================
 
@@ -117,7 +122,10 @@ def _item_to_message(item: Dict[str, Any]) -> Optional[ChatMessage]:
     if itype == "function_call":
         call = ToolCall(
             id=item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:16]}",
-            function={"name": item.get("name", ""), "arguments": item.get("arguments", "{}")},
+            function=FunctionCall(
+                name=item.get("name", ""),
+                arguments=item.get("arguments", "{}"),
+            ),
         )
         return ChatMessage(role="assistant", content=None, tool_calls=[call])
     if itype == "function_call_output":
@@ -147,7 +155,7 @@ def to_chat_request(req: ResponsesRequest) -> ChatCompletionRequest:
             if converted is not None:
                 messages.append(converted)
             else:
-                print(f"[responses] 跳过未知 input item: {item!r}")
+                logger.debug(f"[responses] 跳过未知 input item: {item!r}")
     elif raw_input is None:
         pass
     else:
@@ -252,41 +260,7 @@ def _maybe_register_edit_markdown(request: ChatCompletionRequest) -> None:
     request.tools = tools
 
 
-def _maybe_run_edit_markdown(tool_calls):
-    """本地执行 edit_markdown：把结果就地替换为结构化 tool 结果。
-
-    每个调用会变成 {"name": ..., "arguments": {...}, "result": {...}}，
-    其中 result 是 execute_edit_markdown 的返回值（含 diff / written / error）。
-    未开启本地执行或无可执行调用时原样返回。
-    """
-    if not config.EDIT_MARKDOWN_LOCAL or not tool_calls:
-        return tool_calls
-    out = []
-    for call in tool_calls:
-        if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
-            args = call.get("arguments") or {}
-            result = execute_edit_markdown(
-                args, backup_dir=config.EDIT_MARKDOWN_BACKUP_DIR
-            )
-            out.append({**call, "result": result})
-        else:
-            out.append(call)
-    return out
-
-
 # ==================== 共享执行（流式/非流式都走这里）====================
-
-
-def _resolve_session(request: ChatCompletionRequest, session_key: Optional[str], seed: bool) -> str:
-    delta = build_prompt(request.messages, request.tools, request.tool_choice)
-    seeded = build_prompt(
-        request.messages,
-        request.tools,
-        request.tool_choice,
-        seed=True,
-        seed_max_chars=config.SEED_MAX_CHARS,
-    )
-    return seeded if seed else delta
 
 
 async def run_chat(
@@ -301,8 +275,9 @@ async def run_chat(
     """
     # 任务快照：记录本轮 messages，轮转播种时用它续接任务（不丢任务目标）。
     bucket = session_key or DEFAULT_SESSION_KEY
-    tasks.record(bucket, request.messages)
-    task_block = tasks.resume_block(bucket)
+    # 任务快照落盘/读取是同步文件 I/O，放线程里跑（T3.3）
+    await asyncio.to_thread(tasks.record, bucket, request.messages)
+    task_block = await asyncio.to_thread(tasks.resume_block, bucket)
 
     delta_prompt = build_prompt(request.messages, request.tools, request.tool_choice)
     seeded_prompt = build_prompt(
@@ -323,6 +298,9 @@ async def run_chat(
         on_delta=on_delta,
         seeded_prompt=seeded_prompt,
         key=session_key,
+        # 首轮未调用工具时让 driver 追发一次纠偏指令（T1.1）；调用方在工具模式下
+        # 已先缓冲（RESPONSES_TOOL_BUFFER），不会把首轮文本作为最终答案发出。
+        validate_reply=tool_call_predicate(request.tools) if wants_tools else None,
     )
     tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
     sent_prompt = driver.sent_prompt(session_key) or prompt
@@ -364,7 +342,7 @@ async def handle_responses(
         # 「200 但内容为空」，Codex 会立刻重试并再次撞上同一把锁，形成
         # 「一直有另一个会话请求」的热重试。503 能让客户端走正常的退避。
         bucket = session_key or DEFAULT_SESSION_KEY
-        if driver._bucket_busy(bucket) and not config.BUCKET_LOCK_QUEUE:
+        if driver.bucket_busy(bucket) and not config.BUCKET_LOCK_QUEUE:
             return JSONResponse(
                 status_code=503,
                 content=_error_payload(
@@ -387,8 +365,7 @@ async def handle_responses(
     try:
         reply, _blocks, tool_calls, sent_prompt = await run_chat(chat_req, driver, session_key)
     except ChatGPTContextLimitError as exc:
-        print("\n[ERR] responses: 上下文超限:")
-        traceback.print_exc()
+        logger.error("\n[ERR] responses: 上下文超限:", exc_info=True)
         return JSONResponse(status_code=400, content=_error_payload(str(exc), "context_length_exceeded"))
     except ChatGPTBusyError as exc:
         return JSONResponse(status_code=503, content=_error_payload(str(exc), "upstream_busy"))
@@ -402,7 +379,9 @@ async def handle_responses(
         traceback.print_exc()
         return JSONResponse(status_code=500, content=_error_payload(str(exc), "server_error"))
 
-    tool_calls = _maybe_run_edit_markdown(tool_calls)
+    # 本地执行 edit_markdown 与 chat 路径共用同一实现（见 toolcalls.run_local_edit_markdown）
+    # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
+    tool_calls = await asyncio.to_thread(run_local_edit_markdown, tool_calls)
     return from_chat_response(
         reply, req.model, estimate_tokens(sent_prompt), tool_calls or None
     )

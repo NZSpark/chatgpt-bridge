@@ -25,7 +25,14 @@ from typing import Any, Dict, List, Optional
 # 浏览器时才需要该依赖，纯逻辑模块可在未装 Playwright 的环境下正常使用。
 async_playwright = None
 
-from . import completion, config, errors, page_pool, prompting, session_store  # noqa: F401
+from . import (  # noqa: F401
+    completion,
+    config,
+    errors,
+    page_pool,
+    prompting,
+    session_store,
+)
 from .chat_io import ChatIOMixin
 from .completion import CompletionMixin
 from .errors import (  # noqa: F401  (re-export)
@@ -42,7 +49,7 @@ from .session_store import SessionState, SessionStoreMixin  # noqa: F401  (re-ex
 
 class ChatGPTWebDriver(PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIOMixin):
 
-    def __init__(self, user_data_dir: str = None):
+    def __init__(self, user_data_dir: Optional[str] = None):
         user_data_dir = user_data_dir or config.USER_DATA_DIR
         self.user_data_dir = user_data_dir
         self.playwright = None

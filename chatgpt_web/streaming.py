@@ -1,7 +1,9 @@
 """把一次上游对话编码成 OpenAI 兼容的 SSE 流。"""
 
+
 import asyncio
 import json
+import logging
 import time
 import traceback
 import uuid
@@ -11,8 +13,9 @@ from . import config
 from .driver import ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
 from .models import ChatCompletionRequest
 from .prompting import estimate_tokens
-from .toolcalls import _tool_names, parse_tool_calls
+from .toolcalls import _tool_names, parse_tool_calls, tool_call_predicate
 
+logger = logging.getLogger(__name__)
 
 def _chunk_text(text: str, size: int = 64) -> List[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
@@ -59,27 +62,28 @@ async def _stream_chat_completion(
 
     async def runner():
         try:
-            # 需要工具时先缓冲（等解析出 tool_calls 再决定输出形态），因此不实时吐字
+            # 需要工具时先缓冲（等解析出 tool_calls 再决定输出形态），因此不实时吐字；
+            # 同时传入纠偏判定：首轮没调用工具时会再追发一次指令（T1.1），
+            # 因为缓冲模式下首轮内容从未发给客户端，纠偏不会造成文本拼接错乱。
             reply, blocks = await driver.send_chat(
                 prompt,
                 on_delta=None if wants_tools else on_delta,
                 seeded_prompt=seeded_prompt,
                 key=session_key,
+                validate_reply=tool_call_predicate(request.tools) if wants_tools else None,
             )
             await queue.put(("done", (reply, blocks, None, None)))
         except ChatGPTContextLimitError as exc:
             # 给客户端一个可区分的类型，而不是笼统的 server_error
-            print("\n[ERR] 网页会话已达上下文长度上限:")
-            traceback.print_exc()
+            logger.error("\n[ERR] 网页会话已达上下文长度上限:", exc_info=True)
             await queue.put(("done", (None, [], str(exc), "context_length_exceeded")))
         except ChatGPTBusyError as exc:
             # 本地排队保护：同一会话桶已有请求在跑且等锁超时，对应 HTTP 503 / upstream_busy
-            print(f"\n[繁忙] {exc}")
+            logger.warning(f"\n[繁忙] {exc}")
             await queue.put(("done", (None, [], str(exc), "upstream_busy")))
         except ChatGPTTimeoutError as exc:
             # 与 server.py 的非流式分支保持一致：超时是 504/timeout，而不是 500
-            print("\n[ERR] 等待 ChatGPT 回复超时（已重试）:")
-            traceback.print_exc()
+            logger.error("\n[ERR] 等待 ChatGPT 回复超时（已重试）:", exc_info=True)
             await queue.put(("done", (None, [], str(exc), "timeout")))
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
@@ -105,7 +109,7 @@ async def _stream_chat_completion(
             # 因此这段时间客户端看不到内容 —— 用注释保活 + 日志保持可观测。
             keepalives += 1
             if config.DEBUG:
-                print(
+                logger.debug(
                     f"[debug] 等待上游回复中（已发 {keepalives} 次 keep-alive，"
                     f"工具模式={wants_tools}）"
                 )

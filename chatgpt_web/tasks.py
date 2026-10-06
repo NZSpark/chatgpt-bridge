@@ -14,14 +14,17 @@
 """
 
 import json
+import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from . import config
 from .models import ChatMessage
 from .prompting import _content_to_text
+
+logger = logging.getLogger(__name__)
 
 
 def _namespace() -> str:
@@ -141,7 +144,8 @@ def load(bucket: str) -> Dict[str, Any]:
     try:
         raw = _file(bucket).read_text(encoding="utf-8")
         data = json.loads(raw)
-    except Exception:
+    except Exception:  # noqa: BLE001
+        logger.warning("任务快照解析失败（bucket=%s）：本次忽略。", bucket, exc_info=True)
         return {}
     if not isinstance(data, dict):
         return {}
@@ -179,11 +183,15 @@ def record(bucket: str, messages: List[ChatMessage]) -> None:
     }
     try:
         _dir().mkdir(parents=True, exist_ok=True)
-        _file(bucket).write_text(
+        tmp = _file(bucket).with_name(_file(bucket).name + ".tmp")
+        tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    except Exception:
-        pass
+        tmp.replace(_file(bucket))
+    except Exception:  # noqa: BLE001
+        # 快照落盘失败不该静默：它会让轮转播种丢掉任务目标（T3.1/T3.3）
+        logger.warning("任务快照落盘失败（bucket=%s）：已忽略，下一轮会重试。",
+                       bucket, exc_info=True)
 
 
 def resume_block(bucket: str) -> str:

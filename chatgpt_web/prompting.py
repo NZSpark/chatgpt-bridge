@@ -4,7 +4,16 @@ from typing import Any, Dict, List, Optional
 
 from . import config
 from .models import ChatMessage
-from .toolcalls import format_tool_call_emphasis, format_tools_instruction
+from .toolcalls import (
+    EDIT_MD_HEADER,
+    TOOLCALL_HEADER,
+    format_tool_call_emphasis,
+    format_tools_instruction,
+)
+
+# 播种 prompt 的上下文重建头（去重 / 泄漏检测共用同一份，见 toolcalls 里的标题常量说明）。
+CONTEXT_REBUILD_HEADER = "[上下文重建]"
+ENV_NOTE_HEADER = "[环境说明]"
 
 
 def _content_to_text(content: Any) -> str:
@@ -217,11 +226,18 @@ def build_prompt(
     * ``task_block``：任务快照（见 ``tasks.resume_block``）。仅在 ``seed=True`` 时
       生效，会被放在**历史之前、上下文重建头之后**，因此**不会**被
       ``seed_max_chars`` 的尾部截断逻辑丢掉——这是“轮转不丢任务”的关键。
+
+    带 ``tools`` 时的注入约定（T1.1，实测校准）：
+
+    * 增量路径：工具说明在**用户任务之前**（prompt 开头）；
+    * 播种路径：格式强调块在开头兜底，工具说明**紧贴本轮任务（最后一条消息）
+      之前**——既有近因效应，又不违反「工具说明先于任务」的既有约定。
     """
     if seed:
         systems, kept, truncated = _seed_messages(messages, seed_max_chars or DEFAULT_SEED_MAX_CHARS)
         parts: List[str] = [
-            "[上下文重建] 这是一个新会话。以下是本次任务此前的对话记录，请据此继续，不要从头重做。",
+            f"{CONTEXT_REBUILD_HEADER} 这是一个新会话。以下是本次任务此前的对话记录，"
+            "请据此继续，不要从头重做。",
             # 明确告知：git 仓库就在本地，模型直接下命令即可，无需请求用户提供
             # 远程地址 / 手动执行。放在重建头之后、历史之前，避免被尾部截断丢掉。
             config.SEED_ENV_NOTE,
@@ -230,30 +246,51 @@ def build_prompt(
             parts.append(task_block)
         if truncated:
             parts.append("（更早的部分因长度限制已省略，如需可向我确认。）")
-        parts.extend(_render_message(m) for m in systems + kept)
     else:
-        parts = [_render_message(m) for m in _run_messages(messages)]
+        parts = []
 
     use_tools = bool(tools) and tool_choice != "none"
     if seed and use_tools:
-        # 新 bucket / 重置后的第一轮：把格式强调块放在播种开头，
-        # 模型最容易在这种时候退回原生 DSML 标记或干脆无视工具，双保险。
+        # 新 bucket / 重置后的第一轮：在播种开头再放一次格式强调（强制要求），
+        # 模型最容易在这种时候退回原生 DSML 标记或干脆无视工具。
         parts.insert(1, format_tool_call_emphasis())
 
-    # 工具说明放在**用户任务之前**：模型先看到「有哪些工具、必须调用、怎么调用」，
-    # 再看到具体请求，显著降低「无视工具、直接凭知识作答」的概率。
-    # 去重：入站 system 消息可能已带 [工具调用说明]（harness 会内联一份），
-    # 再追加一遍会造成同一 prompt 出现两份说明、互相干扰。
-    if use_tools and not any("[工具调用说明]" in p for p in parts):
-        parts.insert(1 if not (seed and use_tools) else 2,
-                     format_tools_instruction(tools))
+    # 历史（播种）或增量消息从这里开始追加；工具说明要插在它们**内部**。
+    history_start = len(parts)
+    if seed:
+        rendered = [_render_message(m) for m in systems + kept]
+    else:
+        rendered = [_render_message(m) for m in _run_messages(messages)]
+    parts.extend(rendered)
+
+    # 去重只看**入站消息**（harness 可能已内联一份说明）；不能用 parts 整体判定，
+    # 否则我们自己注入的格式强调块里提到标题就会被误判成「已存在」而不注入工具清单。
+    inbound = "\n".join(rendered)
+
+    # 工具说明的插入位置（T1.1 实测结论）：
+    #   * 增量路径：放最前（用户任务之前）——模型先看到「有哪些工具、必须调用、
+    #     怎么调用」，再看到具体请求，降低「无视工具、直接凭知识作答」的概率；
+    #   * 播种路径：**紧贴本轮任务（最后一条消息）之前**。旧实现把它放在整段
+    #     历史之前，与真正的任务之间隔着环境说明与成百上千行历史，实测模型
+    #     倾向于直接凭知识作答（C1/C2 失败）；贴到任务之前既有近因效应，
+    #     又不违反「工具说明在用户任务之前」的既有约定。
+    # 去重：入站 system 消息可能已带同一份说明（harness 会内联一份），
+    # 再追加一遍会造成同一 prompt 出现两份说明、互相干扰。判定与生成必须
+    # 共用 TOOLCALL_HEADER，否则去重恒不生效（见 T2.3）。
+    if use_tools and TOOLCALL_HEADER not in inbound:
+        tool_list = tools or []
+        if seed:
+            insert_at = len(parts) - 1 if len(parts) > history_start else history_start
+            parts.insert(max(history_start, insert_at), format_tools_instruction(tool_list))
+        else:
+            parts.insert(0, format_tools_instruction(tool_list))
 
     if use_tools and any(
-        (t.get("function", t) or {}).get("name") == "edit_markdown" for t in tools
+        (t.get("function", t) or {}).get("name") == "edit_markdown" for t in (tools or [])
     ):
         from .toolcalls import edit_markdown_spec
 
-        if not any("[edit_markdown 说明]" in p for p in parts):
+        if EDIT_MD_HEADER not in inbound:
             parts.append(edit_markdown_spec())
 
     return "\n\n".join(part for part in parts if part).strip()

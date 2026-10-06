@@ -1,15 +1,17 @@
 """FastAPI 应用与路由（OpenAI 兼容层）。"""
 
-import hashlib
-import re
-import traceback
-from contextlib import asynccontextmanager
-from typing import List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+import asyncio
+import hashlib
+import logging
+import re
+from contextlib import asynccontextmanager
+from typing import List, Optional, Union
+
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config
+from . import config, tasks
 from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTBusyError,
@@ -17,34 +19,57 @@ from .driver import (
     ChatGPTTimeoutError,
     ChatGPTWebDriver,
 )
+from .logging_setup import new_request_id, set_request_id
 from .models import (
+    SUPPORTED_MODELS,
     ChatCompletionRequest,
     ChatCompletionResponse,
     Choice,
     ChoiceMessage,
     ModelCard,
     ModelListResponse,
-    SUPPORTED_MODELS,
     Usage,
 )
 from .prompting import build_prompt, estimate_tokens
 from .responses import ResponsesRequest, handle_responses
-from . import tasks
 from .streaming import _stream_chat_completion
 from .toolcalls import (
-    _tool_names,
     EDIT_MARKDOWN_TOOL,
     EDIT_MARKDOWN_TOOL_NAME,
-    execute_edit_markdown,
+    _tool_names,
     parse_tool_calls,
+    run_local_edit_markdown,
     to_tool_call_models,
+    tool_call_predicate,
 )
 
+logger = logging.getLogger(__name__)
 driver = ChatGPTWebDriver()
+
+
+def _warn_if_exposed(host: Optional[str] = None) -> bool:
+    """HOST 不是回环地址时给出醒目告警（**不阻断启动**）。
+
+    本服务**设计上不提供鉴权**：客户端把 ``api_key`` 随便填都能用，这是核心
+    设计需求（零配置）。因此暴露到非回环地址的唯一防线只能是“让用户立刻
+    察觉到”，而不是在服务里加 key（见 doc/tasks.md T3.2 / §9）。
+    """
+    target = host if host is not None else config.HOST
+    if config.is_loopback_host(target):
+        return False
+    logger.warning(
+        "\n[安全告警] HOST=%s 不是回环地址：本服务不提供任何鉴权，"
+        "任何能访问该地址的人都可用你的 ChatGPT 登录态与额度发起请求。\n"
+        "          请保持 HOST=127.0.0.1；需要远程访问请用 SSH 端口转发 / VPN 等"
+        "外部手段，不要期望在服务内加 API Key（该用法不受支持）。\n",
+        target,
+    )
+    return True
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _warn_if_exposed()
     try:
         await driver.init()
         driver.init_error = None
@@ -52,7 +77,7 @@ async def lifespan(app: FastAPI):
         # 浏览器起不来时也让服务先启动：便于用 /healthz 定位问题，
         # 并让 /v1/chat/completions 返回可读错误，而不是整个进程直接挂掉
         driver.init_error = str(exc)
-        print(
+        logger.error(
             f"\n[启动警告] 浏览器初始化失败：{exc}\n"
             "服务仍会启动，可用 GET /healthz 查看状态。\n"
         )
@@ -106,7 +131,7 @@ def _client_from_ua(ua: str) -> Optional[str]:
 
 
 def _session_key(
-    request: ChatCompletionRequest,
+    request: Union[ChatCompletionRequest, ResponsesRequest],
     header_value: Optional[str],
     user_agent: Optional[str] = None,
 ) -> Optional[str]:
@@ -154,6 +179,8 @@ async def healthz():
             "session_keys": driver.session_keys(),
             "session_scoping": config.SESSION_SCOPING,
             "cluster": driver.cluster_stats(),
+            # 桶 → 页面 / 会话绑定：多 Agent 场景下可直接看出「谁在用哪条会话」
+            "buckets": driver.bucket_map(),
             "init_error": driver.init_error,
         },
     )
@@ -194,6 +221,7 @@ async def root():
             "/v1/responses",
             "/healthz",
             "/debug/dom",
+            "/_debug/selectors",
             "/session/reset",
         ],
     }
@@ -212,6 +240,7 @@ async def list_models():
 @app.post("/v1/responses")
 async def responses(
     request: ResponsesRequest,
+    response: Response,
     x_chatgpt_session: Optional[str] = Header(None, alias=config.SESSION_KEY_HEADER),
     user_agent: Optional[str] = Header(None, alias="User-Agent"),
 ):
@@ -223,9 +252,54 @@ async def responses(
     if not config.ENABLE_RESPONSES_API:
         raise HTTPException(status_code=404, detail="Responses API 未启用（ENABLE_RESPONSES_API=false）")
     session_key = _session_key(request, x_chatgpt_session, user_agent)
+    request_id = new_request_id()
+    set_request_id(request_id)
+    response.headers["X-Request-Id"] = request_id
     if config.DEBUG:
-        print(f"[debug] responses session_key={session_key!r}")
+        logger.debug("[debug] responses session_key=%r", session_key)
     return await handle_responses(request, session_key, driver)
+
+
+@app.get("/_debug/selectors", include_in_schema=False)
+async def debug_selectors():
+    """诊断用：每条配置选择器在当前页面的实时命中数（受 ``CHATGPT_DEBUG`` 控制）。
+
+    选择器失效时 bridge 大多会**静默降级**（例如发送按钮点不到就退回键盘 Enter），
+    没有可观测点很难发现网页版改版。返回 ``healthy``：每条选择器是否至少命中一次。
+    """
+    if not config.DEBUG:
+        raise HTTPException(
+            status_code=404,
+            detail="调试端点默认关闭；请用 CHATGPT_DEBUG=1 启动服务。",
+        )
+    if driver.page is None:
+        raise HTTPException(status_code=503, detail="浏览器尚未初始化")
+
+    groups = {
+        "INPUT_SELECTORS": list(config.INPUT_SELECTORS),
+        "SEND_BUTTON_SELECTORS": list(config.SEND_BUTTON_SELECTORS),
+        "RESPONSE_SELECTORS": [config.RESPONSE_SELECTORS],
+        "READY_SELECTOR": [config.READY_SELECTOR],
+        "NEW_CHAT_SELECTOR": config.NEW_CHAT_SELECTOR.split("||"),
+        "THINK_MODE_SELECTOR": config.THINK_MODE_SELECTOR.split("||"),
+        "CODE_BLOCK_SELECTOR": [config.CODE_BLOCK_SELECTOR],
+    }
+    result = {}
+    healthy = {}
+    for name, selectors in groups.items():
+        entries = []
+        for selector in selectors:
+            selector = selector.strip()
+            if not selector:
+                continue
+            try:
+                count = len(await driver.page.query_selector_all(selector))
+                entries.append({"selector": selector, "matches": count})
+            except Exception as exc:  # noqa: BLE001
+                entries.append({"selector": selector, "error": repr(exc)})
+        result[name] = entries
+        healthy[name] = any((e.get("matches") or 0) > 0 for e in entries)
+    return {"healthy": healthy, "selectors": result}
 
 
 @app.get("/debug/dom", include_in_schema=False)
@@ -278,29 +352,16 @@ async def debug_dom():
     }
 
 
-def _run_local_edit_markdown(tool_calls):
-    """本地执行 edit_markdown，把结构化结果挂回对应调用。未开启时原样返回。"""
-    if not config.EDIT_MARKDOWN_LOCAL or not tool_calls:
-        return tool_calls
-    out = []
-    for call in tool_calls:
-        if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
-            result = execute_edit_markdown(
-                call.get("arguments") or {},
-                backup_dir=config.EDIT_MARKDOWN_BACKUP_DIR,
-            )
-            out.append({**call, "result": result})
-        else:
-            out.append(call)
-    return out
-
-
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     request: ChatCompletionRequest,
+    response: Response,
     x_chatgpt_session: Optional[str] = Header(None, alias=config.SESSION_KEY_HEADER),
     user_agent: Optional[str] = Header(None, alias="User-Agent"),
 ):
+    request_id = new_request_id()
+    set_request_id(request_id)
+    response.headers["X-Request-Id"] = request_id
     if not request.messages:
         return _error_response(400, "messages 不能为空", "invalid_request_error")
 
@@ -314,13 +375,18 @@ async def chat_completions(
 
     # 按任务隔离会话：同一客户端 / 同一 X-ChatGPT-Session 取值的请求共用一条网页会话
     session_key = _session_key(request, x_chatgpt_session, user_agent)
+    logger.info(
+        "请求开始：session_key=%r stream=%s tools=%d",
+        session_key, request.stream, len(request.tools or []),
+    )
     if config.DEBUG:
-        print(f"[debug] session_key={session_key!r}")
+        logger.debug("[debug] session_key=%r", session_key)
 
     # 任务快照：记录本轮 messages，供轮转播种时续接任务（不丢任务目标）。
     bucket = session_key or DEFAULT_SESSION_KEY
-    tasks.record(bucket, request.messages)
-    task_block = tasks.resume_block(bucket)
+    # 任务快照落盘/读取是同步文件 I/O，放线程里跑（T3.3）
+    await asyncio.to_thread(tasks.record, bucket, request.messages)
+    task_block = await asyncio.to_thread(tasks.resume_block, bucket)
 
     if config.EDIT_MARKDOWN_LOCAL and EDIT_MARKDOWN_TOOL_NAME not in _tool_names(request.tools):
         request.tools = list(request.tools or []) + [EDIT_MARKDOWN_TOOL]
@@ -358,38 +424,39 @@ async def chat_completions(
         )
 
     # ---------- 非流式分支 ----------
+    wants_tools = bool(request.tools) and request.tool_choice != "none"
     try:
         reply_content, code_blocks = await driver.send_chat(
-            prompt, seeded_prompt=seeded_prompt, key=session_key
+            prompt,
+            seeded_prompt=seeded_prompt,
+            key=session_key,
+            # 首轮未调用工具时让 driver 追发一次纠偏指令（T1.1）
+            validate_reply=tool_call_predicate(request.tools) if wants_tools else None,
         )
     except ChatGPTContextLimitError as exc:
-        print("\n[ERR] 网页会话已达上下文长度上限:")
-        traceback.print_exc()
+        logger.error("\n[ERR] 网页会话已达上下文长度上限:", exc_info=True)
         return _error_response(400, str(exc), "context_length_exceeded")
     except ChatGPTBusyError as exc:
         # 本地保护：同一会话桶已有请求在跑且等锁超时。稍后重试即可，不是上游故障。
-        print(f"\n[繁忙] {exc}")
+        logger.warning(f"\n[繁忙] {exc}")
         return _error_response(503, str(exc), "upstream_busy")
     except ChatGPTTimeoutError as exc:
-        print("\n[ERR] 等待 ChatGPT 回复超时（已重试）:")
-        traceback.print_exc()
+        logger.error("\n[ERR] 等待 ChatGPT 回复超时（已重试）:", exc_info=True)
         return _error_response(504, str(exc), "timeout")
     except RuntimeError as exc:
         # 浏览器不可用 / 找不到输入框等上游问题
-        print("\n[ERR] 上游浏览器不可用:")
-        traceback.print_exc()
+        logger.error("\n[ERR] 上游浏览器不可用:", exc_info=True)
         return _error_response(502, str(exc), "upstream_error")
     except Exception as exc:  # noqa: BLE001
-        print("\n[ERR] 处理请求失败:")
-        traceback.print_exc()
+        logger.error("\n[ERR] 处理请求失败:", exc_info=True)
         return _error_response(500, str(exc), "server_error")
 
     # usage 用真正发出去的 prompt 估算（driver 可能选了播种版 / 中途轮转过）。
     # 按会话桶读取，并发时不会拿到别的 Agent 的 prompt；回退到预判值兼容假 driver。
     sent_prompt = driver.sent_prompt(session_key) or prompt
-    wants_tools = bool(request.tools) and request.tool_choice != "none"
     tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
-    tool_calls = _run_local_edit_markdown(tool_calls)
+    # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
+    tool_calls = await asyncio.to_thread(run_local_edit_markdown, tool_calls)
 
     if tool_calls:
         return ChatCompletionResponse(
@@ -410,8 +477,9 @@ async def chat_completions(
     # None = 客户端未指定，回落到 config.SAVE_FILES（默认 false）；显式传入才覆盖
     save_files = config.SAVE_FILES if request.save_files is None else request.save_files
     if save_files:
-        saved_files = driver.save_extracted_files(
-            reply_content, code_blocks, request.output_dir or config.OUTPUT_DIR
+        saved_files = await asyncio.to_thread(
+            driver.save_extracted_files,
+            reply_content, code_blocks, request.output_dir or config.OUTPUT_DIR,
         )
 
     return ChatCompletionResponse(

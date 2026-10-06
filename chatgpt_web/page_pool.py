@@ -4,7 +4,9 @@
 以及供 ``/healthz`` 观察的占用统计。页面关闭只关页面，会话状态保留。
 """
 
+
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
@@ -12,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from . import config
 from .errors import DEFAULT_SESSION_KEY, HOME_URL, ChatGPTBusyError
 
+logger = logging.getLogger(__name__)
 
 class PagePoolMixin:
     def busy_keys(self) -> List[str]:
@@ -28,6 +31,24 @@ class PagePoolMixin:
             "busy": self.busy_keys(),
             "keys": self.session_keys(),
         }
+
+    def bucket_map(self) -> Dict[str, Any]:
+        """每个会话桶 → 页面 / 会话绑定关系（供 /healthz 观察，T3.1/T1.2）。
+
+        只读且**不创建**任何状态（不调用 ``_state()``，避免健康检查副作用）。
+        """
+        out: Dict[str, Any] = {}
+        buckets = sorted(set(self._pages) | set(self._sessions) | {DEFAULT_SESSION_KEY})
+        for bucket in buckets:
+            state = self._sessions.get(bucket)
+            out[bucket] = {
+                "page_open": bucket in self._pages,
+                "busy": self.bucket_busy(bucket),
+                "last_used": self._page_last_used.get(bucket),
+                "has_history": bool(getattr(state, "has_history", False)),
+                "turns": int(getattr(state, "turns", 0) or 0),
+            }
+        return out
 
     def _lock_for(self, key: Optional[str] = None) -> asyncio.Lock:
         """取某个会话桶的锁。
@@ -75,9 +96,14 @@ class PagePoolMixin:
     def _touch_page(self, key: Optional[str] = None) -> None:
         self._page_last_used[key or DEFAULT_SESSION_KEY] = time.monotonic()
 
-    def _bucket_busy(self, bucket: str) -> bool:
-        """该桶是否正在生成回复（锁被持有）。用它代替额外的“活跃桶”标志。"""
-        return self._lock_for(bucket).locked()
+    def bucket_busy(self, key: Optional[str] = None) -> bool:
+        """该桶是否正在生成回复（供 session_store / responses 共用）。
+
+        只看 ``_active_buckets``（在持锁期间由 ``_session_lock`` 精确维护），
+        **不能**看锁状态：串行模式（``PARALLEL_BUCKETS=false``）下所有桶共用
+        ``self.lock``，用锁判断会把「别的桶在跑」误判成本桶忙（T2.4）。
+        """
+        return (key or DEFAULT_SESSION_KEY) in self._active_buckets
 
     async def _close_bucket_page(self, bucket: str, reason: str) -> bool:
         """关闭某个会话桶的页面（**只关页面，状态保留**）。
@@ -92,9 +118,9 @@ class PagePoolMixin:
         try:
             await page.close()
         except Exception as exc:  # noqa: BLE001
-            print(f"[回收] 关闭 key={bucket} 的页面时出错（已忽略）：{exc}")
+            logger.warning(f"[回收] 关闭 key={bucket} 的页面时出错（已忽略）：{exc}")
         else:
-            print(f"[回收] 已关闭 key={bucket} 的页面（{reason}），会话状态保留。")
+            logger.info(f"[回收] 已关闭 key={bucket} 的页面（{reason}），会话状态保留。")
         return True
 
     async def _recycle_idle_pages(self, exclude: Optional[str] = None) -> int:
@@ -105,7 +131,7 @@ class PagePoolMixin:
         now = time.monotonic()
         closed = 0
         for bucket in list(self._pages):
-            if bucket == exclude or self._bucket_busy(bucket):
+            if bucket == exclude or self.bucket_busy(bucket):
                 continue
             last_used = self._page_last_used.get(bucket, now)
             if now - last_used > ttl:
@@ -119,7 +145,7 @@ class PagePoolMixin:
         """
         candidates = [
             bucket for bucket in self._pages
-            if bucket != exclude and not self._bucket_busy(bucket)
+            if bucket != exclude and not self.bucket_busy(bucket)
         ]
         if not candidates:
             return False
@@ -134,7 +160,7 @@ class PagePoolMixin:
             )
             return True
         except Exception:
-            print("[会话] 页面已打开，但未检测到输入框，请检查登录状态。")
+            logger.warning("[会话] 页面已打开，但未检测到输入框，请检查登录状态。")
             return False
 
     async def _ensure_page(self, key: Optional[str]) -> None:
@@ -177,4 +203,4 @@ class PagePoolMixin:
             # 新会话默认选中「思考模式」；发送前 _send_chat_locked 还会再确认一次
             await self._select_think_mode(page)
             state.has_history = False
-        print(f"[会话] 已为 key={bucket} 创建独立会话页面（{HOME_URL}）")
+        logger.info(f"[会话] 已为 key={bucket} 创建独立会话页面（{HOME_URL}）")
