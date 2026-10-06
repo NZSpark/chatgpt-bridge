@@ -91,7 +91,7 @@ SESSION_RECOVERY
 
 ## PI-003 建立统一 Bridge Event Model
 
-状态：TODO｜优先级：P0｜依赖：PI-001
+状态：DONE｜优先级：P0｜依赖：PI-001
 
 定义内部事件：
 
@@ -118,7 +118,7 @@ GenerationFailed
 
 ## PI-004 Chat / Responses 协议 Adapter
 
-状态：TODO｜优先级：P0｜依赖：PI-003
+状态：DONE｜优先级：P0｜依赖：PI-003
 
 将 server.py、responses.py、streaming.py 的协议转换逻辑收敛到薄 adapter。
 
@@ -136,7 +136,7 @@ GenerationFailed
 
 ## PI-005 创建 DOM Adapter
 
-状态：TODO｜优先级：P0｜依赖：无
+状态：DONE｜优先级：P0｜依赖：无
 
 新建 chatgpt_web/dom_adapter.py，统一提供：
 
@@ -164,7 +164,7 @@ extract_latest_reply()
 
 ## PI-006 DOM 改版黄金回归
 
-状态：TODO｜优先级：P0｜依赖：PI-005
+状态：BLOCKED｜优先级：P0｜依赖：PI-005
 
 增加真实网页检查：
 
@@ -179,13 +179,15 @@ extract_latest_reply()
 
 DOM 改版时，diagnostics 能指出具体失败层，而不是只能等待总超时。
 
+当前进展：`tests/e2e/test_dom_probe.py` 已覆盖上述探测层，并能把 Cloudflare / profile 占用识别为明确环境阻塞；本机真实回归目前被 ChatGPT Cloudflare challenge 阻断，headed 模式另受 `user_data` 被现有 Chromium 实例占用影响，因此不能宣称真实 DOM 黄金回归已通过。
+
 ---
 
 # 3. P1：Tool Runtime
 
 ## PI-007 ToolCall 强类型对象
 
-状态：TODO｜优先级：P1｜依赖：PI-003
+状态：DONE｜优先级：P1｜依赖：PI-003
 
 把 TOOL_CALL: {...} 解析结果统一转换为：
 
@@ -197,8 +199,7 @@ ToolCallRequest
  ├── source_span
  └── raw_text
 
-
-解析完成后执行层禁止继续依赖原始文本。
+已增加不可变 `ToolCallRequest` 及 `parse_tool_call_requests()` typed boundary；保留 `parse_tool_calls()` / dict facade 以兼容现有 Chat、Responses、streaming 和 edit_markdown 调用方，并让 `to_tool_call_models()` 同时支持 typed request。
 
 ## PI-008 ToolCall 标准流水线
 
@@ -891,8 +892,8 @@ perf: establish browser request baseline
 | --- | --- | --- | --- | --- |
 | PI-001 | 统一任务状态机 | P0 | - | TODO |
 | PI-002 | 状态机不变量测试 | P0 | PI-001 | TODO |
-| PI-003 | Bridge Event Model | P0 | PI-001 | TODO |
-| PI-004 | Chat / Responses Adapter | P0 | PI-003 | TODO |
+| PI-003 | Bridge Event Model | P0 | PI-001 | DONE |
+| PI-004 | Chat / Responses Adapter | P0 | PI-003 | DONE |
 | PI-005 | DOM Adapter | P0 | - | TODO |
 | PI-006 | DOM 黄金回归 | P0 | PI-005 | TODO |
 | PI-007 | ToolCall 强类型 | P1 | PI-003 | TODO |
