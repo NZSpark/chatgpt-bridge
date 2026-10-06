@@ -534,6 +534,8 @@ parse_tool_calls(text, {"bash"})       -> 0 → 1（修复后；命令内容不�
 
 **验证**：`pytest` → **362 passed / 17 skipped**，`ruff` / `mypy` 干净。改动需**重启桥**才对客户端生效。
 
+**完整技术报告**：[doc/code_block_fence.md](code_block_fence.md)（原因 / 机制 / 实现 / 真机对照数据 / 复现步骤 / 残留）。
+
 ---
 
 ## 3. 静态分析发现（与 E2E 无关的既有问题）

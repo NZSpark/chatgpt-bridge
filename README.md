@@ -270,6 +270,7 @@ chatgpt_web/
 doc/tasks.md              任务分解与验收标准
 doc/update.md             项目分析与改进建议（含真实 E2E 结果）
 doc/e2e_test_design.md    E2E 对等测试设计（判定矩阵 / 开关 / 前置条件）
+doc/code_block_fence.md   工具调用载体改造技术报告（纯文本 TOOL_CALL 行 → tool_call 围栏）
 output/                   回复与代码块落盘（gitignore）
 user_data/                浏览器 profile 与状态（gitignore）
 ```

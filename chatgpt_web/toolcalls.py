@@ -19,7 +19,9 @@ from .models import FunctionCall, ToolCall
 
 logger = logging.getLogger(__name__)
 
-# 当前注入格式：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
+# 历史载体（仍兼容，不再是注入格式）：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
+# 2026-10-06 起注入格式改为 ```tool_call 代码围栏（原因：网页版把纯文本行当 markdown
+# 渲染，会吃掉反斜杠转义并折叠连续空格，见 doc/code_block_fence.md）。
 # 只认行首（允许前导空白），避免正文里偶然出现的 "TOOL_CALL:" 被误触发；
 # 后续 JSON 由 _iter_balanced_objects 从冒号之后开始扫。
 _TOOL_CALL_LINE_RE = re.compile(r"^[ \t]*TOOL_CALL\s*:\s*", re.IGNORECASE | re.MULTILINE)
@@ -947,13 +949,13 @@ def _iter_balanced_objects(text: str):
 def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[str, Any]]:
     """从模型回复中解析出工具调用列表。返回 [{"name": ..., "arguments": {...}}, ...]
 
-    需要兼容多种形态（新→旧）：
-      0. **首选**：行首 ``TOOL_CALL: {...}`` 纯文本标记（当前注入格式，无尖括号、
-         无围栏，模型无法脑补出 ``>`` 造成历史污染）；
-      1. 带围栏的 ```tool_call ... ```代码块（模型直接输出 markdown 时）；
+    需要兼容多种形态：
+      0. **当前注入格式**：带围栏的 ```tool_call ... ```代码块（围栏内一条 JSON）；
+      1. 行首 ``TOOL_CALL: {...}`` 纯文本标记——**历史载体**，仍兼容；
+         网页版会把这行当 markdown 渲染并改坏它，见 doc/code_block_fence.md；
       2. **无围栏**的 ``tool_call`` 标签 + JSON 对象——这是从 ChatGPT 网页 DOM
          提取 inner_text 后的常见形态：代码块被渲染成 <pre>，围栏退化为标题文字，
-         于是只剩 ``tool_call`` 标签与裸 JSON。
+         于是只剩 ``tool_call`` 标签与裸 JSON（当前注入格式被渲染后的实际形态）。
     """
     if not text:
         return []
@@ -997,7 +999,7 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             if normalized:
                 calls.append(normalized)
 
-    # 0. 首选形态：行首 TOOL_CALL: 后跟一个平衡 JSON 对象。
+    # 0. 兼容分支（历史载体）：行首 TOOL_CALL: 后跟一个平衡 JSON 对象。
     #
     #    契约：**每个 TOOL_CALL: 标记只取其后第一个平衡 JSON 对象；一行一调用；
     #    多个调用必须写成多行**。同行第二个对象会被丢弃（这是有意为之——
