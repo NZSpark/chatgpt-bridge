@@ -240,6 +240,14 @@ SEED_ENV_NOTE = env_str(
 # Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆 ChatGPT 网页版输入框
 # （Playwright fill 超时）。超出即截断并标注。0 = 不限制（不推荐）。
 TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 20000)
+# 工具纠偏（T1.1）的适用范围：**只在「本轮任务还没调用过任何工具」时**才纠偏。
+# 背景（2026-10-06 用户实测）：模型已经用过工具、最后用纯文本收尾时（“工作区是干净的，
+# 任务完成”），旧行为会立即追发一条纠偏指令 —— 等于把「任务已完成」的结论又重新推成
+# 一条新命令，模型只能继续发指令，任务永远结束不了。
+# 因此默认：历史里已经出现过工具调用 / 工具结果时，不再纠偏（把纯文本回复当作收尾）。
+# 首轮（一次工具都还没调用）仍保留纠偏，因为它解决的是「模型完全无视工具、凭知识编结果」。
+# 设为 false = 完全不纠偏（需要工具却一次不调用时，直接把文本当最终答案返回）。
+TOOL_NUDGE_UNTIL_FIRST_CALL = env_bool("TOOL_NUDGE_UNTIL_FIRST_CALL", True)
 # 工具说明注入时是否输出每个工具的完整 JSON Schema。
 # 默认 false：只列 `name(必填参数): 描述`，能省下大量字符（Codex 的工具
 # schema 动辄数千字，是播种 prompt 变长的隐藏大头）。true = 旧行为（全量 schema）。

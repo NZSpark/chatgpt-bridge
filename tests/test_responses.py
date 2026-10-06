@@ -39,6 +39,7 @@ class FakeDriver:
     def __init__(self, reply):
         self.reply = reply
         self.page = object()
+        self.validate_calls = []
 
     def needs_seed(self, key=None):
         return False
@@ -48,7 +49,8 @@ class FakeDriver:
 
     async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None,
                         validate_reply=None):
-        # validate_reply：生产代码在工具模式下传的纠偏判定（仅供签名兼容）。
+        # validate_reply：生产代码在工具模式下传的纠偏判定；这里只记录，不重试。
+        self.validate_calls.append(validate_reply)
         if on_delta:
             await on_delta(self.reply)
         return self.reply, []
@@ -161,6 +163,51 @@ class StreamResponsesToolTests(unittest.TestCase):
             {item["id"] for item in output},
             {p["item"]["id"] for p in added},
         )
+
+
+class RunChatNudgePredicateTests(unittest.TestCase):
+    """``/v1/responses`` 共享执行路径的纠偏判定接线。
+
+    Codex 走的就是这条路径，且历史里的工具调用/结果是由 Responses 的
+    ``function_call`` / ``function_call_output`` item 转换而来。任务已进入
+    执行阶段后绝不能再追发 prompt（见 prompting.tool_nudge_predicate）。
+    """
+
+    def _validate_args(self, messages):
+        from unittest import mock
+
+        from chatgpt_web import config
+        from chatgpt_web.responses import run_chat
+
+        driver = FakeDriver("仓库是干净的，任务完成。")
+        req = ChatCompletionRequest(
+            model="chatgpt-chat", messages=messages, tools=TOOLS, tool_choice="auto"
+        )
+        # 关掉任务快照：本用例只关心 validate_reply 接线，不碰磁盘。
+        with mock.patch.object(config, "TASK_SNAPSHOT_ENABLED", False):
+            asyncio.run(run_chat(req, driver, None))
+        return driver.validate_calls
+
+    def test_first_turn_keeps_nudge(self):
+        calls = self._validate_args([ChatMessage(role="user", content="看看仓库")])
+        self.assertEqual(len(calls), 1)
+        self.assertIsNotNone(calls[0])
+
+    def test_after_function_call_output_nudge_is_disabled(self):
+        calls = self._validate_args([
+            ChatMessage(role="user", content="看看仓库"),
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": "{}"},
+                }],
+            ),
+            ChatMessage(role="tool", content="(no output)", tool_call_id="call_1"),
+        ])
+        self.assertEqual(calls, [None])
 
 
 class NonStreamingFromChatTests(unittest.TestCase):

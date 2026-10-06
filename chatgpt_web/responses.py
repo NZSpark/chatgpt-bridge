@@ -28,14 +28,13 @@ from .driver import (
     ChatGPTTimeoutError,
 )
 from .models import ChatCompletionRequest, ChatMessage, FunctionCall, ToolCall
-from .prompting import build_prompt, estimate_tokens
+from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
 from .toolcalls import (
     EDIT_MARKDOWN_TOOL,
     EDIT_MARKDOWN_TOOL_NAME,
     _tool_names,
     parse_tool_calls,
     run_local_edit_markdown,
-    tool_call_predicate,
 )
 
 logger = logging.getLogger(__name__)
@@ -300,7 +299,10 @@ async def run_chat(
         key=session_key,
         # 首轮未调用工具时让 driver 追发一次纠偏指令（T1.1）；调用方在工具模式下
         # 已先缓冲（RESPONSES_TOOL_BUFFER），不会把首轮文本作为最终答案发出。
-        validate_reply=tool_call_predicate(request.tools) if wants_tools else None,
+        # 任务已进入执行阶段（用过工具）后不再纠偏——纯文本回复视为收尾。
+        validate_reply=tool_nudge_predicate(
+            request.messages, request.tools, request.tool_choice
+        ),
     )
     tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
     sent_prompt = driver.sent_prompt(session_key) or prompt

@@ -165,6 +165,138 @@ class RepeatedEmptyToolCallTests(unittest.TestCase):
         self.assertIn("a.py", prompt)
 
 
+class NoNudgeAfterTaskStartedTests(unittest.TestCase):
+    """任务收尾不再被追发纠偏 prompt（用户实测：ChatGPT 已结束仍被推着再吐指令）。
+
+    带工具的请求里，「模型回复没有工具调用」有两种完全不同的含义：
+
+    * 本轮任务**一次工具都还没调用过** → 模型可能完全无视了工具、凭自身知识
+      编了个结果（E2E C1/C2）——保留 T1.1 的一次纠偏；
+    * 历史里已经有工具结果 / assistant tool_calls → 任务早已进入执行阶段，
+      这次的纯文本回复是**收尾**（“已完成 / 工作区是干净的”）——**不能**再追发
+      任何 prompt，否则等于把结论重新推成一条新命令，模型只能继续下指令，
+      任务永远结束不了。
+
+    无指令的回复直接作为最终答案返回（客户端看到没有 tool_calls 即判定任务
+    结束）；若模型其实还在生成，chat_io 的静默窗口会继续等到内容出现。
+    """
+
+    TOOLS = _ToolHistoryBuilder.TOOLS
+    CALL_TEXT = 'TOOL_CALL: {"name": "bash", "arguments": {"command": "ls"}}'
+
+    def _plain_history(self):
+        from chatgpt_web.models import ChatMessage
+
+        return [
+            ChatMessage(role="system", content="你是助手"),
+            ChatMessage(role="user", content="看看仓库状态"),
+            ChatMessage(role="assistant", content="仓库是干净的，任务完成。"),
+            ChatMessage(role="user", content="那再确认一下分支"),
+        ]
+
+    # ---------- has_prior_tool_use ----------
+
+    def test_has_prior_tool_use_false_for_plain_chat(self):
+        from chatgpt_web.prompting import has_prior_tool_use
+
+        self.assertFalse(has_prior_tool_use([]))
+        self.assertFalse(has_prior_tool_use(self._plain_history()))
+
+    def test_has_prior_tool_use_detects_tool_result(self):
+        from chatgpt_web.models import ChatMessage
+        from chatgpt_web.prompting import has_prior_tool_use
+
+        history = self._plain_history() + [
+            ChatMessage(role="tool", content="main\n", tool_call_id="call_1")
+        ]
+        self.assertTrue(has_prior_tool_use(history))
+
+    def test_has_prior_tool_use_detects_assistant_tool_calls(self):
+        from chatgpt_web.models import ChatMessage, FunctionCall, ToolCall
+        from chatgpt_web.prompting import has_prior_tool_use
+
+        history = self._plain_history() + [
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(function=FunctionCall(name="bash", arguments="{}"))],
+            )
+        ]
+        self.assertTrue(has_prior_tool_use(history))
+
+    # ---------- tool_nudge_predicate ----------
+
+    def test_no_tools_never_nudges(self):
+        from chatgpt_web.prompting import tool_nudge_predicate
+
+        self.assertIsNone(tool_nudge_predicate(self._plain_history(), None))
+        self.assertIsNone(tool_nudge_predicate(self._plain_history(), []))
+
+    def test_tool_choice_none_never_nudges(self):
+        from chatgpt_web.prompting import tool_nudge_predicate
+
+        self.assertIsNone(
+            tool_nudge_predicate(self._plain_history(), self.TOOLS, "none")
+        )
+
+    def test_first_turn_without_tool_use_still_nudges(self):
+        """T1.1 保留：一次工具都没调用过时，仍纠偏一次。"""
+        from chatgpt_web.prompting import tool_nudge_predicate
+
+        predicate = tool_nudge_predicate(self._plain_history(), self.TOOLS, "auto")
+        self.assertIsNotNone(predicate)
+        self.assertFalse(predicate("仓库是干净的，任务完成。"))
+        self.assertTrue(predicate(self.CALL_TEXT))
+
+    def test_tool_result_disables_nudge(self):
+        """用户实测的 bug：任务已执行过工具，收尾时不能再追发 prompt。"""
+        from chatgpt_web.models import ChatMessage
+        from chatgpt_web.prompting import tool_nudge_predicate
+
+        history = self._plain_history() + [
+            ChatMessage(role="tool", content="(no output)", tool_call_id="call_1")
+        ]
+        self.assertIsNone(tool_nudge_predicate(history, self.TOOLS, "auto"))
+
+    def test_prior_tool_calls_disable_nudge(self):
+        from chatgpt_web.models import ChatMessage, FunctionCall, ToolCall
+        from chatgpt_web.prompting import tool_nudge_predicate
+
+        history = self._plain_history() + [
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(function=FunctionCall(name="bash", arguments="{}"))],
+            )
+        ]
+        self.assertIsNone(tool_nudge_predicate(history, self.TOOLS, "auto"))
+
+    def test_config_off_disables_nudge_everywhere(self):
+        """``TOOL_NUDGE_UNTIL_FIRST_CALL=false`` = 完全不纠偏（桥绝不自行追发 prompt）。"""
+        from unittest.mock import patch
+
+        from chatgpt_web import config
+        from chatgpt_web.models import ChatMessage
+        from chatgpt_web.prompting import tool_nudge_predicate
+
+        with patch.object(config, "TOOL_NUDGE_UNTIL_FIRST_CALL", False):
+            self.assertIsNone(
+                tool_nudge_predicate(self._plain_history(), self.TOOLS, "auto")
+            )
+            self.assertIsNone(
+                tool_nudge_predicate(
+                    [ChatMessage(role="user", content="hi")],
+                    self.TOOLS,
+                    "auto",
+                )
+            )
+
+    def test_config_on_is_the_default(self):
+        from chatgpt_web import config
+
+        self.assertTrue(config.TOOL_NUDGE_UNTIL_FIRST_CALL)
+
+
 class ToolsInstructionDesignTests(unittest.TestCase):
     """工具调用指令的设计不变量（真实联网回归的固化）。
 

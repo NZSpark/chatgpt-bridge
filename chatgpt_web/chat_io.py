@@ -81,6 +81,9 @@ class ChatIOMixin:
         :param validate_reply: 可选「回复是否可接受」判定；返回 False 时会
                     在同一会话追发一次工具纠偏指令（仅一次，见 T1.1）。
                     调用方需自行保证此时未把首轮回复流式发给客户端。
+                    **传 None 即表示不追发任何 prompt**：任务已进入执行阶段后，
+                    无指令的纯文本回复就是收尾，桥不得自行再推模型（见
+                    ``prompting.tool_nudge_predicate`` 与 update.md §2.12）。
 
         **重试阶梯**（本项目不做 URL 恢复，重试即重开对话 + 播种）：
 
@@ -149,15 +152,22 @@ class ChatIOMixin:
                 self._state(bucket).last_error = str(exc)
                 logger.warning(f"[恢复] 第 {attempt}/{max_attempts} 次失败：等待回复超时。")
             else:
-                # 首轮回复达标（或调用方没给判定）——直接返回
+                # 回复达标（或调用方没给判定）——直接返回
                 if validate_reply is None or validate_reply(reply_text):
                     return reply_text, blocks
-                # T1.1 纠偏：模型只给了纯文本、没有调用工具。此时把它当最终答案
+                # T1.1 纠偏：模型完全无视了工具、直接凭知识作答。此时把它当最终答案
                 # 返回，客户端（Pi/Codex）会误以为任务已经完成。这里在同一会话
                 # 追发一次短纠偏指令（只一次），让它重新输出结构化 TOOL_CALL。
+                # 注意：调用方（`prompting.tool_nudge_predicate`）只在**本轮任务还
+                # 没调用过任何工具**时才会传判定进来；任务已进入执行阶段后的纯文本
+                # 回复是**收尾**，不会走到这里——否则等于把结论重新推成一条新命令，
+                # 模型只能继续下指令，任务永远结束不了（用户实测，见 update.md §2.12）。
                 from .toolcalls import format_tool_retry_nudge
 
-                logger.warning("[工具纠偏] 首轮回复未调用工具，追加一次纠偏指令重发（仅一次）。")
+                logger.warning(
+                    "[工具纠偏] 本轮尚未调用过任何工具，回复里没有工具调用——"
+                    "追加一次纠偏指令重发（仅一次）。"
+                )
                 try:
                     # 纠偏是会话内的后续消息：不更新 _last_prompts（usage 仍按
                     # 客户端真正发来的 prompt 估算），也不实时吐字（首轮内容已
@@ -167,10 +177,10 @@ class ChatIOMixin:
                     )
                 except (ChatGPTTimeoutError, ChatGPTContextLimitError,
                         ChatGPTBusyError) as exc:
-                    logger.warning(f"[工具纠偏] 重发失败（{exc!r}），返回首轮回复。")
+                    logger.warning(f"[工具纠偏] 重发失败（{exc!r}），返回原回复。")
                     return reply_text, blocks
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"[工具纠偏] 重发异常（{exc!r}），返回首轮回复。")
+                    logger.warning(f"[工具纠偏] 重发异常（{exc!r}），返回原回复。")
                     return reply_text, blocks
                 return retry_text, retry_blocks
 

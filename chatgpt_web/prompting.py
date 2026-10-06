@@ -239,6 +239,51 @@ def _render_message(message: ChatMessage) -> str:
     return content
 
 
+def has_prior_tool_use(messages: List[ChatMessage]) -> bool:
+    """本轮请求的历史里是否**已经用过工具**（跨轮判断「任务是否已开始执行」）。
+
+    客户端只有在执行完一个工具后才会回传 ``role="tool"`` 的结果（或带 ``tool_calls``
+    的 assistant 消息），因此这两者任一出现就意味着任务**已经进入执行阶段**。
+    用途：决定「模型这次只回纯文本」到底是「无视工具」还是「任务收尾」——
+    见 :func:`tool_nudge_predicate`。
+    """
+    for message in messages:
+        if message.role == "tool":
+            return True
+        if message.tool_calls:
+            return True
+    return False
+
+
+def tool_nudge_predicate(
+    messages: List[ChatMessage],
+    tools: Optional[List[Dict[str, Any]]],
+    tool_choice: Optional[Any] = None,
+) -> Optional[Any]:
+    """按需返回「本轮回复是否可接受」判定，供 ``send_chat(validate_reply=...)``。
+
+    返回 ``None`` = **不纠偏**（把模型这次回复当最终答案）。仅在「带工具、且本轮任务
+    一次工具都还没调用过」时返回判定函数。
+
+    为什么任务执行中不再纠偏（用户实测）：模型用过工具后用纯文本收尾（“已完成”）时，
+    立刻追发纠偏指令等于把结论又推成一条新命令，模型只能再发指令 → 任务永远收不了尾。
+    反之首轮（还没调过工具）的纠偏仍保留，因为它治的是另一种毛病：
+    模型完全无视工具、直接凭自身知识编结果（E2E C1/C2）。
+
+    关闭 ``config.TOOL_NUDGE_UNTIL_FIRST_CALL`` = **完全不纠偏**（桥不再自行追发
+    任何 prompt，模型没调用工具时直接把纯文本当最终答案返回）。
+    """
+    if not config.TOOL_NUDGE_UNTIL_FIRST_CALL:
+        return None
+    if not tools or tool_choice == "none":
+        return None
+    if has_prior_tool_use(messages):
+        return None
+    from .toolcalls import tool_call_predicate
+
+    return tool_call_predicate(tools)
+
+
 def _last_assistant_index(messages: List[ChatMessage]) -> int:
     last = -1
     for index, message in enumerate(messages):

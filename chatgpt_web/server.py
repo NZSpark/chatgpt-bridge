@@ -30,7 +30,7 @@ from .models import (
     ModelListResponse,
     Usage,
 )
-from .prompting import build_prompt, estimate_tokens
+from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
 from .responses import ResponsesRequest, handle_responses
 from .streaming import _stream_chat_completion
 from .toolcalls import (
@@ -40,7 +40,6 @@ from .toolcalls import (
     parse_tool_calls,
     run_local_edit_markdown,
     to_tool_call_models,
-    tool_call_predicate,
 )
 
 logger = logging.getLogger(__name__)
@@ -430,8 +429,12 @@ async def chat_completions(
             prompt,
             seeded_prompt=seeded_prompt,
             key=session_key,
-            # 首轮未调用工具时让 driver 追发一次纠偏指令（T1.1）
-            validate_reply=tool_call_predicate(request.tools) if wants_tools else None,
+            # 首轮未调用工具时让 driver 追发一次纠偏指令（T1.1）；任务已进入
+            # 执行阶段（用过工具）后不再纠偏——纯文本回复视为任务收尾（见
+            # prompting.tool_nudge_predicate）。
+            validate_reply=tool_nudge_predicate(
+                request.messages, request.tools, request.tool_choice
+            ),
         )
     except ChatGPTContextLimitError as exc:
         logger.error("\n[ERR] 网页会话已达上下文长度上限:", exc_info=True)

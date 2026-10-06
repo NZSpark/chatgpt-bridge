@@ -182,6 +182,45 @@ class ToolRetryTests(EndDetectionTestCase):
         text, _ = asyncio.run(driver.send_chat("看看当前目录"))
         self.assertEqual(text, self.PLAIN)
 
+    def test_task_end_sends_no_second_prompt(self) -> None:
+        """驱动层回归（用户实测）：任务已执行过工具、模型用纯文本收尾时，
+        桥不得再往输入框发任何 prompt。
+
+        旧行为：工具模式下 `validate_reply` 恒为 `tool_call_predicate`，收尾的
+        纯文本被判为「没调用工具」→ 立刻追发纠偏指令 → 模型只能又吐一条新指令，
+        任务永远收不了尾。
+
+        当前接线（`prompting.tool_nudge_predicate`）在历史里已有工具调用 /
+        工具结果时返回 `None`：`send_chat` 直接把纯文本当最终答案，
+        输入框里仍是最初那条用户任务（脚本中为第二轮准备的工具调用回复根本没被读到）。
+        """
+        from chatgpt_web.prompting import tool_nudge_predicate
+
+        history = [
+            ChatMessage(role="user", content="看看仓库状态"),
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }],
+            ),
+            ChatMessage(role="tool", content="(no output)", tool_call_id="call_1"),
+        ]
+        validate = tool_nudge_predicate(history, TOOLS, "auto")
+        self.assertIsNone(validate, "任务已进入执行阶段后不应再纠偏")
+
+        page = self._page()
+        driver = self.driver_for(page)
+        text, _ = asyncio.run(
+            driver.send_chat("看看当前目录", validate_reply=validate)
+        )
+        self.assertEqual(text, self.PLAIN, "收尾文本必须原样作为最终答案返回")
+        self.assertNotIn(RETRY_HEADER, page._input.text)
+        self.assertIn("看看当前目录", page._input.text)
+
 
 class RetryNudgeTests(unittest.TestCase):
     def test_nudge_demands_single_tool_call(self) -> None:

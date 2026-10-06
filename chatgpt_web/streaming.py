@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional
 from . import config
 from .driver import ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
 from .models import ChatCompletionRequest
-from .prompting import estimate_tokens
-from .toolcalls import _tool_names, parse_tool_calls, tool_call_predicate
+from .prompting import estimate_tokens, tool_nudge_predicate
+from .toolcalls import _tool_names, parse_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,11 @@ async def _stream_chat_completion(
                 on_delta=None if wants_tools else on_delta,
                 seeded_prompt=seeded_prompt,
                 key=session_key,
-                validate_reply=tool_call_predicate(request.tools) if wants_tools else None,
+                # 仅「本轮任务还没调用过任何工具」时才纠偏；用过工具后的纯文本
+                # 回复视为任务收尾，不再追发指令（见 prompting.tool_nudge_predicate）。
+                validate_reply=tool_nudge_predicate(
+                    request.messages, request.tools, request.tool_choice
+                ),
             )
             await queue.put(("done", (reply, blocks, None, None)))
         except ChatGPTContextLimitError as exc:
