@@ -78,6 +78,19 @@ class ResolveEditPathTests(SandboxCase):
         self.assertIsNone(resolved)
         self.assertIn("绝对路径", error or "")
 
+    def test_symlink_escape_is_rejected(self) -> None:
+        outside = self.root.parent / "edit-md-symlink-target.md"
+        outside.write_text("外部文件\n", encoding="utf-8")
+        self.addCleanup(lambda: outside.exists() and outside.unlink())
+        link = self.root / "linked.md"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink unavailable: {exc}")
+        resolved, error = resolve_edit_path("linked.md")
+        self.assertIsNone(resolved)
+        self.assertIn("路径越界", error or "")
+
     def test_empty_path_is_rejected(self) -> None:
         resolved, error = resolve_edit_path("   ")
         self.assertIsNone(resolved)
@@ -130,6 +143,26 @@ class ExecuteSandboxTests(SandboxCase):
         result = self._edit(start=1, end=999)
         self.assertFalse(result["ok"])
         self.assertIn("行号越界", result["error"])
+
+    def test_backup_failure_never_writes(self) -> None:
+        original = self.doc.read_text(encoding="utf-8")
+        with mock.patch.object(config, "EDIT_MARKDOWN_WRITE", True), mock.patch(
+            "chatgpt_web.markdown_io.backup_md", side_effect=OSError("backup disk full")
+        ):
+            result = self._edit(write=True)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("备份失败", result["error"])
+        self.assertEqual(self.doc.read_text(encoding="utf-8"), original)
+
+    def test_oversized_file_is_rejected_before_parse(self) -> None:
+        self.doc.write_text("x" * 100, encoding="utf-8")
+        with mock.patch.object(config, "EDIT_MARKDOWN_MAX_FILE_BYTES", 16), mock.patch(
+            "chatgpt_web.markdown_io.read_md"
+        ) as read_md:
+            result = self._edit()
+        self.assertFalse(result["ok"], result)
+        self.assertIn("文件过大", result["error"])
+        read_md.assert_not_called()
 
 
 class RunLocalEditMarkdownTests(SandboxCase):

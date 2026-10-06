@@ -20,6 +20,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import config
+from .errors import (
+    ToolCallExecutionError,
+    ToolCallParseError,
+    ToolCallPolicyError,
+    ToolCallSerializationError,
+    ToolCallValidationError,
+)
 from .models import FunctionCall, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -430,6 +437,22 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
     write_requested = bool(args.get("write", False))
     do_write = write_requested and config.EDIT_MARKDOWN_WRITE
     write_refused = write_requested and not do_write
+
+    try:
+        file_size = path.stat().st_size
+    except FileNotFoundError:
+        return {"ok": False, "error": f"文件不存在：{path}"}
+    except OSError as exc:
+        return {"ok": False, "error": f"无法访问文件：{exc}"}
+    max_file_bytes = config.EDIT_MARKDOWN_MAX_FILE_BYTES
+    if max_file_bytes > 0 and file_size > max_file_bytes:
+        return {
+            "ok": False,
+            "error": (
+                f"文件过大：{file_size} bytes > "
+                f"EDIT_MARKDOWN_MAX_FILE_BYTES={max_file_bytes}"
+            ),
+        }
 
     try:
         doc = markdown_io.read_md(path)
@@ -1336,30 +1359,52 @@ def parse_tool_call_requests(
     return requests
 
 
-class ToolCallPipelineError(RuntimeError):
-    """Base error for the explicit parse/validate/policy/execute pipeline."""
+@dataclass(frozen=True, slots=True)
+class ToolPolicy:
+    """Policy boundary for model-driven local tool execution.
 
-    stage = "pipeline"
+    The first implementation is intentionally narrow: only ``edit_markdown``
+    is policy-aware. The remaining fields make the boundary explicit so future
+    tools do not need to grow ad-hoc security checks in the executor.
+    """
 
+    allowed_tools: frozenset[str] = frozenset({EDIT_MARKDOWN_TOOL_NAME})
+    allowed_paths: tuple[str, ...] = ()
+    write_enabled: bool = False
+    network_enabled: bool = False
+    max_output_chars: int = 0
+    max_runtime_s: float = 0.0
+    confirmation_policy: str = "none"
 
-class ToolCallParseError(ToolCallPipelineError):
-    stage = "parse"
+    def validate_request(self, request: ToolCallRequest) -> ToolCallRequest:
+        if request.name not in self.allowed_tools:
+            raise ToolCallPolicyError(f"tool not allowed: {request.name}")
+        if request.name != EDIT_MARKDOWN_TOOL_NAME:
+            return request
 
+        arguments = request.arguments
+        requested_write = bool(arguments.get("write", False))
+        if requested_write and not self.write_enabled:
+            raise ToolCallPolicyError(
+                "edit_markdown write is not allowed by the active ToolPolicy"
+            )
 
-class ToolCallValidationError(ToolCallPipelineError):
-    stage = "validate"
+        path = arguments.get("path")
+        resolved, error = resolve_edit_path(path)
+        if error:
+            raise ToolCallPolicyError(error)
+        assert resolved is not None
 
-
-class ToolCallPolicyError(ToolCallPipelineError):
-    stage = "policy"
-
-
-class ToolCallExecutionError(ToolCallPipelineError):
-    stage = "execute"
-
-
-class ToolCallSerializationError(ToolCallPipelineError):
-    stage = "serialize"
+        if self.allowed_paths:
+            allowed_roots = [Path(root).resolve() for root in self.allowed_paths]
+            if not any(
+                resolved == root or root in resolved.parents
+                for root in allowed_roots
+            ):
+                raise ToolCallPolicyError(
+                    f"path is outside ToolPolicy.allowed_paths: {path}"
+                )
+        return request
 
 
 def validate_tool_call_requests(
@@ -1434,8 +1479,21 @@ def deduplicate_tool_call_requests(
 def check_tool_call_policy(
     requests: List[ToolCallRequest],
     allowed_tools: Optional[set[str]] = None,
+    policy: Optional[ToolPolicy] = None,
 ) -> List[ToolCallRequest]:
-    """Apply the current allow-list policy after parsing and normalization."""
+    """Apply the allow-list and, when provided, the full ToolPolicy boundary."""
+    if policy is not None:
+        if allowed_tools is not None:
+            policy = ToolPolicy(
+                allowed_tools=frozenset(allowed_tools),
+                allowed_paths=policy.allowed_paths,
+                write_enabled=policy.write_enabled,
+                network_enabled=policy.network_enabled,
+                max_output_chars=policy.max_output_chars,
+                max_runtime_s=policy.max_runtime_s,
+                confirmation_policy=policy.confirmation_policy,
+            )
+        return [policy.validate_request(request) for request in requests]
     if allowed_tools is None:
         return requests
     denied = [request.name for request in requests if request.name not in allowed_tools]
@@ -1476,6 +1534,7 @@ def run_tool_call_pipeline(
     text: str,
     *,
     allowed_tools: Optional[set[str]] = None,
+    policy: Optional[ToolPolicy] = None,
     validators: Optional[Dict[str, Callable[[Dict[str, Any]], Any]]] = None,
     executor: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1493,7 +1552,7 @@ def run_tool_call_pipeline(
     requests = validate_tool_call_requests(requests, validators)
     requests = normalize_tool_call_requests(requests)
     requests = deduplicate_tool_call_requests(requests)
-    requests = check_tool_call_policy(requests, allowed_tools)
+    requests = check_tool_call_policy(requests, allowed_tools, policy)
     results = execute_tool_call_requests(requests, executor)
     return serialize_tool_call_results(results)
 

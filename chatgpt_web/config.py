@@ -282,6 +282,9 @@ EDIT_MARKDOWN_ROOT = env_str("EDIT_MARKDOWN_ROOT", str(PROJECT_ROOT))
 # 是否允许 edit_markdown 真正落盘。默认 false：即使模型传 `write=true`，
 # 也只返回 unified diff（dry-run），并在结果里说明被降级的原因。
 EDIT_MARKDOWN_WRITE = env_bool("EDIT_MARKDOWN_WRITE", False)
+# edit_markdown 允许读取/解析的单文件最大字节数；超过上限直接拒绝，避免
+# 模型驱动工具把异常大的本地文件整体载入内存。0 = 不限制。
+EDIT_MARKDOWN_MAX_FILE_BYTES = env_int("EDIT_MARKDOWN_MAX_FILE_BYTES", 4 * 1024 * 1024)
 
 
 # 工具模式下：是否先缓冲整段回复再判断 tool_calls（true = 需要缓冲，

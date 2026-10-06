@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chatgpt_web.toolcalls import (  # noqa: E402
     ToolCallRequest,
     ToolExecutionLedger,
+    ToolPolicy,
     ToolCallExecutionError,
     ToolCallParseError,
     ToolCallPolicyError,
@@ -602,6 +603,61 @@ class ToolCallPipelineTests(unittest.TestCase):
     def test_policy_rejects_denied_tool(self):
         with self.assertRaises(ToolCallPolicyError):
             check_tool_call_policy([self._request()], {"other"})
+
+    def test_tool_policy_rejects_edit_write_by_default(self):
+        request = self._request(
+            name="edit_markdown",
+            arguments={
+                "path": "README.md",
+                "start": 1,
+                "end": 1,
+                "new_text": "# changed",
+                "write": True,
+            },
+        )
+        with self.assertRaises(ToolCallPolicyError):
+            check_tool_call_policy([request], policy=ToolPolicy())
+
+    def test_tool_policy_enforces_allowed_paths(self):
+        request = self._request(
+            name="edit_markdown",
+            arguments={
+                "path": "README.md",
+                "start": 1,
+                "end": 1,
+                "new_text": "# changed",
+            },
+        )
+        policy = ToolPolicy(allowed_paths=("/definitely-not-project-root",))
+        with self.assertRaises(ToolCallPolicyError):
+            check_tool_call_policy([request], policy=policy)
+
+    def test_tool_policy_accepts_dry_run_edit_inside_allowed_path(self):
+        root = str(Path(__file__).resolve().parent.parent)
+        request = self._request(
+            name="edit_markdown",
+            arguments={
+                "path": "README.md",
+                "start": 1,
+                "end": 1,
+                "new_text": "# changed",
+                "write": False,
+            },
+        )
+        policy = ToolPolicy(allowed_paths=(root,))
+        result = check_tool_call_policy([request], policy=policy)
+        self.assertEqual(result, [request])
+
+    def test_pipeline_policy_denial_happens_before_executor(self):
+        executed = []
+        text = '```tool_call\n{"id":"call_1","name":"edit_markdown","arguments":{"path":"README.md","start":1,"end":1,"new_text":"# changed","write":true}}\n```'
+        with self.assertRaises(ToolCallPolicyError):
+            run_tool_call_pipeline(
+                text,
+                policy=ToolPolicy(allowed_paths=(str(Path.cwd()),)),
+                executor=lambda calls: executed.append(calls) or [],
+            )
+        self.assertEqual(executed, [])
 
     def test_execute_wraps_executor_error(self):
         with self.assertRaises(ToolCallExecutionError):
