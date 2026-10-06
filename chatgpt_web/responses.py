@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, ConfigDict
 
 from . import config, tasks
-from .events import completion_events, event_final_text, event_tool_calls
+from .events import AssistantTextDelta, ToolCall as BridgeToolCall, completion_events
 from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTBusyError,
@@ -30,6 +30,13 @@ from .driver import (
 )
 from .models import ChatCompletionRequest, ChatMessage, FunctionCall, ToolCall
 from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
+from .protocol_adapters import (
+    completed_text,
+    completed_tool_calls,
+    responses_function_call,
+    responses_function_call_arguments,
+    responses_text_delta,
+)
 from .toolcalls import (
     EDIT_MARKDOWN_TOOL,
     EDIT_MARKDOWN_TOOL_NAME,
@@ -307,15 +314,8 @@ async def run_chat(
     )
     parsed_tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
     events = completion_events(reply, parsed_tool_calls)
-    tool_calls = [
-        {
-            "id": event.tool_call_id,
-            "name": event.name,
-            "arguments": event.arguments,
-        }
-        for event in event_tool_calls(events)
-    ]
-    final_text = event_final_text(events) or reply
+    tool_calls = completed_tool_calls(events)
+    final_text = completed_text(events, reply)
     sent_prompt = driver.sent_prompt(session_key) or prompt
     return final_text, blocks, tool_calls, sent_prompt
 
@@ -521,12 +521,8 @@ async def stream_responses(
                 # 工具模式 + RESPONSES_TOOL_BUFFER=false：实时吐字时先补发 message item
                 for line in open_message_item():
                     yield line
-            yield evt("response.output_text.delta", {
-                "item_id": msg_id,
-                "output_index": 0,
-                "content_index": 0,
-                "delta": payload,
-            })
+            delta_event = AssistantTextDelta(payload)
+            yield evt("response.output_text.delta", responses_text_delta(delta_event, item_id=msg_id))
         else:
             result = payload
 
@@ -550,17 +546,18 @@ async def stream_responses(
         for index, call in enumerate(tool_calls):
             call_id = f"call_{uuid.uuid4().hex[:16]}"
             item_id = f"fc_{uuid.uuid4().hex[:12]}"
-            args_str = json.dumps(call["arguments"], ensure_ascii=False)
+            event = BridgeToolCall(
+                tool_call_id=call_id,
+                name=call["name"],
+                arguments=call["arguments"],
+            )
+            args_str = responses_function_call_arguments(event)
             yield evt("response.output_item.added", {
                 "output_index": index,
-                "item": {
-                    "type": "function_call",
-                    "id": item_id,
-                    "call_id": call_id,
-                    "name": call["name"],
-                    "arguments": "",
-                    "status": "in_progress",
-                },
+                "item": responses_function_call(
+                    event,
+                    item_id=item_id,
+                ),
             })
             yield evt("response.function_call_arguments.delta", {
                 "item_id": item_id,

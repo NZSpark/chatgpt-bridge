@@ -3,6 +3,7 @@
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -31,6 +32,7 @@ from .models import (
     Usage,
 )
 from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
+from .protocol_adapters import completed_text, completed_tool_calls
 from .responses import ResponsesRequest, handle_responses
 from .streaming import _stream_chat_completion
 from .toolcalls import (
@@ -283,21 +285,27 @@ async def debug_selectors():
         "THINK_MODE_SELECTOR": config.THINK_MODE_SELECTOR.split("||"),
         "CODE_BLOCK_SELECTOR": [config.CODE_BLOCK_SELECTOR],
     }
-    result = {}
-    healthy = {}
-    for name, selectors in groups.items():
-        entries = []
-        for selector in selectors:
-            selector = selector.strip()
-            if not selector:
-                continue
-            try:
-                count = len(await driver.page.query_selector_all(selector))
-                entries.append({"selector": selector, "matches": count})
-            except Exception as exc:  # noqa: BLE001
-                entries.append({"selector": selector, "error": repr(exc)})
-        result[name] = entries
-        healthy[name] = any((e.get("matches") or 0) > 0 for e in entries)
+    diagnostics = driver.dom.selector_diagnostics(driver.page, groups)
+    if inspect.isawaitable(diagnostics):
+        diagnostics = await diagnostics
+    if isinstance(diagnostics, tuple) and len(diagnostics) == 2:
+        result, healthy = diagnostics
+    else:
+        # Keep the endpoint usable with lightweight/mocked DOM adapters too.
+        result, healthy = {}, {}
+        for name, selectors in groups.items():
+            entries = []
+            for selector in selectors:
+                selector = selector.strip()
+                if not selector:
+                    continue
+                try:
+                    count = len(await driver.page.query_selector_all(selector))
+                    entries.append({"selector": selector, "matches": count})
+                except Exception as exc:  # noqa: BLE001
+                    entries.append({"selector": selector, "error": repr(exc)})
+            result[name] = entries
+            healthy[name] = any((entry.get("matches") or 0) > 0 for entry in entries)
     return {"healthy": healthy, "selectors": result}
 
 
@@ -319,12 +327,12 @@ async def debug_dom():
     if driver.page is None:
         raise HTTPException(status_code=503, detail="浏览器尚未初始化")
 
-    nodes = await driver.page.query_selector_all(config.RESPONSE_SELECTORS)
-    last_text = await nodes[-1].inner_text() if nodes else ""
+    nodes = await driver.dom.find_assistant_messages(driver.page)
+    last_text = await driver.dom.complete_text(nodes[-1]) if nodes else ""
     node_summaries: List[dict] = []
     for index, node in enumerate(nodes):
         try:
-            node_text = await node.inner_text()
+            node_text = await driver.dom.complete_text(node)
         except Exception:
             node_text = ""
         try:
@@ -459,14 +467,7 @@ async def chat_completions(
     sent_prompt = driver.sent_prompt(session_key) or prompt
     parsed_tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
     events = completion_events(reply_content, parsed_tool_calls)
-    tool_calls = [
-        {
-            "id": event.tool_call_id,
-            "name": event.name,
-            "arguments": event.arguments,
-        }
-        for event in event_tool_calls(events)
-    ]
+    tool_calls = completed_tool_calls(events)
     # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
     tool_calls = await asyncio.to_thread(run_local_edit_markdown, tool_calls)
 
@@ -485,7 +486,7 @@ async def chat_completions(
             ),
         )
 
-    final_text = event_final_text(events) or reply_content
+    final_text = completed_text(events, reply_content)
     saved_files = []
     # None = 客户端未指定，回落到 config.SAVE_FILES（默认 false）；显式传入才覆盖
     save_files = config.SAVE_FILES if request.save_files is None else request.save_files

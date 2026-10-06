@@ -10,6 +10,13 @@ from chatgpt_web.events import (
     event_final_text,
     event_tool_calls,
 )
+from chatgpt_web.protocol_adapters import (
+    chat_sse_choice_for_event,
+    completed_text,
+    completed_tool_calls,
+    responses_function_call,
+    responses_text_delta,
+)
 
 
 class BridgeEventModelTests(unittest.TestCase):
@@ -60,6 +67,32 @@ class BridgeEventModelTests(unittest.TestCase):
 
         self.assertEqual(text_event.kind, EventKind.ASSISTANT_TEXT_FINAL)
         self.assertEqual(tool_event.kind, EventKind.TOOL_CALL)
+
+    def test_protocol_adapters_share_normalized_completion(self):
+        events = completion_events(
+            "ignored",
+            [{"id": "call_1", "name": "bash", "arguments": {"command": "echo hi"}}],
+        )
+
+        self.assertEqual(completed_text(events, "fallback"), "fallback")
+        self.assertEqual(
+            completed_tool_calls(events),
+            [{"id": "call_1", "name": "bash", "arguments": {"command": "echo hi"}}],
+        )
+        choice = chat_sse_choice_for_event(next(e for e in events if isinstance(e, ToolCall)), tool_index=0)
+        self.assertEqual(choice["delta"]["tool_calls"][0]["id"], "call_1")
+
+    def test_protocol_adapters_preserve_text_and_tool_wire_fields(self):
+        text_delta = __import__("chatgpt_web.events", fromlist=["AssistantTextDelta"]).AssistantTextDelta("hello")
+        text_payload = responses_text_delta(text_delta, item_id="msg_1")
+        self.assertEqual(text_payload["item_id"], "msg_1")
+        self.assertEqual(text_payload["delta"], "hello")
+
+        tool = ToolCall("call_1", "bash", {"command": "echo hi"})
+        item = responses_function_call(tool, item_id="fc_1")
+        self.assertEqual(item["call_id"], "call_1")
+        self.assertEqual(item["id"], "fc_1")
+        self.assertEqual(item["name"], "bash")
 
 
 if __name__ == "__main__":

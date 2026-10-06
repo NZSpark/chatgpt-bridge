@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Optional
 
 from . import config
 from .driver import ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
+from .events import AssistantTextDelta, ToolCall, completion_events
 from .models import ChatCompletionRequest
+from .protocol_adapters import chat_sse_choice_for_event, responses_function_call_arguments
 from .prompting import estimate_tokens, tool_nudge_predicate
 from .toolcalls import _tool_names, parse_tool_calls
 
@@ -122,7 +124,8 @@ async def _stream_chat_completion(
 
         if kind == "delta":
             streamed = True
-            yield encode({"content": payload})
+            choice = chat_sse_choice_for_event(AssistantTextDelta(payload))
+            yield encode(choice["delta"], finish=choice["finish_reason"])
         else:
             reply_content, _blocks, error, error_type = payload
             break
@@ -134,26 +137,23 @@ async def _stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
-    tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+    parsed_tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+    bridge_events = completion_events(reply_content, parsed_tool_calls)
+    bridge_tool_calls = [event for event in bridge_events if isinstance(event, ToolCall)]
 
-    if tool_calls:
-        for index, call in enumerate(tool_calls):
-            yield encode({
-                "tool_calls": [{
-                    "index": index,
-                    "id": f"call_{uuid.uuid4().hex[:16]}",
-                    "type": "function",
-                    "function": {"name": call["name"], "arguments": ""},
-                }]
-            })
-            arguments_str = json.dumps(call["arguments"], ensure_ascii=False)
+    if bridge_tool_calls:
+        for index, event in enumerate(bridge_tool_calls):
+            choice = chat_sse_choice_for_event(event, tool_index=index)
+            yield encode(choice["delta"], finish=choice["finish_reason"])
+            arguments_str = responses_function_call_arguments(event)
             for piece in _chunk_text(arguments_str):
                 yield encode({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
         yield encode(None, finish="tool_calls")
     else:
         if not streamed and reply_content:
             for piece in _chunk_text(reply_content):
-                yield encode({"content": piece})
+                choice = chat_sse_choice_for_event(AssistantTextDelta(piece))
+                yield encode(choice["delta"], finish=choice["finish_reason"])
         yield encode(None, finish="stop")
 
     include_usage = isinstance(request.stream_options, dict) and bool(
