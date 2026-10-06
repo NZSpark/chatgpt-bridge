@@ -22,6 +22,7 @@ from .errors import (
     ChatGPTTimeoutError,
 )
 from .prompting import _delta_piece, estimate_tokens
+from .task_state import TaskState, TaskStateName
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ class ChatIOMixin:
         seeded = seeded_prompt or prompt
         max_attempts = max(1, config.MAX_UPSTREAM_RETRIES)
         last_error: Optional[RuntimeError] = None
+        task_state = TaskState()
 
         # 额外的会话桶需要自己的页面（默认桶就是 self.page，不涉及创建）
         await self._ensure_page(bucket)
@@ -128,6 +130,10 @@ class ChatIOMixin:
             # 记录真正要发出的那份 prompt，供上层估算 usage（按桶隔离，避免并发串台）
             self._last_prompts[bucket] = active_prompt
 
+            if task_state.state in (TaskStateName.RECEIVED, TaskStateName.SESSION_RECOVERY):
+                task_state.transition(TaskStateName.PROMPT_BUILT)
+            task_state.transition(TaskStateName.MODEL_GENERATING)
+
             await self._remember_session(bucket)
             try:
                 reply_text, blocks = await self._send_chat_locked(
@@ -136,6 +142,10 @@ class ChatIOMixin:
             except ChatGPTContextLimitError as exc:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
                 last_error = exc
+                if attempt < max_attempts:
+                    task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
+                else:
+                    task_state.context_limit(str(exc))
                 state = self._state(bucket)
                 state.pending_rotation = True
                 state.cap_failures = getattr(state, "cap_failures", 0) + 1
@@ -149,11 +159,16 @@ class ChatIOMixin:
             except ChatGPTTimeoutError as exc:
                 # 只有「超时 / 到顶」才可重试；找不到输入框、profile 被占用等不可重试
                 last_error = exc
+                if attempt < max_attempts:
+                    task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
+                else:
+                    task_state.timeout(str(exc))
                 self._state(bucket).last_error = str(exc)
                 logger.warning(f"[恢复] 第 {attempt}/{max_attempts} 次失败：等待回复超时。")
             else:
                 # 回复达标（或调用方没给判定）——直接返回
                 if validate_reply is None or validate_reply(reply_text):
+                    task_state.complete()
                     return reply_text, blocks
                 # T1.1 纠偏：模型完全无视了工具、直接凭知识作答。此时把它当最终答案
                 # 返回，客户端（Pi/Codex）会误以为任务已经完成。这里在同一会话
@@ -178,10 +193,13 @@ class ChatIOMixin:
                 except (ChatGPTTimeoutError, ChatGPTContextLimitError,
                         ChatGPTBusyError) as exc:
                     logger.warning(f"[工具纠偏] 重发失败（{exc!r}），返回原回复。")
+                    task_state.complete()
                     return reply_text, blocks
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"[工具纠偏] 重发异常（{exc!r}），返回原回复。")
+                    task_state.complete()
                     return reply_text, blocks
+                task_state.complete()
                 return retry_text, retry_blocks
 
         if last_error is not None:
