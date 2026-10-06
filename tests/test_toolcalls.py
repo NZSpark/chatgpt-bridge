@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from chatgpt_web.toolcalls import (  # noqa: E402
     ToolCallRequest,
+    ToolExecutionLedger,
     ToolCallExecutionError,
     ToolCallParseError,
     ToolCallPolicyError,
@@ -642,6 +643,62 @@ class ToolCallPipelineTests(unittest.TestCase):
     def test_pipeline_parse_error_is_distinct(self):
         with self.assertRaises(ToolCallParseError):
             run_tool_call_pipeline("```tool_call\n{not json}\n```")
+
+
+class ToolExecutionLedgerTests(unittest.TestCase):
+    def test_same_session_and_call_id_has_single_owner(self):
+        ledger = ToolExecutionLedger()
+        first, event, owner = ledger.claim("session-a", "call_1")
+        self.assertIsNone(first)
+        self.assertTrue(owner)
+        second, waiting, second_owner = ledger.claim("session-a", "call_1")
+        self.assertIsNone(second)
+        self.assertFalse(second_owner)
+        self.assertIs(waiting, event)
+
+        record = ledger.record(
+            session_key="session-a",
+            tool_call_id="call_1",
+            tool_name="edit_markdown",
+            normalized_arguments={"path": "README.md"},
+            started_at=0.0,
+            success=True,
+            error_type=None,
+            result={"ok": True},
+        )
+        self.assertEqual(record.session_key, "session-a")
+        self.assertEqual(record.tool_call_id, "call_1")
+        self.assertTrue(record.success)
+        self.assertEqual(len(record.result_hash), 64)
+        self.assertTrue(event.is_set())
+        cached, _, cached_owner = ledger.claim("session-a", "call_1")
+        self.assertEqual(cached.result_hash, record.result_hash)
+        self.assertFalse(cached_owner)
+
+    def test_different_sessions_do_not_deduplicate(self):
+        ledger = ToolExecutionLedger()
+        _, _, owner_a = ledger.claim("session-a", "call_1")
+        _, _, owner_b = ledger.claim("session-b", "call_1")
+        self.assertTrue(owner_a)
+        self.assertTrue(owner_b)
+
+    def test_snapshot_contains_structured_execution_record(self):
+        ledger = ToolExecutionLedger()
+        ledger.record(
+            session_key="session-a",
+            tool_call_id="call_9",
+            tool_name="edit_markdown",
+            normalized_arguments={"write": False},
+            started_at=0.0,
+            success=False,
+            error_type="ToolExecutionError",
+            result={"ok": False, "error": "denied"},
+        )
+        snapshot = ledger.snapshot()
+        self.assertEqual(len(snapshot), 1)
+        self.assertEqual(snapshot[0].error_type, "ToolExecutionError")
+        self.assertEqual(snapshot[0].tool_name, "edit_markdown")
+        self.assertIsInstance(snapshot[0].duration_ms, float)
 
 
 class ToToolCallModelsTests(unittest.TestCase):

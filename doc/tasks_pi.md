@@ -223,7 +223,7 @@ parse → validate → normalize → deduplicate → policy check → execute �
 
 ## PI-009 Tool execution ledger
 
-状态：TODO｜优先级：P1｜依赖：PI-008
+状态：DONE｜优先级：P1｜依赖：PI-008
 
 记录：
 
@@ -231,13 +231,18 @@ text
 (session_key, tool_call_id, tool_name, normalized_arguments)
 
 
-并保存执行时间、成功状态、错误类型、结果 hash。
+并保存执行时间、成功状态、错误类型、结果 hash，并缓存可复用的结构化结果。
+
+实现了进程内 `ToolExecutionLedger`：以 `(session_key, tool_call_id)` 为唯一键，提供 in-flight claim，确保同一会话中的并发重复调用只执行一次；不同 session 的相同 `tool_call_id` 独立执行。Chat 与 Responses 本地工具执行路径均显式传入 `session_key`。
 
 ### 验收
 
-- 相同 tool_call_id 不重复执行；
+- 相同 `tool_call_id` 不重复执行；
 - 不同 session 不错误去重；
-- 重复执行有结构化日志。
+- 重复执行有结构化日志；
+- ledger 记录 duration、success、error_type、result_hash，并可复用首次执行结果；
+- `tests/test_toolcalls.py` 覆盖 session 隔离、single-owner claim 与结构化执行记录；
+- 全套 `pytest -q` 通过。
 
 ## PI-010 ToolPolicy
 

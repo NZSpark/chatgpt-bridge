@@ -7,10 +7,13 @@ ChatGPT 网页版并不原生支持 OpenAI 的 function calling，因此这里�
   3. 下一轮请求里 role=tool 的执行结果再拼回 prompt 喂给网页版。
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,6 +175,117 @@ EDIT_MARKDOWN_TOOL: Dict[str, Any] = {
 BUILTIN_TOOLS: List[Dict[str, Any]] = [EDIT_MARKDOWN_TOOL]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolExecutionRecord:
+    """Audit record and cached result for one session-scoped tool execution."""
+
+    session_key: str
+    tool_call_id: str
+    tool_name: str
+    normalized_arguments: Dict[str, Any]
+    duration_ms: float
+    success: bool
+    error_type: Optional[str]
+    result_hash: Optional[str]
+    result: Optional[Dict[str, Any]]
+
+
+class ToolExecutionLedger:
+    """In-memory execution ledger keyed by ``(session_key, tool_call_id)``."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._records: Dict[tuple[str, str], ToolExecutionRecord] = {}
+        self._inflight: Dict[tuple[str, str], threading.Event] = {}
+
+    @staticmethod
+    def _key(session_key: Optional[str], tool_call_id: str) -> tuple[str, str]:
+        return (session_key or "default", tool_call_id)
+
+    @staticmethod
+    def _hash_result(result: Optional[Dict[str, Any]]) -> Optional[str]:
+        if result is None:
+            return None
+        payload = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def get(self, session_key: Optional[str], tool_call_id: str) -> Optional[ToolExecutionRecord]:
+        key = self._key(session_key, tool_call_id)
+        with self._lock:
+            return self._records.get(key)
+
+    def claim(self, session_key: Optional[str], tool_call_id: str) -> tuple[Optional[ToolExecutionRecord], threading.Event, bool]:
+        """Claim an execution slot, returning (record, event, owner)."""
+        key = self._key(session_key, tool_call_id)
+        with self._lock:
+            existing = self._records.get(key)
+            if existing is not None:
+                event = threading.Event()
+                event.set()
+                return existing, event, False
+            event = self._inflight.get(key)
+            if event is not None:
+                return None, event, False
+            event = threading.Event()
+            self._inflight[key] = event
+            return None, event, True
+
+    def complete(
+        self,
+        *,
+        session_key: Optional[str],
+        tool_call_id: str,
+        record: ToolExecutionRecord,
+    ) -> ToolExecutionRecord:
+        key = self._key(session_key, tool_call_id)
+        with self._lock:
+            existing = self._records.get(key)
+            if existing is None:
+                self._records[key] = record
+                existing = record
+            event = self._inflight.pop(key, None)
+            if event is not None:
+                event.set()
+            return existing
+
+    def record(
+        self,
+        *,
+        session_key: Optional[str],
+        tool_call_id: str,
+        tool_name: str,
+        normalized_arguments: Dict[str, Any],
+        started_at: float,
+        success: bool,
+        error_type: Optional[str],
+        result: Optional[Dict[str, Any]],
+    ) -> ToolExecutionRecord:
+        key = self._key(session_key, tool_call_id)
+        record = ToolExecutionRecord(
+            session_key=key[0],
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            normalized_arguments=json.loads(json.dumps(normalized_arguments, ensure_ascii=False, sort_keys=True)),
+            duration_ms=round((time.monotonic() - started_at) * 1000, 3),
+            success=success,
+            error_type=error_type,
+            result_hash=self._hash_result(result),
+            result=json.loads(json.dumps(result, ensure_ascii=False)) if result is not None else None,
+        )
+        return self.complete(
+            session_key=session_key,
+            tool_call_id=tool_call_id,
+            record=record,
+        )
+
+    def snapshot(self) -> List[ToolExecutionRecord]:
+        with self._lock:
+            return list(self._records.values())
+
+
+TOOL_EXECUTION_LEDGER = ToolExecutionLedger()
+
+
 def builtin_tool_names() -> set:
     return {t["function"]["name"] for t in BUILTIN_TOOLS}
 
@@ -226,8 +340,10 @@ def resolve_edit_path(path: Any) -> tuple[Optional[Path], Optional[str]]:
 def run_local_edit_markdown(
     tool_calls: List[Dict[str, Any]],
     *,
+    session_key: Optional[str] = None,
     backup_dir: Optional[str] = None,
     enabled: Optional[bool] = None,
+    ledger: ToolExecutionLedger = TOOL_EXECUTION_LEDGER,
 ) -> List[Dict[str, Any]]:
     """本地执行 edit_markdown：把结果挂回对应调用（server / responses 共用）。
 
@@ -243,10 +359,45 @@ def run_local_edit_markdown(
     out: List[Dict[str, Any]] = []
     for call in tool_calls:
         if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
-            result = execute_edit_markdown(
-                call.get("arguments") or {}, backup_dir=backup_dir
+            call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}")
+            arguments = dict(call.get("arguments") or {})
+            existing, done, owner = ledger.claim(session_key, call_id)
+            if not owner:
+                if existing is None:
+                    done.wait()
+                    existing = ledger.get(session_key, call_id)
+                if existing is None:
+                    result = {"ok": False, "error": "tool execution did not produce a ledger result"}
+                    out.append({**call, "id": call_id, "result": result, "duplicate": True})
+                    continue
+                logger.warning(
+                    "重复工具执行被跳过：session_key=%r tool_call_id=%s tool=%s",
+                    session_key or "default",
+                    call_id,
+                    existing.tool_name,
+                )
+                out.append({**call, "id": call_id, "result": existing.result, "duplicate": True})
+                continue
+            started_at = time.monotonic()
+            try:
+                result = execute_edit_markdown(arguments, backup_dir=backup_dir)
+                success = bool(result.get("ok"))
+                error_type = None if success else "ToolExecutionError"
+            except Exception as exc:  # noqa: BLE001
+                error_type = type(exc).__name__
+                result = {"ok": False, "error": str(exc)}
+                success = False
+            ledger.record(
+                session_key=session_key,
+                tool_call_id=call_id,
+                tool_name=EDIT_MARKDOWN_TOOL_NAME,
+                normalized_arguments=arguments,
+                started_at=started_at,
+                success=success,
+                error_type=error_type,
+                result=result,
             )
-            out.append({**call, "result": result})
+            out.append({**call, "id": call_id, "result": result})
         else:
             out.append(call)
     return out

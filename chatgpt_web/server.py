@@ -469,7 +469,11 @@ async def chat_completions(
     events = completion_events(reply_content, parsed_tool_calls)
     tool_calls = completed_tool_calls(events)
     # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
-    tool_calls = await asyncio.to_thread(run_local_edit_markdown, tool_calls)
+    tool_calls = await asyncio.to_thread(
+        run_local_edit_markdown,
+        tool_calls,
+        session_key=session_key,
+    )
 
     if tool_calls:
         return ChatCompletionResponse(

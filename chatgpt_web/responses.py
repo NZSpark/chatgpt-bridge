@@ -394,7 +394,11 @@ async def handle_responses(
 
     # 本地执行 edit_markdown 与 chat 路径共用同一实现（见 toolcalls.run_local_edit_markdown）
     # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
-    tool_calls = await asyncio.to_thread(run_local_edit_markdown, tool_calls)
+    tool_calls = await asyncio.to_thread(
+        run_local_edit_markdown,
+        tool_calls,
+        session_key=session_key,
+    )
     return from_chat_response(
         reply, req.model, estimate_tokens(sent_prompt), tool_calls or None
     )
