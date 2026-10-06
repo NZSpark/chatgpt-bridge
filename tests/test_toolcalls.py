@@ -381,6 +381,125 @@ class ToolCallLineContractTests(unittest.TestCase):
         self.assertEqual(calls[0]["arguments"]["cmd"], "ls")
 
 
+class DomRenderDamageTests(unittest.TestCase):
+    """ChatGPT 网页渲染改写 TOOL_CALL 行后的兜底解析（2026-10-06 真机回归，update.md §2.13）。
+
+    线上现象：Pi 收到的是纯文本、把回复当成最终答案、任务**静默结束**，桥的日志里
+    没有任何线索。根因是网页版把这条纯文本 TOOL_CALL 行当 markdown 渲染，渲染过程
+
+      1. 吃掉一层反斜杠转义（值内引号前的反斜杠被吞掉 → JSON 不再合法）；
+      2. 折叠连续空格（缩进 4 空格 -> 1 空格）→ 命令内容被改写；
+      3. 取回的文本在值的闭引号后只剩**一个** ``}``（外层对象的收尾花括号丢失）。
+
+    结果：括号不平衡 → 抽不出对象；``_salvage_string_args`` 又要求 ``endswith("}}")``
+    → 直接放弃，整条调用被丢掉。这里锁住修复：少一个 ``}`` 时补上再 salvage。
+    """
+
+    # 下面这行是**真机抓到原文**（Pi 会话记录里桥实际返回的那条 assistant text），
+    # 未做任何改写：值里是裸引号、末尾只有一个 }。
+    RECEIVED = r'''
+TOOL_CALL: {"name":"bash","arguments":{"command":"python3 -c 'from pathlib import Path; p=Path("chatgpt_web/session_store.py"); s=p.read_text(); old="_STATE_FILE_LOCK = threading.Lock()\n\n\n@dataclass"; new="_STATE_FILE_LOCK = threading.Lock()\n\nSESSION_STATE_SCHEMA_VERSION = 2\n\n\ndef _validate_v2_state(data: Dict[str, Any]) -> Dict[str, Any]:\n \"\"\"Validate the v2 session-state envelope.\"\"\"\n if not isinstance(data, dict):\n raise ValueError(\"session state root must be a JSON object\")\n sessions = data.get(\"sessions\")\n if sessions is not None and not isinstance(sessions, dict):\n raise ValueError(\"session state \'sessions\' must be an object\")\n if isinstance(sessions, dict):\n for key, payload in sessions.items():\n if not isinstance(key, str) or not isinstance(payload, dict):\n raise ValueError(\"session state contains an invalid bucket payload\")\n return data\n\n\ndef migrate_v2(data: Dict[str, Any]) -> Dict[str, Any]:\n \"\"\"Migrate the legacy session-state envelope to schema v2.\"\"\"\n if not isinstance(data, dict):\n raise ValueError(\"session state root must be a JSON object\")\n raw_version = data.get(\"schema_version\", data.get(\"version\", 1))\n if isinstance(raw_version, bool) or not isinstance(raw_version, int):\n raise ValueError(\"session state schema_version must be an integer\")\n if raw_version > SESSION_STATE_SCHEMA_VERSION:\n raise ValueError(\"unsupported session state schema_version=%s\" % raw_version)\n migrated = dict(data)\n migrated.pop(\"version\", None)\n migrated[\"schema_version\"] = SESSION_STATE_SCHEMA_VERSION\n return _validate_v2_state(migrated)\n\n\n@dataclass"; assert old in s; p.write_text(s.replace(old,new,1))'"}
+'''
+
+    def test_missing_outer_brace_recovers_real_received_text(self):
+        calls = parse_tool_calls(self.RECEIVED, {"bash"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "bash")
+        command = calls[0]["arguments"]["command"]
+        # 渲染只吃掉了 JSON 转义，命令正文本身仍是模型写的原文（内容不被改写）。
+        self.assertIn('Path("chatgpt_web/session_store.py")', command)
+        self.assertIn('SESSION_STATE_SCHEMA_VERSION = 2', command)
+        self.assertTrue(command.endswith("p.write_text(s.replace(old,new,1))'"))
+
+    def test_synthetic_missing_outer_brace_recovers(self):
+        # 只少外层收尾花括号：补一个 } 即应救回，而不是整条丢弃。
+        text = 'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "echo hi"}'
+        calls = parse_tool_calls(text, {"exec_command"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["cmd"], "echo hi")
+
+    def test_truncated_value_is_not_fabricated(self):
+        # 值本身被截断（连一个 } 都没有）时不得“猜”出调用：宁可丢弃，让模型重出。
+        text = 'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "echo hi'
+        self.assertEqual(parse_tool_calls(text, {"exec_command"}), [])
+
+    def test_complete_object_still_not_rescued_by_brace_repair(self):
+        # 合法输入不受影响：正常两个 } 走原路径，值原样保留。
+        text = 'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "echo hi"}}'
+        calls = parse_tool_calls(text, {"exec_command"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["cmd"], "echo hi")
+
+
+
+class FencedToolCallCarrierTests(unittest.TestCase):
+    """工具调用的**载体**：代码围栏 ```tool_call（2026-10-06 真机 A/B 实测后从纯文本行切换）。
+
+    为什么换载体（同一 payload、同一页面、同一模型，只改输出形态）：
+
+    | 载体 | 值内引号前的反斜杠 | 4 空格缩进 | 能解析出调用 |
+    | --- | --- | --- | --- |
+    | 纯文本 `TOOL_CALL: {...}` 行 | 被吃掉（变裸引号 → JSON 失效） | 被折叠成 1 空格 | **否**（整条丢弃） |
+    | ```tool_call 围栏 | 原样保留 | 原样保留 | 是，命令**逐字节一致** |
+
+    原理：网页版把纯文本行当 markdown 渲染（转义消耗 + 空格折叠），代码块内部
+    不做这层处理。围栏在 DOM 取回时只剩 info string（`tool_call`）单独一行，
+    所以下面两条用例分别锁定「围栏被渲染掉」与「围栏还在」两种形态。
+    """
+
+    # 真机取回的原文（与网页渲染结果一致）：`tool_call` 标签 + 换行 + JSON。
+    RECEIVED_RENDERED = r'''
+tool_call
+{"name":"bash","arguments":{"command":"printf \"hi\"; echo done\n    x = 1\n    y = 2"}}
+'''
+
+    q = chr(10)
+    EXPECTED = 'printf "hi"; echo done' + q + '    x = 1' + q + '    y = 2'
+
+    def test_rendered_fence_preserves_escapes_and_indentation(self):
+        calls = parse_tool_calls(self.RECEIVED_RENDERED, {"bash"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "bash")
+        command = calls[0]["arguments"]["command"]
+        # 逐字节一致：JSON 转义按 JSON 语义解码后的真换行 + 4 空格缩进都必须在
+        # （纯文本行会两者兼失：引号前的反斜杠被吃掉、缩进被折叠成 1 空格）。
+        self.assertEqual(command, self.EXPECTED)
+        self.assertIn(self.q + "    x = 1", command)
+        self.assertIn('printf \"hi\"', command)
+
+    def test_raw_fence_still_parses(self):
+        # 围栏没被渲染掉时（例如客户端把回复原样贴回）同样认。
+        text = '```tool_call\n{"name": "bash", "arguments": {"command": "echo hi"}}\n```'
+        calls = parse_tool_calls(text, {"bash"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["command"], "echo hi")
+
+    def test_multiline_json_inside_fence_parses(self):
+        # 代码块保留换行，所以围栏里 JSON 合法地跨行也必须能解析（JSON 允许 token 间换行）。
+        text = (
+            "tool_call\n"
+            "{\n"
+            '  "name": "bash",\n'
+            '  "arguments": {\n'
+            '    "command": "echo hi"\n'
+            "  }\n"
+            "}"
+        )
+        calls = parse_tool_calls(text, {"bash"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["command"], "echo hi")
+
+    def test_rendered_json_label_is_not_taken_as_call(self):
+        """负向约束：DOM 里只剩 `json` 标签行（围栏被渲染掉）时**不**当调用执行。
+
+        这是刻意的：若接受任意标签，正文里展示的 JSON 片段只要带 name/arguments
+        就会被误执行。因此载体固定为 `tool_call`（提示词里已明确要求）。
+        """
+        text = 'json\n{"name": "bash", "arguments": {"command": "echo hi"}}'
+        self.assertEqual(parse_tool_calls(text, {"bash"}), [])
+
+
+
 class ToToolCallModelsTests(unittest.TestCase):
     def test_arguments_serialized_as_json_string(self):
         calls = [{"name": "f", "arguments": {"a": 1}}]

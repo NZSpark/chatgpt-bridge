@@ -1,5 +1,16 @@
+import json
 import unittest
 from unittest import mock
+
+
+def _fenced_example(text: str, with_json: bool = False):
+    """从注入指令里取出 ```` ```tool_call ```` 示例块（可连同围栏内的 JSON 一并返回）。"""
+    start = text.index("```tool_call\n") + len("```tool_call\n")
+    end = text.index("\n```", start)
+    body = text[start:end]
+    if with_json:
+        return f"```tool_call\n{body}\n```", body
+    return body
 
 
 class ToolResultFidelityTests(unittest.TestCase):
@@ -378,7 +389,9 @@ class ToolsInstructionDesignTests(unittest.TestCase):
 
         text = format_tool_call_emphasis()
         self.assertIn("MUST use", text)
-        self.assertIn("TOOL_CALL:", text)
+        # 载体是代码围栏（必须与解析器认得的形态一致）；旧的「纯文本行」措辞不得再出现。
+        self.assertIn("```tool_call", text)
+        self.assertNotIn("no code fences", text)
 
     def test_instruction_mandates_single_call(self):
         """提示词必须要求「一次只返回一个 TOOL_CALL」。
@@ -396,8 +409,8 @@ class ToolsInstructionDesignTests(unittest.TestCase):
             format_tools_instruction(self.TOOLS),
             format_tool_call_emphasis(),
         ):
-            self.assertIn("ONE TOOL_CALL", text)
-            self.assertNotIn("several TOOL_CALL", text)
+            self.assertIn("ONE tool_call", text)
+            self.assertNotIn("several tool_call", text)
             self.assertNotIn("multiple tools at once", text)
 
     def test_instruction_explains_empty_output(self):
@@ -422,9 +435,7 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         from chatgpt_web.toolcalls import format_tools_instruction
 
         text = format_tools_instruction(self.TOOLS)
-        example = next(
-            line for line in text.splitlines() if line.startswith("TOOL_CALL: ")
-        )
+        example = _fenced_example(text)
         self.assertNotIn("<command>", example)
         self.assertIn("placeholder", text)
 
@@ -436,12 +447,12 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         )
 
         text = format_tools_instruction(self.TOOLS)
-        example = next(
-            line for line in text.splitlines() if line.startswith("TOOL_CALL: ")
-        )
+        example, example_json = _fenced_example(text, with_json=True)
         parsed = parse_tool_calls(example, valid_names={"bash"})
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0]["name"], "bash")
+        # 围栏里的 JSON 必须能被标准 json 解析（格式说明与解析器同源）。
+        self.assertEqual(json.loads(example_json)["name"], "bash")
 
 
 if __name__ == "__main__":

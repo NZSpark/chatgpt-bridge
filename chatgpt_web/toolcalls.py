@@ -124,8 +124,10 @@ def edit_markdown_spec() -> str:
     return "\n".join([
         EDIT_MD_HEADER,
         "When editing a Markdown file, prefer edit_markdown over rewriting the whole file and doing plain-text matching:",
-        'TOOL_CALL: {"name": "edit_markdown", "arguments": {"path": "README.md", '
+        "```tool_call",
+        '{"name": "edit_markdown", "arguments": {"path": "README.md", '
         '"start": <int>, "end": <int>, "new_text": "<replacement text>"}}',
+        "```",
         "start/end are 1-based inclusive line numbers; content outside the range (including blank lines, indentation, trailing whitespace) is preserved verbatim.",
         "Do not touch ``` fence lines; content inside a fence does not participate in structural positioning.",
         "By default only a diff is returned; once confirmed, pass write=true to persist to disk.",
@@ -312,8 +314,10 @@ def format_tool_retry_nudge() -> str:
         f"{RETRY_HEADER} Your previous reply did not call any tool.",
         "You have NO direct access to a shell, filesystem or the internet. Answering from",
         "your own knowledge instead of calling a tool means the task FAILED.",
-        "Reply now with EXACTLY ONE plain-text line in this form (no code fences, no other text):",
-        'TOOL_CALL: {"name": "<exact tool name>", "arguments": {"<param>": <value>}}',
+        "Reply now with EXACTLY ONE fenced code block in this form (no other text):",
+        "```tool_call",
+        '{"name": "<exact tool name>", "arguments": {"<param>": <value>}}',
+        "```",
     ])
 
 
@@ -352,9 +356,9 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
     example_name = fn0.get("name") or "tool_name"
     props = (fn0.get("parameters") or {}).get("properties") or {}
     example_args = {key: "..." for key in list(props.keys())[:2]} or {}
-    example_call = "TOOL_CALL: " + json.dumps(
+    example_call = "```tool_call\n" + json.dumps(
         {"name": example_name, "arguments": example_args}, ensure_ascii=False
-    )
+    ) + "\n```"
 
     lines = [
         TOOLCALL_HEADER,
@@ -395,25 +399,34 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
             sig = f"{name}({keys})" if keys else name
             lines.append(f"- {sig}: {desc}")
 
-    # 输出格式：始终用纯文本 `TOOL_CALL: {json}` 行，**不要**用 ```tool_call 代码围栏。
-    # 原因：ChatGPT 网页 UI 会把 markdown 代码围栏渲染成 Code snippet 组件，
-    # 取 DOM 文本时围栏/换行被破坏，导致解析失败；纯文本行不会被渲染成代码块，
-    # 能原样取回。解析器（_TOOL_CALL_LINE_RE）已把它作为首选形态。
+    # 输出载体：**代码围栏** ```tool_call（2026-10-06 真机 A/B 实测后从纯文本行切换过来）。
+    # 原因：网页版把纯文本 TOOL_CALL 行当 markdown 渲染——值内引号前的反斜杠被吃掉
+    # （JSON 失效、整条调用被丢弃），连续缩进空格被折叠（命令正文被改写）；同一条命令
+    # 放进围栏后**一字不差**（转义与缩进都保留）。对照数据见 doc/update.md §2.14。
+    # 解析侧两种形态都认：围栏还在（_TOOL_CALL_FENCE_RE），或者围栏被渲染掉、
+    # DOM 里只剩 info string（`tool_call`）单独一行 + JSON（parse_tool_calls 的裸标签兜底）。
     lines += [
         "",
-        "To call a tool, output ONLY the following as a plain-text line (no code fences):",
+        "To call a tool, output a fenced code block whose info string is exactly `tool_call`,",
+        "containing ONE JSON object and nothing else:",
         example_call,
         "(In the example above, \"...\" is a placeholder: replace it with the real value.",
         "Do NOT copy the example literally.)",
         "Rules:",
+        "- The fence info string MUST be exactly `tool_call` (not json, not text, not empty):",
+        "  a block labelled anything else, or a JSON object written as plain text, will NOT be",
+        "  executed. Do not write the call as a plain `TOOL_CALL: {...}` line — the web UI",
+        "  mangles plain-text lines (it eats backslash escapes and collapses indentation).",
         "- `arguments` must be a valid JSON object matching the tool's parameters.",
-        "- Inside JSON strings, escape double quotes as \\\" and newlines as \\n.",
+        "- Inside JSON strings, escape double quotes as \\\" and newlines as \\n; keep the JSON on",
+        "  one line inside the fence.",
+        "- Paste command/script text into the JSON string verbatim - the fenced block preserves it.",
         "- For shell commands, prefer single quotes inside the command.",
-        "- Output EXACTLY ONE TOOL_CALL line per reply. Never emit two or more TOOL_CALL lines",
+        "- Output EXACTLY ONE tool_call block per reply. Never emit two or more blocks",
         "  together; the client can only process a single call at a time. If you need several",
         "  tools, issue one call, wait for its result, then issue the next in your next reply.",
-        "- When you call a tool, output ONLY the single TOOL_CALL line: no explanation, no preamble.",
-        "- Only if the task needs no tool at all, answer directly with no TOOL_CALL line.",
+        "- When you call a tool, output ONLY the single fenced block: no explanation, no preamble.",
+        "- Only if the task needs no tool at all, answer directly with no tool_call block.",
         "- If a tool result is EMPTY (e.g. shows \"(no output)\"), the command SUCCEEDED and",
         "  genuinely printed nothing. That is a valid result, not a failure: move on to the NEXT",
         "  command or give the final answer. Never re-run the exact same command and never assume",
@@ -434,15 +447,18 @@ def format_tool_call_emphasis() -> str:
         f"{EMPHASIS_HEADER} This is a new session (or one that was just reset); "
         "the following rules stay in effect for this whole session:",
         "You MUST use the provided tools whenever the task needs real action or data; never fabricate tool output.",
-        "To call a tool, output only the following format as **plain text lines** (no code fences, do not add ```):",
-        "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
+        "To call a tool, output a fenced code block whose info string is exactly `tool_call`:",
+        "```tool_call",
+        "{\"name\": \"tool name\", \"arguments\": {arguments object}}",
+        "```",
+        "The fence label must be `tool_call` (not json/text/empty); a call written as plain text will NOT be executed.",
         "arguments must be valid JSON: escape double quotes inside strings as \\\" and newlines as \\n; never write a bare double quote or a raw newline inside a JSON string.",
         "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
         "to avoid a clash between double quotes in the command and the JSON boundary quotes.",
         "Use the exact tool names given in the tool instructions; do not invent generic names like bash / shell.",
-        "Output EXACTLY ONE TOOL_CALL line per reply - never two or more in the same message.",
+        "Output EXACTLY ONE tool_call block per reply - never two or more in the same message.",
         "If you need several tools, call one now and the next only after you receive its result.",
-        "Output only the single TOOL_CALL line when calling a tool: no explanation, no preamble.",
+        "Output only the single fenced tool_call block when calling a tool: no explanation, no preamble.",
         "Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter>, <tool_calls> - they will not be executed.",
     ])
 
@@ -747,6 +763,40 @@ def _salvage_string_args(raw: str):
     return {"name": name, "arguments": prefix_args}
 
 
+def _salvage_missing_final_brace(segment: str) -> Optional[Dict[str, Any]]:
+    """最后一道兜底：DOM 取回的文本若只剩一个收尾 ``}``（少一个），也试着解析。
+
+    背景（2026-10-06 真机）：ChatGPT 网页版把模型写的纯文本 ``TOOL_CALL:`` 行当
+    markdown 渲染，渲染过程会**吃掉一层反斜杠转义**并把连续空格折叠成一个
+    （见 doc/update.md §2.13）：
+
+    * 值内引号前的反斜杠被吞掉：JSON 里的转义引号到 DOM 里变成裸引号；
+    * 双反斜杠被吞掉一个：字面量 ``\\n`` 到 DOM 里会变成真换行；
+    * 连续缩进空格被折叠。
+
+    这类文本既不是合法 JSON，括号也不平衡，只能走 :func:`_salvage_string_args`
+    的锚点式 salvage；但实测**取回的文本在值的闭引号之后往往只剩一个 ``}``**
+    （外层对象的收尾花括号丢失），而那个函数要求 ``endswith("}}")``，于是直接
+    放弃 → 整条调用被丢掉 → 客户端只收到纯文本、把回复当成最终答案、任务静默结束。
+
+    这里只做一件极窄的事：文本恰好以**单个** ``}`` 结尾时，补一个 ``}`` 再交给
+    :func:`_salvage_string_args`；能否救回仍由它的锚点匹配与
+    :func:`_parse_complete_string_args` 守卫决定，救不回依旧返回 ``None``。
+    真正缺失内容（值本身被截断）的回复不会因此变成“猜出来的调用”。
+    """
+    stripped = segment.rstrip()
+    if not stripped.endswith("}") or stripped.endswith("}}"):
+        return None
+    salvaged = _salvage_string_args(stripped + "}")
+    if salvaged is not None:
+        logger.warning(
+            "工具调用 JSON 缺少外层的收尾花括号（少一个 }），已按锚点式 salvage 兜底"
+            "解析。这通常意味着 ChatGPT 的 markdown 渲染改写了这条 TOOL_CALL 行"
+            "（吃掉一层反斜杠转义 / 折叠连续空格，见 doc/update.md §2.13）。"
+        )
+    return salvaged
+
+
 def _repair_json_quotes(raw: str) -> Optional[Any]:
     """尽力修复模型输出的非法 JSON。
 
@@ -970,6 +1020,9 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             # 平衡扫描切不出完整对象。改用锚点式 salvage：按 name/arguments/首个
             # 键定位，一直取到对象收尾，绕开括号配对。
             salvaged = _salvage_string_args(segment)
+            if salvaged is None:
+                # 渲染改写过文本时，DOM 里经常只剩一个收尾 `}`（见该函数 docstring）。
+                salvaged = _salvage_missing_final_brace(segment)
             if salvaged is not None:
                 calls.append(salvaged)
                 continue
@@ -1041,6 +1094,18 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     # 这类命令发给 shell 只会得到 `unexpected EOF`，宁可在桥接层丢弃，
     # 让模型下一轮重新输出完整命令。
     calls = [c for c in calls if _call_args_sane(c)]
+
+    # 诊断：模型**确实想调用工具**（写了 TOOL_CALL 标记 / 围栏），但我们一个可用的
+    # 调用都没能交出去。以前这里是静默的：客户端只收到纯文本、把回复当最终答案，
+    # 任务就悄悄结束了，日志里没有任何线索（2026-10-06 真机回归，见 update.md §2.13）。
+    if not calls and (matches or _TOOL_CALL_FENCE_RE.search(text)):
+        logger.warning(
+            "回复里有 %d 个 TOOL_CALL 标记，但没解析出任何可用调用，整条调用已丢弃"
+            "（客户端只会收到纯文本，可能把回复当成最终答案并结束任务）。"
+            "常见原因：网页渲染吃掉了反斜杠转义 / 折叠了连续空格（update.md §2.13）、"
+            "工具名不在客户端 tools 里、或参数引号不配对。",
+            len(matches),
+        )
 
     return calls
 

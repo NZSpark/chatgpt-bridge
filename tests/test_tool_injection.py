@@ -227,8 +227,11 @@ class RetryNudgeTests(unittest.TestCase):
         text = format_tool_retry_nudge()
         self.assertTrue(text.startswith(RETRY_HEADER))
         self.assertIn("ONE", text)
-        self.assertIn("TOOL_CALL:", text)
         self.assertIn("FAILED", text)
+        # 纠偏要求的载体必须与解析器一致：代码围栏（旧版纯文本行会被网页渲染改写）。
+        self.assertIn("```tool_call", text)
+        fenced = '```tool_call\n{"name": "bash", "arguments": {"command": "ls"}}\n```'
+        self.assertTrue(tool_call_predicate(TOOLS)(fenced), "纠偏给出的格式必须能被解析器认出")
 
     def test_predicate_matches_parsed_calls(self) -> None:
         predicate = tool_call_predicate(TOOLS)

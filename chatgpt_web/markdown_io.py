@@ -445,8 +445,10 @@ def generate_edit(doc: MdDoc, instruction: str, llm) -> Tuple[int, int, str]:
 def _build_edit_prompt(doc: MdDoc, instruction: str) -> str:
     tools_doc = (
         "可用工具：edit_markdown\n"
-        "调用格式（一行，严格 JSON）：\n"
-        'TOOL_CALL: {"name": "edit_markdown", "arguments": {"start": <int>, "end": <int>, "new_text": "<替换内容>"}}\n'
+        "调用格式（代码围栏，info string 必须是 tool_call；围栏内只有这一个 JSON 对象）：\n"
+        "```tool_call\n"
+        '{"name": "edit_markdown", "arguments": {"start": <int>, "end": <int>, "new_text": "<替换内容>"}}\n'
+        "```\n"
         "start/end 为 1-based 闭区间行号，必须落在下面视图的行号范围内。\n"
         "代码围栏（[[fence...]] 标记的行）内部不要做结构改动，除非明确要求。"
     )
