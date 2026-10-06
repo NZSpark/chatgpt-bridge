@@ -1,3 +1,5 @@
+.github/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -9,6 +11,8 @@ dist/
 *.egg-info/
 .eggs/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # Virtual environments
 .venv/
