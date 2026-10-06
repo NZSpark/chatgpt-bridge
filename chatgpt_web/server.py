@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -24,6 +25,7 @@ from .logging_setup import new_request_id, set_request_id
 from .models import (
     SUPPORTED_MODELS,
     ChatCompletionRequest,
+    ChatMessage,
     ChatCompletionResponse,
     Choice,
     ChoiceMessage,
@@ -395,7 +397,11 @@ async def chat_completions(
     await asyncio.to_thread(tasks.record, bucket, request.messages)
     task_block = await asyncio.to_thread(tasks.resume_block, bucket)
 
-    if config.EDIT_MARKDOWN_LOCAL and EDIT_MARKDOWN_TOOL_NAME not in _tool_names(request.tools):
+    auto_local_edit_markdown = (
+        config.EDIT_MARKDOWN_LOCAL
+        and EDIT_MARKDOWN_TOOL_NAME not in _tool_names(request.tools)
+    )
+    if auto_local_edit_markdown:
         request.tools = list(request.tools or []) + [EDIT_MARKDOWN_TOOL]
 
     # 两份文本：增量版（现有会话已有上下文）与播种版（新会话 / 轮转后需要重放历史）。
@@ -421,7 +427,15 @@ async def chat_completions(
     # ---------- 流式分支（Pi 默认 stream=true）----------
     if request.stream:
         return StreamingResponse(
-            _stream_chat_completion(request, prompt, driver, seeded_prompt, session_key),
+            _stream_chat_completion(
+                request,
+                prompt,
+                driver,
+                seeded_prompt,
+                session_key,
+                auto_local_edit_markdown=auto_local_edit_markdown,
+                task_block=task_block,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -462,18 +476,84 @@ async def chat_completions(
         logger.error("\n[ERR] 处理请求失败:", exc_info=True)
         return _error_response(500, str(exc), "server_error")
 
-    # usage 用真正发出去的 prompt 估算（driver 可能选了播种版 / 中途轮转过）。
-    # 按会话桶读取，并发时不会拿到别的 Agent 的 prompt；回退到预判值兼容假 driver。
+    # 本地内置工具由 bridge 自己执行：执行结果回灌网页模型后继续生成，
+    # 不把这些内部调用暴露给客户端，避免客户端再尝试寻找不存在的本地工具。
+    # 客户端自己声明的 edit_markdown 仍走标准 OpenAI tool_calls 返回路径。
+    local_rounds = 0
+    working_messages = list(request.messages)
     sent_prompt = driver.sent_prompt(session_key) or prompt
-    parsed_tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
-    events = completion_events(reply_content, parsed_tool_calls)
-    tool_calls = completed_tool_calls(events)
-    # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
-    tool_calls = await asyncio.to_thread(
-        run_local_edit_markdown,
-        tool_calls,
-        session_key=session_key,
-    )
+    blocks = code_blocks
+    while True:
+        parsed_tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+        events = completion_events(reply_content, parsed_tool_calls)
+        all_tool_calls = completed_tool_calls(events)
+        local_tool_calls = (
+            [call for call in all_tool_calls if call.get("name") == EDIT_MARKDOWN_TOOL_NAME]
+            if auto_local_edit_markdown else []
+        )
+        external_tool_calls = [
+            call for call in all_tool_calls if call not in local_tool_calls
+        ]
+
+        if not local_tool_calls:
+            tool_calls = external_tool_calls
+            break
+
+        if external_tool_calls:
+            logger.warning(
+                "模型同时返回本地 edit_markdown 与客户端工具调用；"
+                "本轮仅回传客户端工具调用，局部编辑结果不会暴露为 tool_call。"
+            )
+            tool_calls = external_tool_calls
+            break
+
+        local_rounds += 1
+        if local_rounds > 4:
+            logger.warning("本地 edit_markdown 连续执行超过 4 轮，停止自动继续。")
+            tool_calls = []
+            break
+
+        executed = await asyncio.to_thread(
+            run_local_edit_markdown,
+            local_tool_calls,
+            session_key=session_key,
+        )
+
+        # 网页模型已经在上一轮看到了自己的 tool_call；这里只需把执行结果作为
+        # 下一轮的 role=tool 消息送回同一网页会话，再让模型继续生成最终答复。
+        working_messages.append(ChatMessage(role="assistant", content=reply_content))
+        for call in executed:
+            result = call.get("result")
+            working_messages.append(
+                ChatMessage(
+                    role="tool",
+                    content=json.dumps(result, ensure_ascii=False),
+                    tool_call_id=str(call.get("id") or ""),
+                )
+            )
+
+        delta_prompt = build_prompt(working_messages, request.tools, request.tool_choice)
+        seeded_prompt = build_prompt(
+            working_messages,
+            request.tools,
+            request.tool_choice,
+            seed=True,
+            seed_max_chars=config.SEED_MAX_CHARS,
+            task_block=task_block,
+        )
+        try:
+            reply_content, blocks = await driver.send_chat(
+                delta_prompt if not driver.needs_seed(session_key) else seeded_prompt,
+                seeded_prompt=seeded_prompt,
+                key=session_key,
+                validate_reply=tool_nudge_predicate(
+                    working_messages, request.tools, request.tool_choice
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("本地 edit_markdown 执行后继续生成失败：%s", exc, exc_info=True)
+            return _error_response(500, str(exc), "server_error")
+        sent_prompt = driver.sent_prompt(session_key) or delta_prompt
 
     if tool_calls:
         return ChatCompletionResponse(

@@ -255,16 +255,17 @@ def _map_exception(exc: Exception) -> Tuple[int, str]:
     return 500, "server_error"
 
 
-def _maybe_register_edit_markdown(request: ChatCompletionRequest) -> None:
-    """本地执行开启时，把 edit_markdown 注册进本轮工具列表（客户端未提供时）。"""
+def _maybe_register_edit_markdown(request: ChatCompletionRequest) -> bool:
+    """注册 bridge 内置 edit_markdown；返回是否为本轮自动注入。"""
     if not config.EDIT_MARKDOWN_LOCAL:
-        return
+        return False
     names = _tool_names(request.tools)
     if EDIT_MARKDOWN_TOOL_NAME in names:
-        return
+        return False
     tools = list(request.tools or [])
     tools.append(EDIT_MARKDOWN_TOOL)
     request.tools = tools
+    return True
 
 
 # ==================== 共享执行（流式/非流式都走这里）====================
@@ -275,6 +276,7 @@ async def run_chat(
     driver,
     session_key: Optional[str],
     on_delta=None,
+    auto_local_edit_markdown: bool = False,
 ):
     """执行一次上游对话，返回 (reply, code_blocks, tool_calls)。
 
@@ -300,6 +302,7 @@ async def run_chat(
         raise ValueError("需要包含至少一条 user / tool 消息")
 
     wants_tools = bool(request.tools) and request.tool_choice != "none"
+    working_messages = list(request.messages)
     reply, blocks = await driver.send_chat(
         prompt,
         on_delta=on_delta,
@@ -312,12 +315,54 @@ async def run_chat(
             request.messages, request.tools, request.tool_choice
         ),
     )
-    parsed_tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
-    events = completion_events(reply, parsed_tool_calls)
-    tool_calls = completed_tool_calls(events)
-    final_text = completed_text(events, reply)
     sent_prompt = driver.sent_prompt(session_key) or prompt
-    return final_text, blocks, tool_calls, sent_prompt
+    local_rounds = 0
+    while True:
+        parsed_tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
+        events = completion_events(reply, parsed_tool_calls)
+        all_tool_calls = completed_tool_calls(events)
+        local_tool_calls = (
+            [call for call in all_tool_calls if call.get("name") == EDIT_MARKDOWN_TOOL_NAME]
+            if auto_local_edit_markdown else []
+        )
+        external_tool_calls = [call for call in all_tool_calls if call not in local_tool_calls]
+        if not local_tool_calls or external_tool_calls:
+            final_text = completed_text(events, reply)
+            return final_text, blocks, external_tool_calls, sent_prompt
+        local_rounds += 1
+        if local_rounds > 4:
+            raise RuntimeError("本地 edit_markdown 连续执行超过 4 轮，停止自动继续。")
+        executed = await asyncio.to_thread(
+            run_local_edit_markdown,
+            local_tool_calls,
+            session_key=session_key,
+        )
+        working_messages.append(ChatMessage(role="assistant", content=reply))
+        for call in executed:
+            working_messages.append(ChatMessage(
+                role="tool",
+                content=json.dumps(call.get("result"), ensure_ascii=False),
+                tool_call_id=str(call.get("id") or ""),
+            ))
+        delta_prompt = build_prompt(working_messages, request.tools, request.tool_choice)
+        seeded_prompt = build_prompt(
+            working_messages,
+            request.tools,
+            request.tool_choice,
+            seed=True,
+            seed_max_chars=config.SEED_MAX_CHARS,
+            task_block=task_block,
+        )
+        reply, blocks = await driver.send_chat(
+            delta_prompt if not driver.needs_seed(session_key) else seeded_prompt,
+            on_delta=on_delta,
+            seeded_prompt=seeded_prompt,
+            key=session_key,
+            validate_reply=tool_nudge_predicate(
+                working_messages, request.tools, request.tool_choice
+            ),
+        )
+        sent_prompt = driver.sent_prompt(session_key) or delta_prompt
 
 
 # ==================== 非流式入口 ====================
@@ -340,7 +385,7 @@ async def handle_responses(
         )
 
     chat_req = to_chat_request(req)
-    _maybe_register_edit_markdown(chat_req)
+    auto_local_edit_markdown = _maybe_register_edit_markdown(chat_req)
     if not chat_req.messages:
         return JSONResponse(
             status_code=400,
@@ -366,7 +411,12 @@ async def handle_responses(
             )
 
         return StreamingResponse(
-            stream_responses(chat_req, driver, session_key),
+            stream_responses(
+                chat_req,
+                driver,
+                session_key,
+                auto_local_edit_markdown=auto_local_edit_markdown,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -376,7 +426,12 @@ async def handle_responses(
         )
 
     try:
-        reply, _blocks, tool_calls, sent_prompt = await run_chat(chat_req, driver, session_key)
+        reply, _blocks, tool_calls, sent_prompt = await run_chat(
+            chat_req,
+            driver,
+            session_key,
+            auto_local_edit_markdown=auto_local_edit_markdown,
+        )
     except ChatGPTContextLimitError as exc:
         logger.error("\n[ERR] responses: 上下文超限:", exc_info=True)
         return JSONResponse(status_code=400, content=_error_payload(str(exc), "context_length_exceeded"))
@@ -392,13 +447,9 @@ async def handle_responses(
         traceback.print_exc()
         return JSONResponse(status_code=500, content=_error_payload(str(exc), "server_error"))
 
-    # 本地执行 edit_markdown 与 chat 路径共用同一实现（见 toolcalls.run_local_edit_markdown）
-    # 本地执行含读文件 / 算 diff / （可选）写盘，放线程里跑（T3.3）
-    tool_calls = await asyncio.to_thread(
-        run_local_edit_markdown,
-        tool_calls,
-        session_key=session_key,
-    )
+    # run_chat() 已经负责执行 bridge 自动注入的本地 edit_markdown，
+    # 并只返回仍需由客户端处理的外部 tool calls。
+    # 这里不能再次执行，否则客户端真正声明的工具也会被 bridge 当成本地工具执行。
     return from_chat_response(
         reply, req.model, estimate_tokens(sent_prompt), tool_calls or None
     )
@@ -418,6 +469,7 @@ async def stream_responses(
     request: ChatCompletionRequest,
     driver,
     session_key: Optional[str],
+    auto_local_edit_markdown: bool = False,
 ):
     """以 Responses 命名 SSE 事件流输出。"""
     import asyncio
@@ -461,8 +513,11 @@ async def stream_responses(
     async def runner():
         try:
             reply, blocks, tool_calls, sent_prompt = await run_chat(
-                request, driver, session_key,
+                request,
+                driver,
+                session_key,
                 on_delta=None if buffer_tools else on_delta,
+                auto_local_edit_markdown=auto_local_edit_markdown,
             )
             await queue.put(("done", (reply, blocks, tool_calls, sent_prompt, None, None)))
         except Exception as exc:  # noqa: BLE001

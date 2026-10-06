@@ -246,7 +246,7 @@ text
 
 ## PI-010 ToolPolicy
 
-状态：TODO｜优先级：P1｜依赖：PI-008
+状态：DONE｜优先级：P1｜依赖：PI-008
 
 定义：
 
@@ -262,11 +262,45 @@ confirmation_policy
 
 第一阶段只覆盖已有 edit_markdown；不立即增加 shell 执行能力。
 
+### 已完成
+
+新增不可变 `ToolPolicy`，作为 ToolCall pipeline 的显式 policy boundary：
+
+- `allowed_tools`：工具 allow-list；
+- `allowed_paths`：`edit_markdown` canonical path 白名单；
+- `write_enabled`：显式控制写入权限；
+- `network_enabled`、`max_output_chars`、`max_runtime_s`、`confirmation_policy` 预留为统一策略字段；
+- policy 在 executor 之前执行，拒绝后不会进入工具执行阶段；
+- 保留原 `allowed_tools` 参数，兼容现有调用方。
+
+已增加 `tests/test_toolcalls.py` 回归覆盖：默认禁止 edit_markdown 写入、路径白名单、允许 dry-run，以及 policy 拒绝发生在 executor 之前。
+
+定向测试 `tests/test_toolcalls.py`、`tests/test_edit_markdown_sandbox.py` 已通过，`git diff --check` 已通过。
+
 ## PI-011 edit_markdown 安全回归
 
-状态：TODO｜优先级：P1｜依赖：PI-010
+状态：DONE｜优先级：P1｜依赖：PI-010
 
-测试：绝对路径、..、root 外路径、symlink 越界、只读模式、write flag、backup 失败、超大文件。
+### 已完成
+
+`tests/test_edit_markdown_sandbox.py` 已覆盖：
+
+- 绝对路径拒绝；
+- `..` 路径穿越拒绝；
+- root 外路径拒绝；
+- symlink 越界拒绝；
+- 默认 dry-run / 只读模式；
+- `write=true` 在写入开关关闭时拒绝落盘；
+- 写入开关开启后的实际写入与 backup；
+- backup 失败时保持原文件不变；
+- 超大文件在 Markdown 解析前拒绝；
+- 行号边界校验；
+- 非法 / 空 path 校验；
+- `run_local_edit_markdown` 对非 edit_markdown 调用保持透传。
+
+相关配置已加入 `.env.example`：`EDIT_MARKDOWN_MAX_FILE_BYTES=4194304`。
+
+定向测试 `tests/test_edit_markdown_sandbox.py tests/test_toolcalls.py`：96 项通过；全套 `pytest -q`：全部通过；`git diff --check`：通过。
 
 ### 验收
 
@@ -278,25 +312,34 @@ confirmation_policy
 
 ## PI-012 建立领域异常层
 
-状态：TODO｜优先级：P1｜依赖：PI-005、PI-008
+状态：DONE｜优先级：P1｜依赖：PI-005、PI-008
 
-建议增加：
+### 已完成
 
-text
-BrowserLookupError
-BrowserInteractionError
-ReplyExtractionError
-ToolParseError
-ToolExecutionError
-SessionStateError
-ConfigurationError
+在 `chatgpt_web/errors.py` 建立统一领域异常层，并保留现有异常兼容性：
 
+- `BridgeError`：所有 Bridge 领域异常统一基类；
+- `BrowserError`：浏览器 / Playwright 领域错误；
+- `BrowserLookupError`：网页元素或状态定位失败；
+- `BrowserInteractionError`：网页交互失败；
+- `ReplyExtractionError`：回复存在但无法可靠提取；
+- `ToolError` / `ToolParseError`：工具领域错误；
+- `ToolCallPipelineError` 及 parse / validation / policy / execution / serialization 子类；
+- `SessionStateError`：会话状态异常；
+- `ConfigurationError`：配置异常；
+- `ChatGPTTimeoutError`、`ChatGPTContextLimitError`、`ChatGPTBusyError` 统一归入 `BrowserError`。
+
+`toolcalls.py` 不再维护重复的 ToolCall pipeline 异常定义，而是从 `errors.py` 导入；旧的 `toolcalls.ToolCall*Error` 导入路径仍然有效。`chatgpt_web.__init__` 同时导出领域异常，供上层统一依赖异常类型而不依赖具体 Driver。
+
+已新增 `tests/test_errors.py`，覆盖领域继承关系以及 ToolCall pipeline 异常向后兼容。
 
 ### 要求
 
-- 关键路径减少 except Exception；
-- Playwright 可预期错误与程序 bug 分开；
-- fallback 必须记录结构化日志。
+- 领域异常类型集中定义；
+- 现有超时 / 上下文限制 / busy 行为保持不变；
+- ToolCall 旧异常名称和导入路径保持兼容；
+- 新异常层具备独立回归测试。
+
 
 ## PI-013 宽泛异常审计
 

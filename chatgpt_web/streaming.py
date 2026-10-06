@@ -12,10 +12,10 @@ from typing import Any, Dict, List, Optional
 from . import config
 from .driver import ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
 from .events import AssistantTextDelta, ToolCall, completion_events
-from .models import ChatCompletionRequest
+from .models import ChatCompletionRequest, ChatMessage
 from .protocol_adapters import chat_sse_choice_for_event, responses_function_call_arguments
-from .prompting import estimate_tokens, tool_nudge_predicate
-from .toolcalls import _tool_names, parse_tool_calls
+from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
+from .toolcalls import EDIT_MARKDOWN_TOOL_NAME, _tool_names, parse_tool_calls, run_local_edit_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,8 @@ async def _stream_chat_completion(
     driver,
     seeded_prompt: Optional[str] = None,
     session_key: Optional[str] = None,
+    auto_local_edit_markdown: bool = False,
+    task_block: Optional[str] = None,
 ):
     """以 OpenAI SSE 格式输出 chunk，兼容 Pi 的 openai-completions 流式解析。
 
@@ -64,21 +66,78 @@ async def _stream_chat_completion(
 
     async def runner():
         try:
-            # 需要工具时先缓冲（等解析出 tool_calls 再决定输出形态），因此不实时吐字；
-            # 同时传入纠偏判定：首轮没调用工具时会再追发一次指令（T1.1），
-            # 因为缓冲模式下首轮内容从未发给客户端，纠偏不会造成文本拼接错乱。
-            reply, blocks = await driver.send_chat(
-                prompt,
-                on_delta=None if wants_tools else on_delta,
-                seeded_prompt=seeded_prompt,
-                key=session_key,
-                # 仅「本轮任务还没调用过任何工具」时才纠偏；用过工具后的纯文本
-                # 回复视为任务收尾，不再追发指令（见 prompting.tool_nudge_predicate）。
-                validate_reply=tool_nudge_predicate(
-                    request.messages, request.tools, request.tool_choice
-                ),
-            )
-            await queue.put(("done", (reply, blocks, None, None)))
+            working_messages = list(request.messages)
+            current_prompt = prompt
+            current_seeded_prompt = seeded_prompt
+            local_rounds = 0
+
+            while True:
+                reply, blocks = await driver.send_chat(
+                    current_prompt,
+                    on_delta=None if wants_tools else on_delta,
+                    seeded_prompt=current_seeded_prompt,
+                    key=session_key,
+                    validate_reply=tool_nudge_predicate(
+                        working_messages, request.tools, request.tool_choice
+                    ),
+                )
+
+                parsed_tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
+                bridge_events = completion_events(reply, parsed_tool_calls)
+                bridge_tool_calls = [event for event in bridge_events if isinstance(event, ToolCall)]
+                local_events = (
+                    [event for event in bridge_tool_calls if event.name == EDIT_MARKDOWN_TOOL_NAME]
+                    if auto_local_edit_markdown else []
+                )
+                external_events = [event for event in bridge_tool_calls if event not in local_events]
+
+                # 客户端声明的工具调用保持原来的 tool-call 路径；若同轮混合出现两者，
+                # 不擅自执行本地调用，整轮交给客户端处理。
+                if external_events or not local_events:
+                    await queue.put(("done", (reply, blocks, None, None)))
+                    return
+
+                local_rounds += 1
+                if local_rounds > 4:
+                    raise RuntimeError("本地 edit_markdown 连续执行超过 4 轮，停止自动继续。")
+
+                local_calls = [
+                    {
+                        "id": event.tool_call_id,
+                        "name": event.name,
+                        "arguments": event.arguments,
+                    }
+                    for event in local_events
+                ]
+                executed = await asyncio.to_thread(
+                    run_local_edit_markdown,
+                    local_calls,
+                    session_key=session_key,
+                )
+
+                working_messages.append(ChatMessage(role="assistant", content=reply))
+                for call in executed:
+                    working_messages.append(ChatMessage(
+                        role="tool",
+                        content=json.dumps(call.get("result"), ensure_ascii=False),
+                        tool_call_id=str(call.get("id") or ""),
+                    ))
+
+                current_prompt = build_prompt(
+                    working_messages, request.tools, request.tool_choice
+                )
+                current_seeded_prompt = build_prompt(
+                    working_messages,
+                    request.tools,
+                    request.tool_choice,
+                    seed=True,
+                    seed_max_chars=config.SEED_MAX_CHARS,
+                    task_block=task_block,
+                )
+                if not current_prompt:
+                    raise ValueError("本地 edit_markdown 执行后没有可继续生成的 prompt")
+                if driver.needs_seed(session_key):
+                    current_prompt = current_seeded_prompt
         except ChatGPTContextLimitError as exc:
             # 给客户端一个可区分的类型，而不是笼统的 server_error
             logger.error("\n[ERR] 网页会话已达上下文长度上限:", exc_info=True)
