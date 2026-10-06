@@ -13,10 +13,27 @@
 """
 
 from . import config, tasks
-from .driver import (
-    DEFAULT_SESSION_KEY,
+from .errors import (
+    BridgeError,
+    BrowserError,
+    BrowserInteractionError,
+    BrowserLookupError,
+    ChatGPTBusyError,
     ChatGPTContextLimitError,
     ChatGPTTimeoutError,
+    ConfigurationError,
+    ReplyExtractionError,
+    SessionStateError,
+    ToolCallExecutionError,
+    ToolCallParseError,
+    ToolCallPolicyError,
+    ToolCallSerializationError,
+    ToolCallValidationError,
+    ToolError,
+    ToolParseError,
+)
+from .driver import (
+    DEFAULT_SESSION_KEY,
     ChatGPTWebDriver,
     SessionState,
 )
@@ -38,8 +55,23 @@ __all__ = [
     "ChatCompletionResponse",
     "ChatMessage",
     "DEFAULT_SESSION_KEY",
+    "BridgeError",
+    "BrowserError",
+    "BrowserInteractionError",
+    "BrowserLookupError",
+    "ChatGPTBusyError",
     "ChatGPTContextLimitError",
     "ChatGPTTimeoutError",
+    "ConfigurationError",
+    "ReplyExtractionError",
+    "SessionStateError",
+    "ToolError",
+    "ToolParseError",
+    "ToolCallExecutionError",
+    "ToolCallParseError",
+    "ToolCallPolicyError",
+    "ToolCallSerializationError",
+    "ToolCallValidationError",
     "ChatGPTWebDriver",
     "SessionState",
     "build_prompt",
