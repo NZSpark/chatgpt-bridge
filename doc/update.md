@@ -434,6 +434,106 @@ bridge 却**紧接着又往输入框发了一条 prompt**，于是 ChatGPT 又�
 `.env` / `.env.example` / README 同步新增该配置项（`tests/test_config_drift.py` 强制模板不落后）。
 `pytest` → **354 passed / 17 skipped**，`ruff` / `mypy` 干净。
 
+### 2.13（已修复）超长 `TOOL_CALL` 行被网页渲染改写 → 整条调用被丢弃、任务静默结束
+
+**现象（用户实测）**：模型输出了单行约 5.4 KB 的 `TOOL_CALL: {"name":"bash", …}`，
+Pi 却收到一条**纯文本**回复（没有 tool_calls）→ 把回复当成最终答案、**直接结束任务**；
+桥的日志里没有任何线索。用户随后把该行贴回来问「为什么没有正常解析」。
+
+**证据来源**：真机会话记录 `~/.pi/agent/sessions/--Users-onetreehill-Github-ChatGPTBridge--/`
+（2026-10-06）——同一条回复在 Pi 侧是 `content:[{"type":"text"}]` 而**不是** `toolCall`，
+同一会话里更早/更晚的同类回复却都是 `toolCall`（说明桥本身能解析工具调用，问题只出在这一类文本上）。
+把记录里的原文取出直接喂 `parse_tool_calls`：**0 条**（`balanced_objs = 0`）。
+
+**根因**：ChatGPT 网页版把这条**纯文本** `TOOL_CALL:` 行当 markdown 渲染，DOM 取回的文本已被改写
+（同一行文本、同一命令，渲染前后只差这一层）：
+
+| 模型写的（JSON 转义要求） | DOM 取回的 | 后果 |
+| --- | --- | --- |
+| `\"`（值内引号） | **裸 `"`** | JSON 不再合法 |
+| `\\n`（字面量 `\n`） | `\n` | 语义改变（字面量 ↔ 真换行） |
+| `    `（缩进 4 空格） | ` `（1 空格） | 命令**正文**被改写，解析层无法恢复 |
+| 末尾 `"}}` | `"}` | 外层对象**少一个** `}` |
+
+于是：括号不平衡 → `_iter_balanced_objects` 两个扫描都抽不出对象（0 个）；
+退到 `_salvage_string_args` 兜底，而它要求 `endswith("}}")` → 直接放弃 →
+`parse_tool_calls` 返回 `[]` → `server.py` / `responses.py` 把回复作为纯文本返回、
+`finish_reason="stop"` → 客户端判定任务结束。**整条调用被静默丢弃。**
+
+**最小复现与验证**（用真机抓到的原文，`tests/test_toolcalls.py::DomRenderDamageTests::RECEIVED`）：
+
+```
+_salvage_string_args(segment)          -> None      # 旧路径到此为止
+_salvage_string_args(segment + "}")    -> dict      # 只差这一个 }
+parse_tool_calls(text, {"bash"})       -> 0 → 1（修复后；命令内容不被改写）
+```
+
+**修复内容**：
+
+1. `toolcalls._salvage_missing_final_brace(segment)`：文本恰好以**单个** `}` 结尾时，
+   补一个 `}` 再交给锚点式 salvage；能否救回仍由 `_parse_complete_string_args` 守卫决定
+   （值真被截断的回复不会被「猜」出调用），并在救回时打一条 warning 说明原因。
+2. `parse_tool_calls` 收尾新增**诊断日志**：回复里出现了 `TOOL_CALL` 标记 / 围栏，
+   却一个可用调用都没交出去时打 warning（以前这种情况完全静默，
+   线上表现为「客户端什么都没执行就结束了」，无从排查）。
+
+**已知局限（留给后续）**：渲染折叠掉的缩进空格**无法从解析层恢复**，
+所以救回的命令仍可能缩进错误（会得到可见的 SyntaxError，模型可以据此重试——
+比静默结束好，但不是根治）。根治要换掉「纯文本行」这个载体：
+例如要求模型把调用放进代码围栏（围栏内容不经 markdown 转义、也不折叠空格），
+或让模型避免在 JSON 里出现缩进/反斜杠转义。这属于协议层决策，见 §5 路线图。
+
+**验证**：`tests/test_toolcalls.py::DomRenderDamageTests` 4 条（含真机原文；
+另 3 条锁定「合法 JSON 不受影响」「值被截断不得猜出调用」「只少一个 `}` 能救回」）；
+把 `_salvage_missing_final_brace` 关掉后 2 条立刻失败，区分力已实测。
+`pytest` → **358 passed / 17 skipped**，`ruff` / `mypy` 干净。
+
+### 2.14（已修复）工具调用载体：纯文本行 → ```tool_call 代码围栏（真机 A/B 证据）
+
+§2.13 找到了根因（网页版把纯文本 `TOOL_CALL:` 行当 markdown 渲染），但那只治了「丢掉调用」的
+一半：即使保住调用，缩进也已经被改坏（命令被**静默**改写）。因此根本修法是**换载体**。
+
+**验证环境**：真实网页、`HEADLESS=false`、正在跑的桥（`127.0.0.1:8002`）、
+请求带 `tools`（`bash`）且 `tool_choice=auto`，提示词带用户要求的环境声明
+（`[环境说明] 执行环境在用户本地电脑上…你直接下命令就可以`）——不带这句模型不会真的下命令。
+
+**对照一（运输层，模型只做逐字节回声，排除模型改写）**：同一 payload
+`{"command":"printf \\"hi\\"; echo A\\n    echo B\\n        echo C"}`（真实 4/8 空格缩进 + 需要 JSON 转义的引号）：
+
+| 载体 | 桥返回的 `command` | 逐字节一致 | 缩进段 |
+| --- | --- | --- | --- |
+| ` ```tool_call ` 围栏 | `printf "hi"; echo A\n    echo B\n        echo C` | ✅ | `[4, 8]` |
+| 纯文本 `TOOL_CALL:` 行 | `printf "hi"; echo A\n echo B\n echo C` | ❌ | `[]`（4/8 全被折叠成 1） |
+
+**对照二（更早一轮，单行 JSON + `\"` + 4 空格）**：纯文本行 `json.loads` **FAIL**（引号前的反斜杠被吃掉）、
+缩进段 0，`parse_tool_calls` → **0 条**（整条丢弃）；围栏则 `json.loads` OK、缩进段 2，解析出 1 条调用。
+
+**对照三（反例，避免误判）**：把同一条命令交给模型**自己写**（不是回声）时，两种载体返回的都是同一种
+“1 空格缩进”——那是**模型自己重排**，不是载体丢东西（围栏在对照一里已证明会保留 4/8 空格）。
+提示词因此明确要求“原样粘贴、不要改写缩进”。
+
+**实现**：
+
+1. 提示词全面改为围栏形态：`format_tools_instruction`（示例本身就是一个 ```tool_call 块 + 新增规则
+   “info string 必须是 `tool_call`，json/text/空 都不会被执行”）、`format_tool_call_emphasis`、
+   `format_tool_retry_nudge`（纠偏也要求围栏）、`edit_markdown_spec`、`markdown_io._build_edit_prompt`。
+2. **解析层不需要新增分支**：围栏被网页渲染掉后，DOM 里只剩 info string（`tool_call`）单独一行 + JSON，
+   既有的「裸标签 + 平衡扫描」兜底正好认得（真机已验：`finish_reason=tool_calls`，命令逐字节一致）；
+   围栏还在时（客户端原样贴回）走 `_TOOL_CALL_FENCE_RE`。刻意**不**接受 ` ```json ` 或 DOM 的 `json`
+   标签行——否则正文里展示的 JSON 只要带 `name`/`arguments` 就会被误执行。旧的纯文本行仍兼容。
+3. 回归用例 `tests/test_toolcalls.py::FencedToolCallCarrierTests`：真机取回的原文逐字节断言（含 4 空格缩进）、
+   原始围栏、围栏内合法多行 JSON、`json` 标签负向；`tests/test_prompting.py` 改为**从注入指令里抽出示例
+   直接喂 `parse_tool_calls`**（锁死提示词与解析器同源）。
+
+**已知残留**（不是“已完成”）：
+
+* 模型若写 ` ```json ` 且围栏被渲染掉，取不到（提示词已明确禁止，负向行为有用例锁定）。
+* 模型自己重排命令时，任何载体都保不住原缩进（对照三）；只能靠提示词要求原样粘贴。
+* `tool_call` 围栏会进入 `_extract_code_blocks` 结果；`SAVE_FILES=true` 时可能被当普通代码块存盘
+  （默认为 false，后续可按 lang 过滤）。
+
+**验证**：`pytest` → **362 passed / 17 skipped**，`ruff` / `mypy` 干净。改动需**重启桥**才对客户端生效。
+
 ---
 
 ## 3. 静态分析发现（与 E2E 无关的既有问题）
