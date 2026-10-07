@@ -536,6 +536,85 @@ parse_tool_calls(text, {"bash"})       -> 0 → 1（修复后；命令内容不�
 
 **完整技术报告**：[doc/code_block_fence.md](code_block_fence.md)（原因 / 机制 / 实现 / 真机对照数据 / 复现步骤 / 残留）。
 
+### 2.15（已修复）提示词的**否定式**措辞导致模型拒答（“本会话没有挂载工具”）
+
+现象（用户实测）：载体换成 ```tool_call 围栏、解析层又补了 shell 围栏兜底之后，模型不再写
+`bash` 围栏，而是**整轮拒答**：
+
+> …但在当前这个会话环境里**没有实际挂载 `read/write/edit/bash` 执行工具**，所以我不能真实发送
+> `tool_call` 并等待执行结果；如果我现在伪造一个，会违反实际工具状态。
+
+接着它给出两条“替代方案”：让用户重新连接带执行器的会话，或者直接给出文件路径 + 修改点 +
+patch + 测试命令 + 提交信息，让用户自己动手。整轮没有任何 `tool_call`，客户端看到的是
+`finish_reason=stop` 的纯文本——任务静默失败。
+
+**根因**：工具说明头段写的是「You have **NO direct access** to a shell, filesystem, or the
+internet…」。这句本意是断掉“凭知识作答”的退路，但它是**否定式**陈述，模型把它读成关于
+**会话能力**的事实描述（“本会话没有 shell / 文件系统”）→ 它认为**工具没挂载**，而发
+`tool_call` 就是在**声称**自己有能力——于是被既有的“不伪造工具输出”拦住，诚实拒答。
+元凶不是“工具清单没送到”（清单就在同一段里），而是同一段里那句否定式陈述抵消了清单的效果。
+
+**第一次修法（无效）**：把否定句改成肯定句，头段写成「You are an autonomous agent driving a
+local executor bridge… The tools listed below are **ALREADY MOUNTED and LIVE**…」，并新增规则 7
+禁止以「no tools / no executor / nothing is mounted」为由拒答。模型换了种拒答：
+
+> 我看到了你提供的本地执行器协议……但在当前这个会话环境里**没有实际挂载
+> `read/write/edit/bash` 执行工具**，所以我不能真实发送 `tool_call`……
+
+**真正的根因（用户判定）**：两版措辞毛病相同——都在**描述模型自己的状态**（“你没有 shell
+访问” / “你的工具已挂载”）。模型会把它当成一道关于**自身能力**的事实题去核对：
+
+| 头段怎么说 | 模型怎么想 | 结果 |
+| --- | --- | --- |
+| 「You have NO direct access to a shell…」 | 本会话没有 shell / 文件系统 | 拒答：“迁移到带执行器的会话后我再下命令” |
+| 「You are an autonomous agent… tools are ALREADY MOUNTED and LIVE」 | 我是 agent ⇒ 我应该有挂载好的工具列表，可**我的列表里没有它** | 拒答：“没有实际挂载 read/write/edit/bash 执行工具” |
+
+**最终修法：只描述链路，不描述模型的能力。** 三块注入文本统一改为：
+
+* **定位**：「You are a **language model**: the only thing you produce is text, and you cannot
+  run anything yourself」——不再写 agent。
+* **执行者在客户端**：「This conversation is read by a small **local client** running on the
+  user's own computer - when you write a tool call… **that client executes it there for real**
+  and returns the real output to you as your next message」。
+* **不需要（也无法）挂载在它那一侧**：「**No tool has to be installed or mounted on your
+  side**, and the tools below will never appear in your built-in tool list - **that is expected
+  and normal**」——直接拆掉那句拒答的事实前提。
+* **发调用 ≠ 伪造**：「**not fabrication** and not a false claim about your capabilities: you
+  are writing the command and the client runs it」。
+* **断退路仍在，但不再用会被读成“没工具”的句型**：「That is the **only way you take real
+  action** here… answering from your own knowledge… means the task **FAILS**. Never fabricate
+  tool output.」
+* **工具清单归属客户端**：「**Tools the client (not you) can execute** - use these exact names:」。
+* **规则 7 只禁止拒答这个“借口”**（不声称已挂载）：「Never decline a task on the grounds that
+  you \"have no tools\" or that the tools are not in your own tool list: **you are not the one
+  that runs them**」；也不得“给用户一段补丁让他自己应用”来代替调用工具。
+* `format_tool_call_emphasis` / `format_tool_retry_nudge` 同口径（纠偏块：「You are **not
+  expected to have tools of your own**: this conversation is read by a local client… it
+  executes whatever tool call you write」）。
+
+**同类教训**：不要用否定句去“切断退路”。任何「你没有 X」都会被模型当成关于自身能力的事实
+陈述，而不“X”往往正是它能做的事。要说的是**链路**（你写的东西会被谁拿去做什么），不是
+**它的本体**。
+
+**为什么这不是“措辞喜好”**：§2.14/§6.1 都记过。真机 A/B 的**关键前提**就是提示词里必须带一句
+“执行环境在用户本地、命令会由客户端真实执行”。旧实现只在 `seed=True` 路径注入
+`config.SEED_ENV_NOTE`，**增量路径完全没有**这类声明；现在这句被内建进工具块本身，
+两条路径每轮都带着。
+
+**验证**：新增 `test_prompting::test_instruction_denies_the_no_tools_refusal`：三块注入文本都
+必须禁止“no tools”式拒答、都不得出现 `agent`（`assertNotIn("agent", text.lower())`），工具块
+必须出现 `not fabrication`、`local client running on the`、`returns the real output to you as
+your next message`、`No tool has to be installed or mounted on your side`、
+`Tools the client (not you) can execute`；`test_instruction_forbids_answering_without_tool` 的
+断言从 `NO direct access` / `ONLY way`（旧）→ `ALREADY MOUNTED`（第一版修法，已被否决）→
+`only way you take real action` / `FAILS` / `Never fabricate`（当前）。
+`ruff check .` / `mypy chatgpt_web` exit 0，`.venv/bin/python -m pytest` → **459 passed /
+17 skipped**。
+
+**未做（有意）**：没有加“识别拒答措辞再反复纠偏”的重试机制——现有纠偏只追发一次且仅限“本轮
+一次工具都没调用过”；再加一轮拉锯会把“任务收尾的纯文本”也拖成新指令（§2.12 的事故）。
+拒答是提示词问题，就在提示词里解决。
+
 ---
 
 ## 3. 静态分析发现（与 E2E 无关的既有问题）

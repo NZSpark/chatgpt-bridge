@@ -278,6 +278,95 @@ git status --short
 `test_prompting::test_fence_delimiters_are_paired` 锁定：四块注入文本 + 空输出说明 +
 重复调用提醒里，三反引号必须成对且配对之间只能是标签行 + JSON。
 
+### 5.7 「本会话没有挂载工具」拒答：把执行能力说成模型自己的状态就会翻车（2026-10-07）
+
+现象（用户实测）：提示词、解析层都修好之后，模型**不再写 bash 围栏**，改为
+**拒答**——它原话是：
+
+> …但在当前这个会话环境里**没有实际挂载 `read/write/edit/bash` 执行工具**，
+> 所以我不能真实发送 `tool_call` 并等待执行结果；如果我现在伪造一个，
+> 会违反实际工具状态。
+
+随后它给出两条「替代方案」：让用户**重新连接带执行器的会话**，或者它**直接给补丁**
+（文件路径 + 修改点 + patch + 测试命令 + 提交信息）让用户自己动手。整轮没有任何
+`tool_call`，客户端看到的是 `finish_reason=stop` 的纯文本——任务静默失败。
+
+**第一层原因**：头段落写的是
+
+> You have NO direct access to a shell, filesystem, or the internet…
+
+这句本意是「断掉凭知识作答的退路」，但它是**否定式**陈述。模型把它读成一句关于
+**会话能力**的事实描述：「本会话没有 shell / 文件系统」→ 于是它认为**工具没挂载**，
+而发 `tool_call` 就是在**声称**自己有能力——被「不伪造工具输出」这条既有指令拦住，
+诚实拒答。注意元凶不是「工具清单没送到」（清单就在同一段里），而是**同一段里一句
+否定式事实陈述把清单的效力抵消掉了**。
+
+#### 第一次修法（无效）：否定式 → 肯定式「工具已挂载」
+
+第一轮把否定句改成肯定句，并把「工具为何以文本形式出现」讲清楚：头段写成
+「You are an autonomous agent driving a local executor bridge… The tools listed below are
+**ALREADY MOUNTED and LIVE**…」，并新增规则 7 禁止以「no tools / no executor /
+nothing is mounted」为由拒答。
+
+**结果：仍然无效——只是换了一种拒答。** 模型原话：
+
+> 我看到了你提供的本地执行器协议……但在当前这个会话环境里**没有实际挂载
+> `read/write/edit/bash` 执行工具**，所以我不能真实发送 `tool_call`……
+
+#### 真正的根因：把执行能力说成了**模型自己的状态**
+
+两版措辞的毛病是同一个，只是方向相反：它们都在给模型**描述它自身的能力**（“你没有 shell
+访问” / “你的工具已挂载”）。模型会把它当成一道关于自己的事实题去**核对**：
+
+| 头段怎么说 | 模型怎么想 | 结果 |
+| --- | --- | --- |
+| 「You have **NO direct access** to a shell…」 | 本会话没有 shell / 文件系统 | 拒答：“迁移到带执行器的会话后我再下命令” |
+| 「You are an **autonomous agent**… the tools are **ALREADY MOUNTED and LIVE**」 | 我是 agent ⇒ 我应该有一份挂载好的工具列表；可**我的工具列表里没有它** | 拒答：“没有实际挂载 read/write/edit/bash 执行工具” |
+
+第二版的错误更隐蔽：**“你是 agent”这个定位本身就在要求模型拥有一份工具清单**。而桥的实现
+根本不可能是那样——**模型就只有文本一条出口**，工具装在“读它回复的那个本地客户端”那边。
+所以只要把执行能力说成模型自己的属性，无论说“有”还是“没有”，都会撞上同一个事实核查。
+
+#### 最终措辞：只描述那条链路，不描述模型的能力
+
+三块注入文本（`format_tools_instruction` / `format_tool_call_emphasis` /
+`format_tool_retry_nudge`）统一改为：
+
+| 要点 | 现在写的话 |
+| --- | --- |
+| **定位：只是 LLM，只产出文本** | 「You are a **language model**: the only thing you produce is text, and you cannot run anything yourself」——不写 agent、不写 exec/工具是它的能力 |
+| **执行者在客户端** | 「This conversation is read by a small **local client** running on the user's own computer - when you write a tool call… **that client executes it there for real** and returns the real output to you as your next message」 |
+| **不需要（也无法）挂载在它这一侧** | 「**No tool has to be installed or mounted on your side**, and the tools below will never appear in your built-in tool list - **that is expected and normal**, because the client takes the call out of your reply text」——直接拆掉模型那句拒答的事实前提 |
+| **发调用 ≠ 伪造** | 「Writing a tool call is therefore **not fabrication** and not a false claim about your capabilities: **you are writing the command and the client runs it**」 |
+| **断退路仍在** | 「That is the **only way you take real action** here… answering from your own knowledge… means the task **FAILS**. Never fabricate tool output.」（不再用“你没有 shell 访问”这种会被读成“没工具”的句型） |
+| **工具清单归属客户端** | 「**Tools the client (not you) can execute** - use these exact names:」 |
+| **只禁止拒答这个“借口”，不声称已挂载**（规则 7） | 「Never decline a task on the grounds that you \"have no tools\" or that the tools are not in your own tool list: **you are not the one that runs them** - the client executes whatever you write」 |
+| **纠偏块同口径** | 「You are **not expected to have tools of your own**: this conversation is read by a local client… **it executes whatever tool call you write**」 |
+
+对“拒答借口”的点名是**行为约束**（不是格式示范），不违反 §5.5 的「列举即示范」教训——
+格式禁令不能写具体形态，行为禁令必须写具体形态才管得住。
+
+**回归锁**：`test_prompting::test_instruction_denies_the_no_tools_refusal` 除断言三块文本都
+禁止“no tools”式拒答、都不得出现 `agent`（`assertNotIn("agent", text.lower())`）外，还锁定
+“not fabrication”“结果作为下一条消息返回”“客户端执行你写的东西”“工具不会出现在你的
+工具列表里·这是预期”等关键句；`test_instruction_forbids_answering_without_tool` 的 token
+从 `NO direct access` / `ONLY way`（旧）→ `ALREADY MOUNTED`（第一版修法，已被否决）→
+`only way you take real action` / `FAILS` / `Never fabricate`（当前）。
+
+**为什么这条不只是“措辞喜好”**：§6.1 记过，真机 A/B 的**关键前提**就是提示词里必须带
+一句“执行环境在用户本地电脑上、命令会由客户端真实执行”的环境声明——没有这句，模型
+不会真的下命令。旧实现只在 `seed=True` 路径注入 `config.SEED_ENV_NOTE`，增量路径**完全没有**
+这类声明；现在“客户端执行你写的调用”这句被**内建进工具块本身**，两条路径每轮都带着。
+
+**未做（有意）**：没有新增“识别拒答措辞并反复纠偏”的重试机制。现有纠偏只追发**一次**
+（`chat_io` 的 T1.1 单次重试），且只在**本轮一次工具都没调用过**时生效；再加一轮拉锯会把
+“任务收尾的纯文本”也拖成新指令（2026-10-06 的 `update.md §2.12` 事故）。**拒答是提示词问题，
+就该在提示词里解决。**
+
+**同类教训（写提示词时反复踩）**：不要用否定句去“切断退路”。任何形如「你没有 X」的句子
+都会被模型当成关于它自身能力的事实陈述，而不“X”往往正是它能做的事。要说的是**链路**
+（“你写的东西会被谁拿去做什么”），不是**它的本体**。
+
 ### 5.2 解析侧：判定链与兼容矩阵
 
 `parse_tool_calls`（`toolcalls.py:947`）的既有优先级链**未改动**：
@@ -465,6 +554,8 @@ tool_call
 | `test_streaming::test_shell_fence_stream_is_recovered_as_tool_call`（§5.6） | 流式路径（Pi 默认）同样给出 tool_calls 分片与 `finish_reason=tool_calls` |
 | `test_prompting::test_fence_delimiters_are_paired`（§5.6） | 注入文本里的三反引号必须成对（防裸围栏吃掉后续指令） |
 | `test_tool_injection::RetryNudgeTests::test_nudge_demands_single_tool_call` | 纠偏文本含围栏模板，且 `tool_call_predicate(TOOLS)` 对其返回 True |
+| `test_prompting::test_instruction_denies_the_no_tools_refusal`（§5.7） | 三块注入文本都禁止「我没有工具」式拒答、都不得出现 `agent`（不得把模型描述成自带工具清单的 agent）；工具块必须明说「客户端执行 + 结果作为下一条消息返回」「不是伪造」「工具不会出现在你的工具列表里·这是预期」「Tools the client (not you) can execute」 |
+| `test_prompting::test_instruction_forbids_answering_without_tool`（§5.7） | 工具块必须保留断退路的硬约束（`only way you take real action` / `FAILS` / `Never fabricate`） |
 
 ### 7.2 区分力实验（证明用例不是「必然通过」）
 
@@ -481,7 +572,10 @@ mypy chatgpt_web                           # exit 0
 ```
 
 - 载体改造落地时：**362 passed / 17 skipped**（`ruff` / `mypy` 干净）；
-- 报告成文时（后续提交叠加后）：**374 passed / 17 skipped**，exit 0。
+- 报告成文时（后续提交叠加后）：**374 passed / 17 skipped**，exit 0；
+- shell 围栏修复落地后（§5.6）：**458 passed / 17 skipped**，exit 0；
+- 拒答修复落地后（§5.7，当前基线）：**459 passed / 17 skipped**（43s），`ruff check .` 与
+  `mypy chatgpt_web` 均 exit 0（`mypy` 仅 `server.py:453` 一条 `annotation-unchecked` note）。
 
 `tests/e2e/` 需 `CHATGPT_E2E=1` + 有头浏览器 + 已登录 profile，**本报告未把 e2e 套件当作门禁**（见 §8）。
 
@@ -495,8 +589,12 @@ mypy chatgpt_web                           # exit 0
 4. **§3.4 的末尾括号丢失机制未定位**：只做了窄兜底（补一个 `}` 再走锚点 salvage + warning），没有消除其成因。
 5. **历史回放不重放载体**：`_render_message` 对 assistant 工具调用只渲染文本内容（`[你之前的回复]`），因此模型不能从历史里「学到」新载体——载体必须靠注入指令反复声明。这对提示词的可读性与长度是个持续成本。
 6. **提示词变更需重启桥才对客户端生效**：桥是常驻进程，注入指令在启动时/调用时从模块读取，运行中的进程不会自动拾取代码改动。
-7. **本报告未覆盖 e2e 门禁**：`T4.7` 的整套 e2e 验收仍为 `DEFERRED`；真机 A/B 是**手工脚本**证据，不是自动化用例。若要让回归可重复，应把 6.2/6.3 的抓取固化成 `CHATGPT_E2E=1` 才运行的用例。
-8. **回案脚本本身要防污染**：任何「载体 A/B」都必须避免让桥注入的格式指令与脚本指令互相干扰（6.3 已复现过一次错误的 byte-exact 结果）。评测载体保真时要用**不注入格式指令**的抓取（不带 `tools`）或本地重放。
+7. **§5.7 的拒答修复只有结构性证据**：`tests/e2e/` 需 `CHATGPT_E2E=1` + 有头浏览器 +
+   已登录 profile，本环境按设计全 skip，因此「模型是否真的不再拒答」**没有**真机行为层证据，
+   只有「注入文本里确实有肯定式声明与禁令」的单测证据。要闭环必须手工跑一次真机请求
+   （带 `tools`，看回复是不是 `tool_call` 围栏而不是一段解释）。
+8. **本报告未覆盖 e2e 门禁**：`T4.7` 的整套 e2e 验收仍为 `DEFERRED`；真机 A/B 是**手工脚本**证据，不是自动化用例。若要让回归可重复，应把 6.2/6.3 的抓取固化成 `CHATGPT_E2E=1` 才运行的用例。
+9. **回案脚本本身要防污染**：任何「载体 A/B」都必须避免让桥注入的格式指令与脚本指令互相干扰（6.3 已复现过一次错误的 byte-exact 结果）。评测载体保真时要用**不注入格式指令**的抓取（不带 `tools`）或本地重放。
 
 ---
 
