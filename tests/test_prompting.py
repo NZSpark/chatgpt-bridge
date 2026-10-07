@@ -492,6 +492,34 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         self.assertIn("loops forever", text)
         self.assertIn("move on to the NEXT", text)
 
+    def test_fence_delimiters_are_paired(self):
+        """四块注入文本里的三反引号必须成对，且配对之间只能是标签行 + JSON。
+
+        背景：提示词里出现**未配对**的三反引号会被网页版当成围栏开始，把后半段指令
+        整段吃掉（同类事故见 doc/code_block_fence.md）。因此正文里只能写内联反引号
+        （`tool_call`），不能出现裸的 ```` ``` ````。
+        """
+        from chatgpt_web.toolcalls import (
+            edit_markdown_spec,
+            format_tool_call_emphasis,
+            format_tool_retry_nudge,
+            format_tools_instruction,
+        )
+
+        for text in (
+            format_tools_instruction(self.TOOLS),
+            format_tool_call_emphasis(self.TOOLS),
+            edit_markdown_spec(),
+            format_tool_retry_nudge(),
+        ):
+            parts = text.split("```")
+            self.assertEqual(len(parts) % 2, 1, f"三反引号不成对：\n{text}")
+            for inside in parts[1::2]:
+                self.assertTrue(
+                    inside.strip().startswith(("tool_call", "tool-call")),
+                    f"围栏里出现非标签内容（多半是正文里写了裸反引号）：{inside!r}",
+                )
+
     def test_example_placeholder_is_not_angle_bracket(self):
         """示例里的占位符不能用 <command> 这种形式。
 
