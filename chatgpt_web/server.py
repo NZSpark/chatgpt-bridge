@@ -17,36 +17,24 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import config, tasks
 from .driver import (
     DEFAULT_SESSION_KEY,
-    ChatGPTBusyError,
-    ChatGPTContextLimitError,
-    ChatGPTTimeoutError,
     ChatGPTWebDriver,
 )
-from .events import completion_events
 from .logging_setup import new_request_id, set_request_id
 from .metrics import metrics
 from .models import (
     SUPPORTED_MODELS,
     ChatCompletionRequest,
     ChatCompletionResponse,
-    ChatMessage,
-    Choice,
-    ChoiceMessage,
     ModelCard,
     ModelListResponse,
-    Usage,
 )
-from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
-from .protocol_adapters import completed_text, completed_tool_calls
+from .prompting import build_prompt
 from .responses import ResponsesRequest, handle_responses
 from .streaming import _stream_chat_completion
-from .toolcalls import (
-    EDIT_MARKDOWN_TOOL,
-    EDIT_MARKDOWN_TOOL_NAME,
-    _tool_names,
-    parse_reply_tool_calls,
-    run_local_edit_markdown,
-    to_tool_call_models,
+from .api.chat_adapter import (
+    ChatAdapterError,
+    register_edit_markdown,
+    run_chat_completion,
 )
 
 logger = logging.getLogger(__name__)
@@ -516,12 +504,8 @@ async def chat_completions(
     await asyncio.to_thread(tasks.record, bucket, request.messages)
     task_block = await asyncio.to_thread(tasks.resume_block, bucket)
 
-    auto_local_edit_markdown = (
-        config.EDIT_MARKDOWN_LOCAL
-        and EDIT_MARKDOWN_TOOL_NAME not in _tool_names(request.tools)
-    )
-    if auto_local_edit_markdown:
-        request.tools = list(request.tools or []) + [EDIT_MARKDOWN_TOOL]
+    # 协议转换与 chat 执行都在 api.chat_adapter 里；server 只负责 HTTP。
+    auto_local_edit_markdown = register_edit_markdown(request)
 
     # 两份文本：增量版（现有会话已有上下文）与播种版（新会话 / 轮转后需要重放历史）。
     # 到底用哪份由 driver 决定（只有它知道当前网页会话是否还有历史）。
@@ -563,155 +547,20 @@ async def chat_completions(
             },
         )
 
-    # ---------- 非流式分支 ----------
-    wants_tools = bool(request.tools) and request.tool_choice != "none"
+    # ---------- 非流式分支：交给 api.chat_adapter ----------
     try:
-        reply_content, code_blocks = await driver.send_chat(
-            prompt,
-            seeded_prompt=seeded_prompt,
-            key=session_key,
-            # 首轮未调用工具时让 driver 追发一次纠偏指令（T1.1）；任务已进入
-            # 执行阶段（用过工具）后不再纠偏——纯文本回复视为任务收尾（见
-            # prompting.tool_nudge_predicate）。
-            validate_reply=tool_nudge_predicate(
-                request.messages, request.tools, request.tool_choice
-            ),
-        )
-    except ChatGPTContextLimitError as exc:
-        metrics.inc("request_context_limit_total")
-        logger.error("\n[ERR] 网页会话已达上下文长度上限:", exc_info=True)
-        return _error_response(400, str(exc), "context_length_exceeded")
-    except ChatGPTBusyError as exc:
-        # 本地保护：同一会话桶已有请求在跑且等锁超时。稍后重试即可，不是上游故障。
-        logger.warning(f"\n[繁忙] {exc}")
-        return _error_response(503, str(exc), "upstream_busy")
-    except ChatGPTTimeoutError as exc:
-        metrics.inc("request_timeout_total")
-        logger.error("\n[ERR] 等待 ChatGPT 回复超时（已重试）:", exc_info=True)
-        return _error_response(504, str(exc), "timeout")
-    except RuntimeError as exc:
-        # 浏览器不可用 / 找不到输入框等上游问题
-        logger.error("\n[ERR] 上游浏览器不可用:", exc_info=True)
-        return _error_response(502, str(exc), "upstream_error")
-    except Exception as exc:  # noqa: BLE001
-        logger.error("\n[ERR] 处理请求失败:", exc_info=True)
-        return _error_response(500, str(exc), "server_error")
-
-    # 本地内置工具由 bridge 自己执行：执行结果回灌网页模型后继续生成，
-    # 不把这些内部调用暴露给客户端，避免客户端再尝试寻找不存在的本地工具。
-    # 客户端自己声明的 edit_markdown 仍走标准 OpenAI tool_calls 返回路径。
-    local_rounds = 0
-    working_messages = list(request.messages)
-    sent_prompt = driver.sent_prompt(session_key) or prompt
-    blocks = code_blocks
-    while True:
-        parsed_tool_calls = parse_reply_tool_calls(reply_content, request.tools) if wants_tools else []
-        events = completion_events(reply_content, parsed_tool_calls)
-        all_tool_calls = completed_tool_calls(events)
-        local_tool_calls = (
-            [call for call in all_tool_calls if call.get("name") == EDIT_MARKDOWN_TOOL_NAME]
-            if auto_local_edit_markdown else []
-        )
-        external_tool_calls = [
-            call for call in all_tool_calls if call not in local_tool_calls
-        ]
-
-        if not local_tool_calls:
-            tool_calls = external_tool_calls
-            break
-
-        if external_tool_calls:
-            logger.warning(
-                "模型同时返回本地 edit_markdown 与客户端工具调用；"
-                "本轮仅回传客户端工具调用，局部编辑结果不会暴露为 tool_call。"
-            )
-            tool_calls = external_tool_calls
-            break
-
-        local_rounds += 1
-        if local_rounds > 4:
-            logger.warning("本地 edit_markdown 连续执行超过 4 轮，停止自动继续。")
-            tool_calls = []
-            break
-
-        executed = await asyncio.to_thread(
-            run_local_edit_markdown,
-            local_tool_calls,
-            session_key=session_key,
-        )
-
-        # 网页模型已经在上一轮看到了自己的 tool_call；这里只需把执行结果作为
-        # 下一轮的 role=tool 消息送回同一网页会话，再让模型继续生成最终答复。
-        working_messages.append(ChatMessage(role="assistant", content=reply_content))
-        for call in executed:
-            result = call.get("result")
-            working_messages.append(
-                ChatMessage(
-                    role="tool",
-                    content=json.dumps(result, ensure_ascii=False),
-                    tool_call_id=str(call.get("id") or ""),
-                )
-            )
-
-        delta_prompt = build_prompt(working_messages, request.tools, request.tool_choice)
-        seeded_prompt = build_prompt(
-            working_messages,
-            request.tools,
-            request.tool_choice,
-            seed=True,
-            seed_max_chars=config.SEED_MAX_CHARS,
+        return await run_chat_completion(
+            request,
+            driver,
+            session_key,
+            auto_local_edit_markdown=auto_local_edit_markdown,
             task_block=task_block,
+            prompt=prompt,
+            seeded_prompt=seeded_prompt,
         )
-        try:
-            reply_content, blocks = await driver.send_chat(
-                delta_prompt if not driver.needs_seed(session_key) else seeded_prompt,
-                seeded_prompt=seeded_prompt,
-                key=session_key,
-                validate_reply=tool_nudge_predicate(
-                    working_messages, request.tools, request.tool_choice
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("本地 edit_markdown 执行后继续生成失败：%s", exc, exc_info=True)
-            return _error_response(500, str(exc), "server_error")
-        sent_prompt = driver.sent_prompt(session_key) or delta_prompt
-
-    if tool_calls:
-        return ChatCompletionResponse(
-            model=request.model,
-            choices=[Choice(
-                index=0,
-                message=ChoiceMessage(role="assistant", content=None, tool_calls=to_tool_call_models(tool_calls)),
-                finish_reason="tool_calls",
-            )],
-            usage=Usage(
-                prompt_tokens=estimate_tokens(sent_prompt),
-                completion_tokens=estimate_tokens(reply_content),
-                total_tokens=estimate_tokens(sent_prompt) + estimate_tokens(reply_content),
-            ),
-        )
-
-    final_text = completed_text(events, reply_content)
-    saved_files = []
-    # None = 客户端未指定，回落到 config.SAVE_FILES（默认 false）；显式传入才覆盖
-    save_files = config.SAVE_FILES if request.save_files is None else request.save_files
-    if save_files:
-        saved_files = await asyncio.to_thread(
-            driver.save_extracted_files,
-            reply_content, code_blocks, request.output_dir or config.OUTPUT_DIR,
-        )
-
-    return ChatCompletionResponse(
-        model=request.model,
-        choices=[Choice(
-            index=0,
-            message=ChoiceMessage(role="assistant", content=final_text),
-            finish_reason="stop",
-        )],
-        usage=Usage(
-            prompt_tokens=estimate_tokens(sent_prompt),
-            completion_tokens=estimate_tokens(reply_content),
-            total_tokens=estimate_tokens(sent_prompt) + estimate_tokens(reply_content),
-        ),
-        saved_files=saved_files,
-    )
+    except ChatAdapterError as exc:
+        if exc.err_type == "context_length_exceeded":
+            metrics.inc("request_context_limit_total")
+        elif exc.err_type == "timeout":
+            metrics.inc("request_timeout_total")
+        return _error_response(exc.status_code, exc.message, exc.err_type)

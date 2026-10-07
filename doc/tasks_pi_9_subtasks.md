@@ -10,7 +10,7 @@
 | 一 | PI-901 Tool Runtime 拆分 | ✅ 已完成 | `chatgpt_web/tools/`（parser/validator/policy/executor/ledger/serializer）；`toolcalls.py` 为 facade；`tests/test_tools_package.py` |
 | 二 | PI-902 Completion 拆分 | ✅ 已完成 | `chatgpt_web/completion/`（lifecycle/generator/extractor）；`completion/__init__.py` 即 facade；`tests/test_completion_package.py` |
 | 三 | PI-903 Browser 层拆分 | ✅ 已完成 | `chatgpt_web/browser/`（selectors/dom_adapter/diagnostics/driver）；`dom_adapter.py` 为 facade；`tests/test_browser_package.py` |
-| 四 | PI-904 API Adapter 拆分 | ⬜ 未开始 | 无 `api/`；`server.py`(717行)/`responses.py`(692行)/`streaming.py`(247行) 仍分立 |
+| 四 | PI-904 API Adapter 拆分 | ✅ 已完成 | `chatgpt_web/api/`（chat_adapter/responses_adapter/streaming_adapter）；`responses.py`/`streaming.py` 为 facade；`tests/test_api_package.py` |
 | 五 | PI-905 Session 模块化 | ✅ 已完成 | `chatgpt_web/session/`（schema/migration/lock/store）；`session_store.py` 为 facade；`tests/test_session_package.py` |
 | 六 | PI-906 Config 模块化 | ✅ 已完成 | `chatgpt_web/config/`（_core + server/browser/session/tools/limits/debug）；`config/__init__.py` 为兼容 facade；`tests/test_config.py` 含包结构回归 |
 
@@ -271,10 +271,34 @@ browser/
 
 # PI-904 API Adapter 拆分
 
-## 状态：未开始
+## 状态：已完成（2026-10-08）
 
-现状：`chatgpt_web/api/` 不存在；`server.py`（~29KB）/ `responses.py` /
-`streaming.py` 仍是独立模块，协议转换与 HTTP 处理仍混在 server 里。
+实际落地结构：
+
+```
+chatgpt_web/api/
+├── __init__.py           组装 + re-export（含 __all__）
+├── chat_adapter.py       Chat Completions 语义 -> OpenAI SSE chunk
+├── responses_adapter.py  Responses API <-> 内部 Chat 语义（含流式命名事件）
+└── streaming_adapter.py  通用 SSE 事件编码辅助（sse_event）
+```
+
+兼容契约（``chatgpt_web.streaming`` / ``chatgpt_web.responses`` 仍是 facade）：
+
+- ``from chatgpt_web.streaming import _stream_chat_completion`` /
+  ``_chunk_text`` 不变（再导出 ``api.chat_adapter`` 里的同名对象）；
+- ``from chatgpt_web.responses import run_chat`` / ``handle_responses`` /
+  ``ResponsesRequest`` / ``to_chat_request`` / ``from_chat_response`` /
+  ``stream_responses`` 不变；
+- 私有 helper ``_sse`` / ``_error_payload`` / ``_map_exception`` /
+  ``_maybe_register_edit_markdown`` / ``_tool_to_chat`` / ``_usage_dict`` 仍可从
+  facade 访问（既有 ``patch.object`` 契约）。
+
+``server.py`` 现在只负责 HTTP：协议转换全部委托 ``api.chat_adapter`` /
+``api.responses_adapter``（``run_chat_completion`` / ``register_edit_markdown`` /
+``ChatAdapterError`` / ``handle_responses``）。行数从 717 降到 566。
+
+独立回归测试：``tests/test_api_package.py``。
 
 ## 子任务
 
