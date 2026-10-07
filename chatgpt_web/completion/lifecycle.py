@@ -1,7 +1,13 @@
-"""生成结束 / 会话轮转 / 到顶判定（``CompletionMixin``）。
+"""会话生命周期（``CompletionMixin`` 主体，PI-902 的 ``runner`` 职责）。
 
-负责：新建对话、启动恢复、上下文到顶探测、会话轮转与恢复，
-以及判断页面「是否仍在生成」的诊断辅助。
+负责：新建对话、启动恢复、上下文到顶探测、会话轮转与恢复，以及判断页面
+「是否仍在生成」的诊断辅助。这是文档 ``doc/tasks_pi_9_subtasks.md`` PI-902 里
+命名的 *runner*（任务/会话生命周期）在真实代码中的落点。
+
+拆分说明（PI-902）：本模块只保留「会话级」生命周期，真正的轮询/生成等待在
+:mod:`chatgpt_web.completion.generator`，回复/代码块提取在
+:mod:`chatgpt_web.completion.extractor`。本模块不新增业务逻辑，行为与拆分前
+的 ``chatgpt_web/completion.py`` 完全一致。
 """
 
 
@@ -10,19 +16,27 @@ import logging
 import re
 from typing import List, Optional
 
-from . import config
-from .errors import (
+from .. import config
+from ..errors import (
     HOME_URL,
     ChatGPTContextLimitError,
 )
-from .metrics import metrics
+from ..metrics import metrics
 
 logger = logging.getLogger(__name__)
 
-# 「新建对话」按钮的**总**搜索预算（秒）：页面冷启动时侧边栏可能晚于 composer
-# 渲染，所以在预算内轮询；一命中就返回，不会白等（2026-10-06 线上回归修复）。
-_NEW_CHAT_SEARCH_TIMEOUT_S = 8.0
-_NEW_CHAT_POLL_INTERVAL_S = 0.4
+
+def _completion_globals():
+    """延迟取回 facade 模块 ``chatgpt_web.completion``。
+
+    ``_NEW_CHAT_SEARCH_TIMEOUT_S`` / ``_NEW_CHAT_POLL_INTERVAL_S`` 定义在 facade
+    上，历史测试用 ``mock.patch.object(completion, "_NEW_CHAT_...", ...)`` 打补丁。
+    这里在调用时通过 sys.modules 取回 facade 对象，保证补丁仍然生效（PI-902）。
+    """
+    import sys
+
+    return sys.modules.get("chatgpt_web.completion")
+
 
 class CompletionMixin:
     # Kept here as a compatibility contract for regression tests and callers that
@@ -72,6 +86,7 @@ class CompletionMixin:
           matches: words.some((w) => label.includes(w)) || byClass };
       }).filter((x) => x.matches);
     }'''
+
     async def _restore_session_on_startup(self) -> None:
         """启动时一律新开对话（不做 URL 恢复）。
 
@@ -151,8 +166,13 @@ class CompletionMixin:
         """兼容 facade：New Chat 定位/点击统一由 DOM adapter 负责。"""
         # The original implementation kept these knobs in this module; mirror
         # them into the adapter so existing tests/callers can still patch them.
-        self.dom.NEW_CHAT_SEARCH_TIMEOUT_S = _NEW_CHAT_SEARCH_TIMEOUT_S
-        self.dom.NEW_CHAT_POLL_INTERVAL_S = _NEW_CHAT_POLL_INTERVAL_S
+        # PI-902：常量定义在 facade（chatgpt_web.completion），这里在调用时
+        # 回读，保证 mock.patch.object(completion, ...) 依然生效。
+        facade = _completion_globals()
+        search_timeout = getattr(facade, "_NEW_CHAT_SEARCH_TIMEOUT_S", 8.0)
+        poll_interval = getattr(facade, "_NEW_CHAT_POLL_INTERVAL_S", 0.4)
+        self.dom.NEW_CHAT_SEARCH_TIMEOUT_S = search_timeout
+        self.dom.NEW_CHAT_POLL_INTERVAL_S = poll_interval
         await self.dom.open_new_chat(page)
 
     async def _start_new_session(self, key: Optional[str] = None) -> None:

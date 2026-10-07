@@ -18,13 +18,6 @@
 import asyncio
 from typing import Any, Dict, List, Optional
 
-# 惰性 import Playwright：把 `from playwright.async_api import async_playwright`
-# 放到 `init()` 内部。driver 被 `chatgpt_web/__init__.py` 顶层导入，若这里顶层
-# import Playwright，则任何 `import chatgpt_web`（哪怕只想读 config / 跑纯逻辑
-# 测试）都会因缺 Playwright 直接 ImportError。放进 init() 后，只有真正要启动
-# 浏览器时才需要该依赖，纯逻辑模块可在未装 Playwright 的环境下正常使用。
-async_playwright = None
-
 from . import (  # noqa: F401
     completion,
     config,
@@ -33,6 +26,8 @@ from . import (  # noqa: F401
     prompting,
     session_store,
 )
+from .browser.driver import BrowserLifecycleMixin
+from .browser.driver import async_playwright  # noqa: F401  (兼容再导出：历史上是模块全局)
 from .chat_io import ChatIOMixin
 from .completion import CompletionMixin
 from .dom_adapter import ChatGPTDOMAdapter
@@ -48,7 +43,9 @@ from .page_pool import PagePoolMixin
 from .session_store import SessionState, SessionStoreMixin  # noqa: F401  (re-export)
 
 
-class ChatGPTWebDriver(PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIOMixin):
+class ChatGPTWebDriver(
+    BrowserLifecycleMixin, PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIOMixin
+):
 
     def __init__(self, user_data_dir: Optional[str] = None):
         user_data_dir = user_data_dir or config.USER_DATA_DIR
@@ -84,45 +81,9 @@ class ChatGPTWebDriver(PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIO
         self.dom = ChatGPTDOMAdapter()
 
     async def init(self):
-        """初始化浏览器实例"""
-        global async_playwright
-        if async_playwright is None:
-            try:
-                from playwright.async_api import async_playwright as _async_playwright
-            except ImportError as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    "缺少 Playwright 依赖，无法启动浏览器。请先安装：\n"
-                    "  pip install -r requirements.txt\n"
-                    "  playwright install chromium"
-                ) from exc
-            async_playwright = _async_playwright
-        self.playwright = await async_playwright().start()
-        try:
-            self.context = await self.playwright.chromium.launch_persistent_context(
-                user_data_dir=self.user_data_dir,
-                headless=config.HEADLESS,
-                args=["--disable-blink-features=AutomationControlled"]
-            )
-        except Exception as exc:  # noqa: BLE001
-            # persistent context 不能被两个进程共用；给出可操作的提示而不是原始堆栈
-            await self.playwright.stop()
-            self.playwright = None
-            message = str(exc)
-            if (
-                "existing browser session" in message
-                or "profile is already in use" in message
-                or "SingletonLock" in message
-            ):
-                raise RuntimeError(
-                    f"浏览器用户目录 {self.user_data_dir} 已被另一个 Chromium 实例占用。\n"
-                    "通常是因为已有一个 chatgpt_api_server.py 仍在运行，"
-                    "或上一次的浏览器窗口没有关闭。\n"
-                    "请先结束旧实例再重试：\n"
-                    "  pkill -f chatgpt_api_server.py\n"
-                    "或直接关闭占用该 profile 的 Chromium 窗口。"
-                ) from exc
-            raise
-        self.page = await self.context.new_page()
+        """初始化浏览器实例（生命周期委托 :class:`BrowserLifecycleMixin`）。"""
+        await self.launch_persistent_context(self.user_data_dir)
+        self.page = await self.new_browser_page()
         await self._restore_session_on_startup()
         await self._warn_if_blocked(self.page)
 
@@ -139,9 +100,3 @@ class ChatGPTWebDriver(PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIO
         静态方法是为了向后兼容既有的调用方式）。
         """
         return prompting.build_prompt(messages, tools, tool_choice)
-
-    async def close(self):
-        if self.context:
-            await self.context.close()
-        if self.playwright:
-            await self.playwright.stop()

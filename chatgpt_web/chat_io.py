@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from . import config
-from .end_detection import EndLimits, EndState, evaluate_poll
+# PI-902：结束判定的纯函数状态机与阈值组装统一由 completion 子包 re-export。
+from .completion.extractor import strip_code_noise as _strip_code_noise_impl
+from .completion.generator import (
+    EndLimits,
+    EndState,
+    build_end_limits,
+    evaluate_poll,
+)
 from .errors import (
     DEFAULT_SESSION_KEY,
     ChatGPTBusyError,
@@ -243,48 +250,8 @@ class ChatIOMixin:
 
     @staticmethod
     def _strip_code_noise(code_content: str, lang: str) -> str:
-        """剥离 ChatGPT 代码块界面噪声，但保留首尾空白。
-
-        旧实现直接 .strip()，会无条件抹掉开头/结尾的空白与空行。
-        对 README.md 这类要按原文匹配再改的文件是致命的：
-        首行空行、末尾换行被删后，edit 工具逐字节匹配就会失败。
-
-        这里只去掉头部的语言标签行与 Copy/Download 行，
-        正文的空白、空行、首尾换行全部原样保留。
-        """
-        text = code_content.replace("\r\n", "\n").replace("\r", "\n")
-        lines = text.split("\n")
-        lang_alt = re.escape(lang) if lang else r"[A-Za-z0-9_+#.-]*"
-        lang_line_re = re.compile(
-            r"^\s*(?:" + lang_alt + r"|bash|shell|sh|python|py|json|html|javascript|js|"
-            r"typescript|ts|css|sql|go|rust|java|cpp|c|markdown|md|txt)\s*$",
-            re.IGNORECASE,
-        )
-        copy_line_re = re.compile(
-            r"^\s*(?:" + lang_alt + r"|bash|shell|sh|python|py|json|html|javascript|js)?"
-            r"\s*(?:Copy|Download)\s*$",
-            re.IGNORECASE,
-        )
-        # 头部：允许先跳过空行，再剥语言标签 / Copy 行；
-        # 一旦遇到第一行正文就停，避免误删正文里同名的行。
-        start = 0
-        while start < len(lines):
-            line = lines[start]
-            if not line.strip():
-                start += 1
-                continue
-            if lang_line_re.match(line) or copy_line_re.match(line):
-                start += 1
-                continue
-            break
-        end = len(lines)
-        while end > start:
-            last = lines[end - 1]
-            if last.strip() and copy_line_re.match(last):
-                end -= 1
-                continue
-            break
-        return "\n".join(lines[start:end])
+        """剥离 ChatGPT 代码块界面噪声，但保留首尾空白（PI-902 迁至 extractor）。"""
+        return _strip_code_noise_impl(code_content, lang)
 
     async def _extract_code_blocks(self, element) -> List[dict]:
         """兼容 facade：代码块提取统一由 DOM adapter 负责。"""
@@ -652,12 +619,7 @@ class ChatIOMixin:
             # 判定状态与阈值：真正的判定逻辑在纯函数 evaluate_poll 里（T4.2），
             # 这里只维护状态、副作用与日志。
             end_state = EndState()
-            end_limits = EndLimits(
-                quiet_polls=max(1, int(config.RESUME_QUIET_POLLS)),
-                stable_polls=int(config.STABLE_POLLS),
-                stall_limit=max(1, int(config.STALL_POLLS)),
-                extend_step_s=config.RESPONSE_TIMEOUT_S,
-            )
+            end_limits = build_end_limits()
             saw_generating = end_state.saw_generating
             # 零节点诊断：连续 N 轮才打印，且只打印一次（poll 间隔 1.5s）
             empty_node_polls = 0
