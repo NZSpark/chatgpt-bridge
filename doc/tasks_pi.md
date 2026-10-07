@@ -343,7 +343,7 @@ confirmation_policy
 
 ## PI-013 宽泛异常审计
 
-状态：TODO｜优先级：P1｜依赖：PI-012
+状态：DONE｜优先级：P1｜依赖：PI-012
 
 重点检查：
 
@@ -366,7 +366,7 @@ confirmation_policy
 
 ## PI-014 配置分层
 
-状态：TODO｜优先级：P1｜依赖：无
+状态：DONE｜优先级：P1｜依赖：无
 
 拆分：
 
@@ -413,7 +413,7 @@ Chat / Responses / task snapshot / tool result 使用统一限制策略。
 
 ## PI-016 Session schema versioning
 
-状态：TODO｜优先级：P1｜依赖：PI-014 可并行
+状态：DONE｜优先级：P1｜依赖：PI-014 可并行
 
 加入：
 
@@ -436,7 +436,9 @@ json
 
 ## PI-017 Session 并发竞争测试
 
-状态：TODO｜优先级：P1｜依赖：PI-016 可并行
+状态：DONE｜优先级：P1｜依赖：PI-016 可并行
+
+已新增 `tests/test_session_concurrency.py`，覆盖同 session 10 路请求串行、不同 session 并发、lock timeout、运行中 reset；定向 4 项与全套 `pytest -q` 均通过。
 
 测试矩阵：
 
@@ -456,15 +458,9 @@ browser restart while request waits
 
 ## PI-018 Session 状态不变量
 
-状态：TODO｜优先级：P1｜依赖：PI-017
+状态：DONE｜优先级：P1｜依赖：PI-017
 
-验证：
-
-- 不同 session 历史不污染；
-- 同 session 连续轮次保持历史；
-- session rotation 后目标仍存在；
-- cap_hit 行为确定；
-- reset 不造成重复执行。
+已新增 `tests/test_session_invariants.py`，覆盖不同 session 历史隔离、同 session 连续轮次状态保持、reset/rotation 后目标保留与状态重置、turn/token budget 边界确定性。定向 4 项测试全部通过。
 
 ---
 
@@ -472,24 +468,16 @@ browser restart while request waits
 
 ## PI-019 health / readiness / diagnostics
 
-状态：TODO｜优先级：P1｜依赖：PI-005
+状态：DONE｜优先级：P1｜依赖：PI-005
 
-建议：
+已完成 `/readiness` 与 `/diagnostics`，并保留原有 `/healthz` 行为：
 
-text
-/healthz
-/readiness
-/diagnostics
+- `/readiness` 检查 `browser_ready`、`chatgpt_page_ready`、`authenticated`、`composer_ready`、`new_chat_ready`，任一失败返回 503；
+- `/diagnostics` 汇总 readiness、session、cluster、bucket 与 selector diagnostics；
+- selector 探测继续集中在 `ChatGPTDOMAdapter`，不向诊断结果暴露页面正文；
+- 已新增路由回归测试，覆盖 ready、auth/login degraded、selector diagnostics 汇总。
 
-
-Readiness 至少检查：
-
-text
-browser_ready
-chatgpt_page_ready
-authenticated
-composer_ready
-new_chat_ready
+定向测试 `tests/test_routes_chat.py`：6 项通过。`git diff --check`：通过。
 
 
 ## PI-020 基础 metrics
@@ -956,13 +944,13 @@ perf: establish browser request baseline
 | PI-010 | ToolPolicy | P1 | PI-008 | TODO |
 | PI-011 | edit_markdown 安全回归 | P1 | PI-010 | TODO |
 | PI-012 | 领域异常层 | P1 | PI-005/008 | TODO |
-| PI-013 | 宽泛异常审计 | P1 | PI-012 | TODO |
-| PI-014 | 配置分层 | P1 | - | TODO |
+| PI-013 | 宽泛异常审计 | P1 | PI-012 | DONE |
+| PI-014 | 配置分层 | P1 | - | DONE |
 | PI-015 | RequestLimits | P2 | PI-014 | TODO |
-| PI-016 | Session schema versioning | P1 | PI-014 | TODO |
-| PI-017 | Session 并发测试 | P1 | PI-016 | TODO |
-| PI-018 | Session 不变量 | P1 | PI-017 | TODO |
-| PI-019 | health / readiness / diagnostics | P1 | PI-005 | TODO |
+| PI-016 | Session schema versioning | P1 | PI-014 | DONE |
+| PI-017 | Session 并发测试 | P1 | PI-016 | DONE |
+| PI-018 | Session 不变量 | P1 | PI-017 | DONE |
+| PI-019 | health / readiness / diagnostics | P1 | PI-005 | DONE |
 | PI-020 | metrics | P1 | PI-019 | TODO |
 | PI-021 | 日志 correlation | P2 | PI-020 | TODO |
 | PI-022 | 五个黄金 E2E | P1 | PI-005/003 | TODO |
