@@ -499,8 +499,10 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         整段吃掉（同类事故见 doc/code_block_fence.md）。因此正文里只能写内联反引号
         （`tool_call`），不能出现裸的 ```` ``` ````。
         """
+        from chatgpt_web.prompting import EMPTY_TOOL_RESULT_NOTE
         from chatgpt_web.toolcalls import (
             edit_markdown_spec,
+            format_repeat_call_hint,
             format_tool_call_emphasis,
             format_tool_retry_nudge,
             format_tools_instruction,
@@ -511,6 +513,8 @@ class ToolsInstructionDesignTests(unittest.TestCase):
             format_tool_call_emphasis(self.TOOLS),
             edit_markdown_spec(),
             format_tool_retry_nudge(),
+            format_repeat_call_hint([("bash|{}", 2)]),
+            EMPTY_TOOL_RESULT_NOTE,
         ):
             parts = text.split("```")
             self.assertEqual(len(parts) % 2, 1, f"三反引号不成对：\n{text}")

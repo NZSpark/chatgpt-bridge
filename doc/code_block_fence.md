@@ -266,9 +266,17 @@ git status --short
 「执行这条命令」的显式表达，而 `json` 围栏可能只是正文里展示的 JSON 片段——两者风险不同，
 所以只修前者。
 
-落地后（2026-10-07）：`456 passed / 17 skipped`；新增 17 条用例，含端到端用例
-`test_routes_chat::test_bash_fence_reply_is_recovered_as_tool_call`（把
-`SHELL_FENCE_FALLBACK=false` 时该用例在 `finish_reason` 上失败，证明它有区分力，不是恒真断言）。
+落地后（2026-10-07）：`458 passed / 17 skipped`；新增 19 条用例，含两条端到端/流式用例
+（`test_routes_chat::test_bash_fence_reply_is_recovered_as_tool_call` 与
+`test_streaming::test_shell_fence_stream_is_recovered_as_tool_call`）。把
+`SHELL_FENCE_FALLBACK=false` 时前者在 `finish_reason` 上失败，证明它有区分力，不是恒真断言。
+
+**顺带修掉一个同类隐 bug**：`edit_markdown_spec()` 里有一句 `Do not touch ``` fence lines…`
+——这是**未配对**的三反引号（提示词正文里的裸围栏），网页版会把它当围栏开始，可能把
+该块之后的内容整段吞进代码块。已改为文字描述（「triple-backtick lines」），并用
+
+`test_prompting::test_fence_delimiters_are_paired` 锁定：四块注入文本 + 空输出说明 +
+重复调用提醒里，三反引号必须成对且配对之间只能是标签行 + JSON。
 
 ### 5.2 解析侧：判定链与兼容矩阵
 
@@ -454,6 +462,8 @@ tool_call
 | `test_prompting::test_instruction_forbids_bare_bash_code_block`（§5.6） | 两块提示词都写明「命令永远写在 `command` 参数里」 |
 | `test_toolcalls::ShellFenceRepairTests`（15 条，§5.6） | 用户原例被恢复；`sh`→唯一 shell 工具（键名按声明）；歧义/多围栏/无参数表/非 shell 标签/开关关闭时**不**执行；`tool_call` 围栏在场时优先 |
 | `test_routes_chat::test_bash_fence_reply_is_recovered_as_tool_call`（§5.6） | 端到端：非流式路径把 `bash` 围栏回复返回为 `finish_reason=tool_calls` |
+| `test_streaming::test_shell_fence_stream_is_recovered_as_tool_call`（§5.6） | 流式路径（Pi 默认）同样给出 tool_calls 分片与 `finish_reason=tool_calls` |
+| `test_prompting::test_fence_delimiters_are_paired`（§5.6） | 注入文本里的三反引号必须成对（防裸围栏吃掉后续指令） |
 | `test_tool_injection::RetryNudgeTests::test_nudge_demands_single_tool_call` | 纠偏文本含围栏模板，且 `tool_call_predicate(TOOLS)` 对其返回 True |
 
 ### 7.2 区分力实验（证明用例不是「必然通过」）

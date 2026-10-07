@@ -331,7 +331,8 @@ def edit_markdown_spec() -> str:
         "The line numbers and \"...\" above are placeholders: replace them with the real path,",
         "start/end and replacement text.",
         "start/end are 1-based inclusive line numbers; content outside the range (including blank lines, indentation, trailing whitespace) is preserved verbatim.",
-        "Do not touch ``` fence lines; content inside a fence does not participate in structural positioning.",
+        "Do not touch the fence lines themselves (triple-backtick lines); content inside a fence",
+        "does not participate in structural positioning.",
         "By default only a diff is returned (dry-run); pass write=true to persist to disk.",
     ])
 

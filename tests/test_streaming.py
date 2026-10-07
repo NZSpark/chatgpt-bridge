@@ -166,6 +166,36 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(events[0]["object"], "chat.completion.chunk")
         self.assertTrue(events[0]["id"].startswith("chatcmpl-"))
 
+    def test_shell_fence_stream_is_recovered_as_tool_call(self):
+        """用户报的原例（流式，Pi 默认 stream=true）。
+
+        模型把命令回成 `bash` 代码块而不是 tool_call JSON 时，SSE 里也必须出现
+        tool_calls 分片与 finish_reason=tool_calls，否则客户端会把回复当纯文本。
+        注意工具定义必须带 `command` 参数：没有参数 schema 时桥不会猜键名。
+        """
+        req = self._request(
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }],
+            tool_choice="auto",
+        )
+        reply = "```bash\ngit status --short\n```"
+        events = _events(_collect(_stream_chat_completion(req, "p", FakeDriver(reply))))
+        tool_chunks = [
+            e for e in events
+            if "choices" in e and e["choices"][0]["delta"].get("tool_calls")
+        ]
+        self.assertTrue(tool_chunks, events)
+        self.assertIn("tool_calls", finishes_of(events))
+
     def test_tool_call_stream(self):
         req = self._request(
             tools=[{"type": "function", "function": {"name": "get_weather"}}],
