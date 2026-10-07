@@ -24,6 +24,68 @@ _warned_bad_state = False
 # 状态文件是「整个文件读改写」的共享资源；跨线程（asyncio.to_thread）并发
 # 落盘时必须串行化，否则后写会把先写的整个覆盖掉（T3.3 验收用例）。
 _STATE_FILE_LOCK = threading.Lock()
+STATE_SCHEMA_VERSION = 2
+_SESSION_FIELDS = frozenset({
+    "has_history",
+    "turns",
+    "est_tokens",
+    "cap_hit",
+    "pending_rotation",
+    "last_error",
+    "cap_failures",
+    "updated_at",
+})
+
+
+def _empty_state_document() -> Dict[str, Any]:
+    return {"schema_version": STATE_SCHEMA_VERSION, "sessions": {}}
+
+
+def _validate_state_document(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a v2 state document without changing session payload semantics."""
+    if not isinstance(data, dict):
+        raise ValueError("session state root must be an object")
+    version = data.get("schema_version")
+    if version != STATE_SCHEMA_VERSION:
+        raise ValueError(f"unsupported session state schema_version: {version!r}")
+    sessions = data.get("sessions")
+    if sessions is None:
+        data["sessions"] = {}
+    elif not isinstance(sessions, dict):
+        raise ValueError("session state sessions must be an object")
+    else:
+        data["sessions"] = {
+            key: value
+            for key, value in sessions.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+    return data
+
+
+def _migrate_state_document(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate the legacy root/default + sessions format to schema v2."""
+    if not isinstance(data, dict):
+        raise ValueError("session state root must be an object")
+    version = data.get("schema_version")
+    legacy_version = data.get("version")
+    if version == STATE_SCHEMA_VERSION:
+        return _validate_state_document(dict(data))
+    if version not in (None, 1) or legacy_version not in (None, 1):
+        raise ValueError(
+            f"unsupported session state schema marker: {version!r}/{legacy_version!r}"
+        )
+
+    migrated = dict(data)
+    migrated.pop("version", None)
+    migrated["schema_version"] = STATE_SCHEMA_VERSION
+    sessions = migrated.get("sessions")
+    migrated["sessions"] = dict(sessions) if isinstance(sessions, dict) else {}
+    logger.info("会话状态文件已由旧格式迁移到 schema v%d。", STATE_SCHEMA_VERSION)
+    return _validate_state_document(migrated)
+
+
+def _session_payload_only(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: payload[key] for key in _SESSION_FIELDS if key in payload}
 
 
 @dataclass
@@ -180,23 +242,23 @@ class SessionStoreMixin:
             return {}
         try:
             data = json.loads(raw)
+            return _migrate_state_document(data)
         except Exception:  # noqa: BLE001
             if not _warned_bad_state:
                 _warned_bad_state = True
-                logger.warning("会话状态文件解析失败（%s）：本次按空状态继续。",
+                logger.warning("会话状态文件解析失败或迁移失败（%s）：本次按空状态继续。",
                                config.SESSION_FILE, exc_info=True)
-            return {}
-        return data if isinstance(data, dict) else {}
+            return _empty_state_document()
 
     def _load_session_state(self, key: Optional[str] = None) -> Dict[str, Any]:
         """读取某个会话桶的状态（轮数 / 体积 / 是否到顶 / 上次错误）。"""
         bucket = key or DEFAULT_SESSION_KEY
         data = self._read_state_file()
         if bucket == DEFAULT_SESSION_KEY:
-            return {k: v for k, v in data.items() if k not in ("sessions", "version")}
+            return _session_payload_only(data)
         extra = data.get("sessions")
         own = extra.get(bucket) if isinstance(extra, dict) else None
-        return own if isinstance(own, dict) else {}
+        return _session_payload_only(own) if isinstance(own, dict) else {}
 
     def _save_session_state(self, key: Optional[str] = None) -> None:
         """落盘某个会话桶的状态，供轮转决策与跨重启延续预算使用。
@@ -215,10 +277,15 @@ class SessionStoreMixin:
             extra = data.get("sessions")
             extra = dict(extra) if isinstance(extra, dict) else {}
             if bucket == DEFAULT_SESSION_KEY:
-                payload["sessions"] = extra
+                payload = {
+                    "schema_version": STATE_SCHEMA_VERSION,
+                    **_session_payload_only(payload),
+                    "sessions": extra,
+                }
             else:
-                extra[bucket] = payload
+                extra[bucket] = _session_payload_only(payload)
                 data = {k: v for k, v in data.items() if k != "sessions"}
+                data["schema_version"] = STATE_SCHEMA_VERSION
                 data["sessions"] = extra
                 payload = data
             try:

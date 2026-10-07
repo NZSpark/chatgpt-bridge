@@ -55,6 +55,7 @@ class ConcurrentSaveTests(_DriverCase):
                 thread.join(timeout=10)
 
         data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["schema_version"], session_store.STATE_SCHEMA_VERSION)
         sessions = data.get("sessions") or {}
         self.assertIn("bucket-a", sessions, f"并发落盘丢了桶：{sessions}")
         self.assertIn("bucket-b", sessions)
@@ -71,9 +72,65 @@ class ConcurrentSaveTests(_DriverCase):
 
         asyncio.run(scenario())
         data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["schema_version"], session_store.STATE_SCHEMA_VERSION)
         sessions = data.get("sessions") or {}
         for bucket in ("async-a", "async-b", "async-c"):
             self.assertIn(bucket, sessions, f"asyncio.to_thread 并发落盘丢了 {bucket}")
+
+
+class SchemaMigrationTests(_DriverCase):
+    def test_legacy_state_is_migrated_and_preserved(self) -> None:
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "has_history": True,
+                    "turns": 4,
+                    "est_tokens": 123,
+                    "cap_hit": False,
+                    "sessions": {"legacy-b": {"turns": 9, "has_history": True}},
+                    "version": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        default = self.driver._load_session_state()
+        bucket = self.driver._load_session_state("legacy-b")
+        data = self.driver._read_state_file()
+
+        self.assertEqual(default["turns"], 4)
+        self.assertEqual(bucket["turns"], 9)
+        self.assertEqual(data["schema_version"], session_store.STATE_SCHEMA_VERSION)
+        self.assertNotIn("version", data)
+
+        self.driver._state("legacy-b").turns = 10
+        self.driver._save_session_state("legacy-b")
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["schema_version"], session_store.STATE_SCHEMA_VERSION)
+        self.assertEqual(saved["sessions"]["legacy-b"]["turns"], 10)
+        self.assertEqual(saved["turns"], 4)
+
+    def test_unsupported_schema_is_rejected_without_polluting_state(self) -> None:
+        self.state_file.write_text(
+            json.dumps({"schema_version": 99, "sessions": {"bad": {"turns": 99}}}),
+            encoding="utf-8",
+        )
+        with mock.patch.object(session_store, "_warned_bad_state", False), \
+                self.assertLogs("chatgpt_web.session_store", level="WARNING") as captured:
+            data = self.driver._read_state_file()
+        self.assertEqual(data, {"schema_version": session_store.STATE_SCHEMA_VERSION, "sessions": {}})
+        self.assertTrue(any("迁移失败" in record.getMessage() for record in captured.records))
+
+    def test_v2_unknown_session_payload_fields_are_ignored_on_load(self) -> None:
+        self.state_file.write_text(
+            json.dumps({
+                "schema_version": session_store.STATE_SCHEMA_VERSION,
+                "sessions": {"bucket": {"turns": 5, "unexpected": "discard"}},
+            }),
+            encoding="utf-8",
+        )
+        payload = self.driver._load_session_state("bucket")
+        self.assertEqual(payload, {"turns": 5})
 
 
 class AtomicWriteTests(_DriverCase):
@@ -110,6 +167,7 @@ class AtomicWriteTests(_DriverCase):
         # 恢复写入后状态正常
         self._write("bucket-a", 2)
         data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["schema_version"], session_store.STATE_SCHEMA_VERSION)
         self.assertEqual(data["sessions"]["bucket-a"]["turns"], 2)
 
 

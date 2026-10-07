@@ -9,7 +9,9 @@
 import ipaddress
 import logging
 import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -417,3 +419,210 @@ THINK_MODE_TEXTS = env_str("THINK_MODE_TEXTS", "think||思考")
 # 语言头就不会混进提取出的代码。
 CODE_BLOCK_SELECTOR = env_str("CODE_BLOCK_SELECTOR", '[class*="CodeBlock"], pre')
 CODE_TAG_SELECTOR = env_str("CODE_TAG_SELECTOR", "[data-language], code")
+
+
+# ==================== Typed configuration layers ====================
+# `config.<NAME>` remains the compatibility facade used by the existing codebase.
+# These immutable snapshots provide typed boundaries for new code and diagnostics.
+
+@dataclass(frozen=True)
+class ServerConfig:
+    host: str
+    port: int
+    reset_token: str
+    enable_responses_api: bool
+    session_key_header: str
+
+
+@dataclass(frozen=True)
+class BrowserConfig:
+    user_data_dir: str
+    headless: bool
+    ready_timeout_ms: int
+    fill_timeout_ms: int
+    fill_retries: int
+    input_selectors: tuple[str, ...]
+    send_button_selectors: tuple[str, ...]
+    response_selectors: str
+    ready_selector: str
+    new_chat_selector: str
+    think_mode_default: bool
+    think_mode_selector: str
+    think_mode_texts: str
+    code_block_selector: str
+    code_tag_selector: str
+
+
+@dataclass(frozen=True)
+class SessionConfig:
+    session_file: str
+    session_scoping: bool
+    session_scoping_by_ua: bool
+    session_key_max_len: int
+    max_session_buckets: int
+    max_session_state_cache: int
+    bucket_idle_ttl_s: float
+    parallel_buckets: bool
+    bucket_lock_timeout_s: float
+    bucket_lock_queue: bool
+    session_max_turns: int
+    session_max_tokens: int
+    new_session_on_start: bool
+
+
+@dataclass(frozen=True)
+class CompletionConfig:
+    chat_keepalive_s: float
+    response_timeout_s: float
+    response_timeout_extend_s: float
+    poll_interval_s: float
+    stable_polls: int
+    len_stable_polls: int
+    resume_quiet_polls: int
+    stall_polls: int
+    max_upstream_retries: int
+    retry_backoff_s: float
+    cap_check_every: int
+    seed_max_chars: int
+    seed_system_max_chars: int
+    seed_env_note: str
+    prompt_max_chars: int
+    tool_nudge_until_first_call: bool
+    tools_instruction_verbose: bool
+    tools_desc_max_chars: int
+
+
+@dataclass(frozen=True)
+class ToolConfig:
+    tool_result_max_chars: int
+    edit_markdown_local: bool
+    edit_markdown_backup_dir: str
+    edit_markdown_root: str
+    edit_markdown_write: bool
+    edit_markdown_max_file_bytes: int
+    responses_tool_buffer: bool
+
+
+@dataclass(frozen=True)
+class StorageConfig:
+    output_dir: str
+    save_files: bool
+    output_max_files: int
+    output_max_age_days: float
+    task_snapshot_enabled: bool
+    task_file_dir: str
+    task_namespace: str
+    task_goal_max_chars: int
+    task_keep_messages: int
+    task_recent_item_max_chars: int
+
+
+@dataclass(frozen=True)
+class DebugConfig:
+    debug: bool
+
+
+@dataclass(frozen=True)
+class ConfigBundle:
+    server: ServerConfig
+    browser: BrowserConfig
+    session: SessionConfig
+    completion: CompletionConfig
+    tool: ToolConfig
+    storage: StorageConfig
+    debug: DebugConfig
+
+
+def build_config_bundle() -> ConfigBundle:
+    """Build a typed snapshot from the legacy module-level configuration facade."""
+    return ConfigBundle(
+        server=ServerConfig(
+            host=HOST,
+            port=PORT,
+            reset_token=RESET_TOKEN,
+            enable_responses_api=ENABLE_RESPONSES_API,
+            session_key_header=SESSION_KEY_HEADER,
+        ),
+        browser=BrowserConfig(
+            user_data_dir=USER_DATA_DIR,
+            headless=HEADLESS,
+            ready_timeout_ms=READY_TIMEOUT_MS,
+            fill_timeout_ms=FILL_TIMEOUT_MS,
+            fill_retries=FILL_RETRIES,
+            input_selectors=tuple(INPUT_SELECTORS),
+            send_button_selectors=tuple(SEND_BUTTON_SELECTORS),
+            response_selectors=RESPONSE_SELECTORS,
+            ready_selector=READY_SELECTOR,
+            new_chat_selector=NEW_CHAT_SELECTOR,
+            think_mode_default=THINK_MODE_DEFAULT,
+            think_mode_selector=THINK_MODE_SELECTOR,
+            think_mode_texts=THINK_MODE_TEXTS,
+            code_block_selector=CODE_BLOCK_SELECTOR,
+            code_tag_selector=CODE_TAG_SELECTOR,
+        ),
+        session=SessionConfig(
+            session_file=str(SESSION_FILE),
+            session_scoping=SESSION_SCOPING,
+            session_scoping_by_ua=SESSION_SCOPING_BY_UA,
+            session_key_max_len=SESSION_KEY_MAX_LEN,
+            max_session_buckets=MAX_SESSION_BUCKETS,
+            max_session_state_cache=MAX_SESSION_STATE_CACHE,
+            bucket_idle_ttl_s=BUCKET_IDLE_TTL_S,
+            parallel_buckets=PARALLEL_BUCKETS,
+            bucket_lock_timeout_s=BUCKET_LOCK_TIMEOUT_S,
+            bucket_lock_queue=BUCKET_LOCK_QUEUE,
+            session_max_turns=SESSION_MAX_TURNS,
+            session_max_tokens=SESSION_MAX_TOKENS,
+            new_session_on_start=NEW_SESSION_ON_START,
+        ),
+        completion=CompletionConfig(
+            chat_keepalive_s=CHAT_KEEPALIVE_S,
+            response_timeout_s=RESPONSE_TIMEOUT_S,
+            response_timeout_extend_s=RESPONSE_TIMEOUT_EXTEND_S,
+            poll_interval_s=POLL_INTERVAL_S,
+            stable_polls=STABLE_POLLS,
+            len_stable_polls=LEN_STABLE_POLLS,
+            resume_quiet_polls=RESUME_QUIET_POLLS,
+            stall_polls=STALL_POLLS,
+            max_upstream_retries=MAX_UPSTREAM_RETRIES,
+            retry_backoff_s=RETRY_BACKOFF_S,
+            cap_check_every=CAP_CHECK_EVERY,
+            seed_max_chars=SEED_MAX_CHARS,
+            seed_system_max_chars=SEED_SYSTEM_MAX_CHARS,
+            seed_env_note=SEED_ENV_NOTE,
+            prompt_max_chars=PROMPT_MAX_CHARS,
+            tool_nudge_until_first_call=TOOL_NUDGE_UNTIL_FIRST_CALL,
+            tools_instruction_verbose=TOOLS_INSTRUCTION_VERBOSE,
+            tools_desc_max_chars=TOOLS_DESC_MAX_CHARS,
+        ),
+        tool=ToolConfig(
+            tool_result_max_chars=TOOL_RESULT_MAX_CHARS,
+            edit_markdown_local=EDIT_MARKDOWN_LOCAL,
+            edit_markdown_backup_dir=EDIT_MARKDOWN_BACKUP_DIR,
+            edit_markdown_root=EDIT_MARKDOWN_ROOT,
+            edit_markdown_write=EDIT_MARKDOWN_WRITE,
+            edit_markdown_max_file_bytes=EDIT_MARKDOWN_MAX_FILE_BYTES,
+            responses_tool_buffer=RESPONSES_TOOL_BUFFER,
+        ),
+        storage=StorageConfig(
+            output_dir=OUTPUT_DIR,
+            save_files=SAVE_FILES,
+            output_max_files=OUTPUT_MAX_FILES,
+            output_max_age_days=OUTPUT_MAX_AGE_DAYS,
+            task_snapshot_enabled=TASK_SNAPSHOT_ENABLED,
+            task_file_dir=TASK_FILE_DIR,
+            task_namespace=TASK_NAMESPACE,
+            task_goal_max_chars=TASK_GOAL_MAX_CHARS,
+            task_keep_messages=TASK_KEEP_MESSAGES,
+            task_recent_item_max_chars=TASK_RECENT_ITEM_MAX_CHARS,
+        ),
+        debug=DebugConfig(debug=DEBUG),
+    )
+
+
+def effective_config_summary() -> Dict[str, Any]:
+    """Return a JSON-serializable effective configuration summary with secrets redacted."""
+    summary = asdict(build_config_bundle())
+    if summary["server"]["reset_token"]:
+        summary["server"]["reset_token"] = "***"
+    return summary

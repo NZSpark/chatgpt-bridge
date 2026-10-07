@@ -1,5 +1,6 @@
-"""配置层回归测试：默认值、.env 覆盖、`||` 回退链解析、布尔/数值容错。"""
+"""配置层回归测试：默认值、.env 覆盖、回退链、typed config 与摘要。"""
 
+import json
 import os
 import sys
 import unittest
@@ -75,8 +76,6 @@ class DefaultValueTests(unittest.TestCase):
         joined = " ".join(config.INPUT_SELECTORS) + config.READY_SELECTOR + config.NEW_CHAT_SELECTOR
         self.assertNotIn("ds-markdown", joined)
         self.assertNotIn("deepseek", joined.lower())
-        # 真实 DOM 校准后：composer 是 ProseMirror（#prompt-textarea），
-        # READY_SELECTOR 覆盖它就绪即可，不再强求含 contenteditable 字面量。
         self.assertTrue(
             "prompt-textarea" in config.READY_SELECTOR
             or "ProseMirror" in config.READY_SELECTOR
@@ -84,17 +83,10 @@ class DefaultValueTests(unittest.TestCase):
         )
 
     def test_response_selectors_are_chatgpt(self):
-        # 老版 DOM 钩子保留（部分账号/灰度仍是旧 UI），新版钩子必须有：
-        # 2026-10-06 线上改版后助手回复容器是 <div class="MarkdownRoot-<hash>"
-        # data-markdown-text-style>，旧属性（author-role / message-content /
-        # .markdown）逐条命中数全为 0 → 轮询 nodes=0 空转到超时、拿不到回复。
         self.assertIn("message-content", config.RESPONSE_SELECTORS)
         self.assertIn("[data-markdown-text-style]", config.RESPONSE_SELECTORS)
         self.assertIn('class*="MarkdownRoot"', config.RESPONSE_SELECTORS)
-        # 用户消息容器（[data-user-message-bubble] / *-user-message）绝不能选进来，
-        # 否则会把用户自己发的内容当成回复。
         self.assertNotIn("user-message", config.RESPONSE_SELECTORS)
-        # 直接喂 page.query_selector_all：逗号分隔的 CSS 列表，不能混入 "||"。
         self.assertNotIn("||", config.RESPONSE_SELECTORS)
         for selector in config.RESPONSE_SELECTORS.split(","):
             self.assertTrue(selector.strip(), config.RESPONSE_SELECTORS)
@@ -116,6 +108,38 @@ class EnvFileTests(unittest.TestCase):
 
     def test_load_missing_file_is_noop(self):
         config._load_env_file(Path("/nonexistent/path/to/.env"))
+
+
+class TypedConfigTests(unittest.TestCase):
+    def test_build_config_bundle_is_typed_and_read_only(self):
+        bundle = config.build_config_bundle()
+        self.assertIsInstance(bundle, config.ConfigBundle)
+        self.assertIsInstance(bundle.server, config.ServerConfig)
+        self.assertIsInstance(bundle.browser, config.BrowserConfig)
+        self.assertIsInstance(bundle.session, config.SessionConfig)
+        self.assertIsInstance(bundle.completion, config.CompletionConfig)
+        self.assertIsInstance(bundle.tool, config.ToolConfig)
+        self.assertIsInstance(bundle.storage, config.StorageConfig)
+        self.assertIsInstance(bundle.debug, config.DebugConfig)
+        with self.assertRaises(Exception):
+            bundle.server.port = 9999
+
+    def test_build_config_bundle_reflects_legacy_facade(self):
+        with unittest.mock.patch.object(config, "HOST", "192.0.2.10"), unittest.mock.patch.object(config, "FILL_RETRIES", 7), unittest.mock.patch.object(config, "EDIT_MARKDOWN_WRITE", True):
+            bundle = config.build_config_bundle()
+            self.assertEqual(bundle.server.host, "192.0.2.10")
+            self.assertEqual(bundle.browser.fill_retries, 7)
+            self.assertTrue(bundle.tool.edit_markdown_write)
+
+    def test_effective_config_summary_redacts_reset_token(self):
+        with unittest.mock.patch.object(config, "RESET_TOKEN", "secret-token"):
+            summary = config.effective_config_summary()
+        self.assertEqual(summary["server"]["reset_token"], "***")
+        self.assertEqual(summary["server"]["host"], config.HOST)
+        self.assertIsInstance(summary["browser"]["input_selectors"], tuple)
+
+    def test_effective_config_summary_is_json_serializable(self):
+        json.dumps(config.effective_config_summary())
 
 
 if __name__ == "__main__":
