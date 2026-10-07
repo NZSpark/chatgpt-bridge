@@ -106,6 +106,7 @@ from chatgpt_web.toolcalls import (  # noqa: F401
     _normalize_tool_entry,
     _tool_names,
     format_tools_instruction,
+    parse_reply_tool_calls,
     parse_tool_calls,
     to_tool_call_models,
 )

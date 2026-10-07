@@ -225,6 +225,51 @@ Rules:
 
 **未做（有意）**：`parse_tool_calls` 仍保留行首 `TOOL_CALL:` 的历史兼容分支（老客户端 / 历史回放），只是不再在提示词里宣传它。
 
+### 5.6 shell 围栏修复：模型把命令写成 `bash` 代码块（2026-10-07）
+
+现象（用户实测）：提示词已要求 `tool_call` 围栏，模型回的却是
+
+````text
+```bash
+git status --short
+```
+````
+
+旧解析链只认 `tool_call` 系列载体 → 解析出 0 条 → 非流式路径把回复当纯文本返回
+（`finish_reason=stop`）、流式路径一个 tool_call 事件都没有，客户端以为任务结束；
+日志里除了「模型根本没想调用」之外没有任何线索。
+
+两层修复：
+
+1. **提示词**：两块注入指令都新增一句「A shell command always travels as the `command` value
+   inside the tool_call JSON: never reply with the bare command in a `bash` style code block.」
+   注意措辞里**不写** ```` ```bash ```` 字面形态，两点原因：列举即示范（§5.5），而且提示词里
+   出现未配对的三反引号会被网页版当成围栏开始渲染，把后半段指令吃掉。
+2. **解析层兜底**：`_shell_fence_calls()` 把 shell 类标签的围栏恢复成一条调用，开关
+   `SHELL_FENCE_FALLBACK`（默认 true）。前提**全部**满足才恢复：
+   - 标签 ∈ {bash, sh, shell, zsh, fish, cmd, powershell, ps1, console, terminal}；
+   - 全篇只有一个这样的围栏（一份回复只跑一条命令）；
+   - 能**唯一**映射到客户端工具集里的一个 shell 类工具（复用 DSML 的名字映射：
+     `sh` → `exec_command`；多候选就不猜）；
+   - 知道命令写进哪个参数（`tool_parameter_names()`：`command`/`cmd`/... 优先，
+     否则只有唯一参数键时才敢用）；
+   - 回复里没有任何 `tool_call` 尝试（围栏或历史标记）——那是格式错误，不是「近似执行」的理由。
+   任何一条不满足 → 保持旧行为（不解析），宁可让模型下一轮重出。围栏里若其实是调用 JSON
+   （标签写错、内容对）也按调用收下。
+
+配套两个公开入口：`tool_parameter_names(tools)`（工具名 → 参数键）与
+`parse_reply_tool_calls(text, tools)`（server / streaming / responses 的统一调用点）；
+`tool_call_predicate` 也改用它——判定与最终解析必须同源，否则修出来的调用会被判成
+「没调用工具」而触发一次多余的纠偏。
+
+**关键取舍**：**不**放宽 `tool_call` 标签约束（§4.3 的 I3 安全面不变）。`bash` 围栏是模型对
+「执行这条命令」的显式表达，而 `json` 围栏可能只是正文里展示的 JSON 片段——两者风险不同，
+所以只修前者。
+
+落地后（2026-10-07）：`456 passed / 17 skipped`；新增 17 条用例，含端到端用例
+`test_routes_chat::test_bash_fence_reply_is_recovered_as_tool_call`（把
+`SHELL_FENCE_FALLBACK=false` 时该用例在 `finish_reason` 上失败，证明它有区分力，不是恒真断言）。
+
 ### 5.2 解析侧：判定链与兼容矩阵
 
 `parse_tool_calls`（`toolcalls.py:947`）的既有优先级链**未改动**：
@@ -406,6 +451,9 @@ tool_call
 | `test_prompting::test_example_uses_required_params_with_declared_types`（§5.5） | 示例只列 `required` 参数，整数参数不得写成字符串占位 |
 | `test_tool_injection::ExampleShapeTests`（§5.5） | `edit_markdown` 说明 / 强调块 / 纠偏块里的示例必须能被 `json.loads` + `parse_tool_calls` 往返 |
 | `test_toolcalls::DescriptionTruncationTests`（§5.5） | 描述截断优先落在句末/空白处，不得切碎单词 |
+| `test_prompting::test_instruction_forbids_bare_bash_code_block`（§5.6） | 两块提示词都写明「命令永远写在 `command` 参数里」 |
+| `test_toolcalls::ShellFenceRepairTests`（15 条，§5.6） | 用户原例被恢复；`sh`→唯一 shell 工具（键名按声明）；歧义/多围栏/无参数表/非 shell 标签/开关关闭时**不**执行；`tool_call` 围栏在场时优先 |
+| `test_routes_chat::test_bash_fence_reply_is_recovered_as_tool_call`（§5.6） | 端到端：非流式路径把 `bash` 围栏回复返回为 `finish_reason=tool_calls` |
 | `test_tool_injection::RetryNudgeTests::test_nudge_demands_single_tool_call` | 纠偏文本含围栏模板，且 `tool_call_predicate(TOOLS)` 对其返回 True |
 
 ### 7.2 区分力实验（证明用例不是「必然通过」）
