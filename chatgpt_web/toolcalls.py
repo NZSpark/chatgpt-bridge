@@ -573,8 +573,10 @@ def format_tool_retry_nudge() -> str:
     """
     return "\n".join([
         f"{RETRY_HEADER} Your previous reply did not call any tool.",
-        "You have NO direct access to a shell, filesystem or the internet. Answering from",
-        "your own knowledge instead of calling a tool means the task FAILED.",
+        "You are not expected to have tools of your own: this conversation is read by a local",
+        "client on the user's machine, and it executes whatever tool call you write, then sends the",
+        "real output back to you. Refusing because you \"have no tools\", or answering from your own",
+        "knowledge instead of calling a tool, means the task FAILED.",
         "Reply now with EXACTLY ONE fenced code block in this form (no other text):",
         "```tool_call",
         '{"name": "...", "arguments": {"param": "..."}}',
@@ -667,7 +669,7 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
     实测（联网真机验证）：模型很容易**无视工具、直接凭知识作答**——例如问它
     “查看当前目录”时，它会直接编一份 ls 输出，parse 结果为空。让模型真正调用
     工具的关键有四点：
-      1. 明确切断退路：“你没有直接的 shell/文件系统访问，唯一方式是输出
+      1. 明确切断退路：“你没有别的 shell/文件系统访问，唯一的方式是输出
          ```` ```tool_call ```` 围栏块，直接作答＝任务失败”；
       2. 给一个**具体到参数**的调用示例（只给格式模板不够）；
       3. **载体只有一种**。旧措辞在同一段里既说“唯一方式是输出 TOOL_CALL 行”，
@@ -675,16 +677,39 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
          失败。现在全篇不再出现纯文本行的写法，禁止项也只做抽象描述——不给出
          具体形态，避免“负向示范”把禁用写法教给模型（列举即示范）；
       4. 指令要短、聚焦，长段 meta 说明会稀释掉核心要求。
+
+    第 5 点（2026-10-07 用户实测的**拒答**）：旧头段写“You have NO direct access to a
+    shell, filesystem, or the internet”，模型把它读成“本会话没有挂载任何工具”，
+    于是拒绝输出 tool_call（“伪造一个会违反实际工具状态”），并改为让用户
+    “重新连接带执行器的会话”或由它给出补丁让用户手动应用——任务直接失败。
+    第 6 点（同日第二次实测，用户判定）：只把否定句改成肯定句还不够——旧头段写
+    “You are an autonomous agent … the tools … are ALREADY MOUNTED and LIVE”，
+    **“你是 agent / 工具已挂载”恰好把模型推向核对自身工具状态**：它答“当前会话环境里
+    没有实际挂载 read/write/edit/bash 执行工具，所以我不能真实发送 tool_call”。
+    正确定位是：**它就是 LLM，只能产出文本**；真正执行的是“读这条回复的本地客户端”，
+    工具装在客户端那一侧，永远不会出现在它自己的工具列表里。所以头段必须明说
+    “你不需要有工具、工具也不需要挂载在你这一侧”，规则 7 只禁止以此为借口的拒答
+    （不声称“已挂载”）。
+    两条教训合起来：**不要把执行能力说成模型自己的状态**（“你有工具”也好、
+    “你没有访问”也好，都会被当成关于它自身能力的事实题而卡住）；只说“你的文本会被
+    客户端执行、执行结果会作为下一条消息回来”这一条链路。
     因此这里把命令式要求 + 工具清单 + 具体示例放在一起，规则编号精简。
     """
     example_call = _tool_example_call(tools)
 
     lines = [
         TOOLCALL_HEADER,
-        "You are an agent connected to external tools. You have NO direct access to a shell,",
-        "filesystem, or the internet: the ONLY way to perform an action or fetch real data is to",
-        "output a tool call in the format below. If the task needs a tool and you answer from",
-        "your own knowledge instead, the task FAILS. Never fabricate tool output.",
+        "You are a language model: the only thing you produce is text, and you cannot run",
+        "anything yourself. This conversation is read by a small local client running on the",
+        "user's own computer - when you write a tool call in the format below, that client",
+        "executes it there for real and returns the real output to you as your next message.",
+        "No tool has to be installed or mounted on your side, and the tools below will never",
+        "appear in your built-in tool list - that is expected and normal, because the client",
+        "takes the call out of your reply text.",
+        "Writing a tool call is therefore not fabrication and not a false claim about your",
+        "capabilities: you are writing the command and the client runs it.",
+        "That is the only way you take real action here. If the task needs real action or data and you",
+        "answer from your own knowledge instead, the task FAILS. Never fabricate tool output.",
         "",
         "A tool call is ONE fenced code block labelled exactly `tool_call`, containing one JSON",
         "object and nothing else:",
@@ -692,7 +717,7 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "(Replace the \"...\" placeholders above with the real values. Do NOT copy the example",
         "literally.)",
         "",
-        "Available tools (use these exact names):",
+        "Tools the client (not you) can execute - use these exact names:",
     ]
     from . import config
 
@@ -748,7 +773,12 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "   then issue the next in your next reply.",
         "6. When you call a tool, output ONLY the single fenced block: no explanation, no preamble,",
         "   no text before or after it.",
-        "7. Only if the task needs no tool at all, answer directly with no tool_call block.",
+        "7. Never decline a task on the grounds that you \"have no tools\" or that the tools are not",
+        "   in your own tool list: you are not the one that runs them - the client executes",
+        "   whatever you write, and such a refusal means the task FAILED. Never offer the user",
+        "   instructions or a patch to apply themselves instead of calling a tool. Answer",
+        "   directly (no tool_call block) ONLY when the task genuinely needs no action and no",
+        "   real data.",
         "8. If a tool result is EMPTY (e.g. shows \"(no output)\"), the command SUCCEEDED and",
         "   genuinely printed nothing. That is a valid result, not a failure: move on to the NEXT",
         "   command or give the final answer. Never re-run the exact same command and never assume",
@@ -781,6 +811,8 @@ def format_tool_call_emphasis(tools: Optional[List[Dict[str, Any]]] = None) -> s
         f"{EMPHASIS_HEADER} This is a new session (or one that was just reset); "
         "the following rules stay in effect for this whole session:",
         "You MUST use the provided tools whenever the task needs real action or data; never fabricate tool output.",
+        "You do not run anything yourself: the user's local client executes the tool calls you write and",
+        "sends their real output back as your next message; never reply that you have no tools.",
         "To call a tool, output ONE fenced code block labelled exactly `tool_call`:",
         example_call,
         "(Replace the \"...\" placeholders above with the real values; never copy the example literally.)",

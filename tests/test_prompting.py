@@ -314,7 +314,8 @@ class ToolsInstructionDesignTests(unittest.TestCase):
     背景：实测发现模型很容易「无视工具、直接凭知识作答」——问它查看当前目录，
     它会直接编一份 ls 输出，parse 结果为空。修好之后，以下要素必须保留，
     否则模型又会退回「直接作答」：
-      1. 必须明确切断退路（“你没有直接的 shell/文件系统访问，唯一方式是 TOOL_CALL”）；
+      1. 必须明确切断退路（“工具已挂载并真的执行，唯一能真正做事的方式是发一条
+         工具调用”，并禁止“我没有工具”式拒答）；
       2. 必须给出**具体到参数**的调用示例（只给格式模板不够）；
       3. 工具清单里每个工具的必填参数要带上（默认紧凑形态；完整 schema 由
          TOOLS_INSTRUCTION_VERBOSE 控制）；
@@ -338,11 +339,54 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         from chatgpt_web.toolcalls import format_tools_instruction
 
         text = format_tools_instruction(self.TOOLS)
-        # 切断退路：必须出现“没有直接访问 / 唯一方式”这类硬约束
-        self.assertIn("NO direct access", text)
-        self.assertIn("ONLY way", text)
+        # 切断退路：必须出现「唯一方式 / 任务失败」这类硬约束
+        self.assertIn("only way you take real action", text)
         self.assertIn("FAILS", text)
         self.assertIn("Never fabricate", text)
+
+    def test_instruction_denies_the_no_tools_refusal(self):
+        """必须正面驳回「本会话没挂载工具」的拒答（2026-10-07 用户实测）。
+
+        用户实测：模型看到工具清单后仍回答「当前会话环境里没有实际挂载
+        read/write/edit/bash 执行工具，所以不能真实发送 tool_call」——它把注
+        入的工具说明当成了**它自己**的能力声明，于是去核对自身工具状态。
+
+        因此**不能把执行能力说成模型自己的状态**：既不得写「你是 agent / 工具已
+        挂载」（推它去核对工具列表），也不得写「你没有 shell 访问」（被读成
+        「没工具」）——只描述那条链路：你的文本会被本地客户端执行，真实结果
+        作为下一条消息返回。
+        """
+        from chatgpt_web.toolcalls import (
+            format_tool_call_emphasis,
+            format_tool_retry_nudge,
+            format_tools_instruction,
+        )
+
+        blocks = (
+            format_tools_instruction(self.TOOLS),
+            format_tool_call_emphasis(self.TOOLS),
+            format_tool_retry_nudge(),
+        )
+        for text in blocks:
+            self.assertIn("no tools", text, "未明确禁止「我没有工具」式拒答")
+            # 不得把模型描述成 agent（用户实测：这会让它要求「挂载工具执行器」）。
+            self.assertNotIn("agent", text.lower(), "不应把模型描述成 agent")
+        instruction = blocks[0]
+        self.assertIn("not fabrication", instruction)
+        self.assertIn("local client running on the", instruction)
+        self.assertIn("returns the real output to you as your next message", instruction)
+        # 工具不需要（也无法）挂载在模型这一侧，这是预期现象。
+        self.assertIn("No tool has to be installed or mounted on your side", instruction)
+        # 工具清单是「客户端能执行的」，不是「你拥有的」。
+        self.assertIn("Tools the client (not you) can execute", instruction)
+        # 强调块（播种首轮的兜底）同样只说「客户端执行你写的东西」。
+        self.assertIn(
+            "local client executes the tool calls you write",
+            format_tool_call_emphasis(self.TOOLS),
+        )
+        # “工具不在我的工具列表里”必须被说明成预期现象（模型曾据此拒答）。
+        self.assertIn("appear in your built-in tool list", instruction)
+        self.assertIn("that is expected and normal", instruction)
 
     def test_instruction_contains_concrete_example(self):
         from chatgpt_web.toolcalls import format_tools_instruction
