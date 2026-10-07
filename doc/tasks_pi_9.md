@@ -2,6 +2,33 @@
 
 > 来源：doc/tasks_pi.md # 9. P2：模块拆分
 > 目标：降低单模块复杂度，提高可维护性、测试隔离能力和后续功能扩展能力。
+> 任务分解与逐项验收见 doc/tasks_pi_9_subtasks.md。
+
+---
+
+# 0. 实施状态（2026-10-08 核对代码后更新）
+
+本文档是**建议性设计文档**（不含状态列）；下表为各阶段相对本文建议架构的实际落地情况。
+
+| 阶段 | 文档建议 | 实际落地 | 状态 |
+|---|---|---|---|
+| PI-901 Tool Runtime | `tools/`（parser/validator/policy/executor/ledger/serializer） | 完全一致；`toolcalls.py` 为 facade | ✅ 已完成 |
+| PI-902 Completion | `completion/`（runner/generator/extractor） | `generator`/`extractor` 同名；**`runner.py` 实为 `lifecycle.py`**（承载会话生命周期，task 状态机在 `task_state.py`） | ✅ 已完成（命名差异） |
+| PI-903 Browser | `browser/`（driver/page_pool/dom_adapter/selectors/diagnostics） | `driver`/`dom_adapter`/`selectors`/`diagnostics` 已落地；**`page_pool.py` 未创建**（当前无 page 池需求） | ✅ 已完成（page_pool 暂缺） |
+| PI-904 API Adapter | `api/`（chat_adapter/responses_adapter/streaming_adapter） | 完全一致；`responses.py`/`streaming.py` 为 facade；`server.py` 仅剩 HTTP（717→566 行） | ✅ 已完成 |
+| PI-905 Session | `session/`（store/schema/migration/lock） | 完全一致；`session_store.py` 为 facade | ✅ 已完成 |
+| PI-906 Config | `config/`（server/browser/tools/limits） | 一致，且额外提供 `_core.py`/`debug.py`/`session.py`；`config/__init__.py` 为兼容 facade | ✅ 已完成 |
+
+与建议架构的两处差异（均已在 subtasks 文档中说明）：
+
+- `completion/runner.py` → 实际命名 `lifecycle.py`（真实代码里 completion 承载的是
+  **会话生命周期**而非 task 生命周期）；
+- `browser/page_pool.py` → 未创建；当前 driver 直接管理 context/page 生命周期，
+  尚无 page 池化需求，待有多页/并发复用场景时再引入。
+
+最终目标（第 12 节「API 层不了解浏览器细节 / Browser 层不了解 OpenAI 协议 /
+Tool 层不了解网页实现 / Session 层不了解请求协议 / Config 层统一提供运行参数」
+已随六阶段拆分达成。
 
 ---
 
@@ -38,13 +65,13 @@ chatgpt_web/
 │
 ├── browser/
 │   ├── driver.py
-│   ├── page_pool.py
+│   ├── page_pool.py      # 建议项，当前未创建（见 §0 差异说明）
 │   ├── dom_adapter.py
 │   ├── selectors.py
 │   └── diagnostics.py
 │
 ├── completion/
-│   ├── runner.py
+│   ├── runner.py         # 实际落地为 lifecycle.py（见 §0 差异说明）
 │   ├── generator.py
 │   └── extractor.py
 │
@@ -404,14 +431,14 @@ DebugConfig
 
 推荐顺序：
 
-|阶段|模块|风险|优先级|
-|-|-|-|-|
-|1|tools|低|最高|
-|2|completion|中|高|
-|3|browser|中|高|
-|4|api adapter|低|中|
-|5|session|低|中|
-|6|config|低|中|
+|阶段|模块|风险|优先级|状态|
+|-|-|-|-|-|
+|1|tools|低|最高|✅ 已完成|
+|2|completion|中|高|✅ 已完成|
+|3|browser|中|高|✅ 已完成（page_pool 暂缺）|
+|4|api adapter|低|中|✅ 已完成|
+|5|session|低|中|✅ 已完成|
+|6|config|低|中|✅ 已完成|
 
 ---
 

@@ -484,6 +484,13 @@ browser restart while request waits
 
 状态：DONE｜优先级：P1｜依赖：PI-019
 
+> 核对（2026-10-08）：`chatgpt_web/metrics.py` 已定义全部 counter
+> （`request_total` / `request_retry_total` / `browser_selector_miss_total` /
+> `tool_call_total` 等）与全部 latency
+> （`request_latency` / `browser_generation_latency` / `reply_extraction_latency` /
+> `tool_execution_latency` / `session_recovery_latency`）；`tests/test_metrics.py` 覆盖。
+> §15 汇总表此前误标为 TODO，已修正。
+
 已完成第一阶段进程内 metrics：
 
 - `/metrics` 提供运行时 metrics 快照，并并入 `/diagnostics`；
@@ -580,7 +587,13 @@ E5 必须检查输入框最后一次被填充的内容，确保 bridge 没有追
 
 ## PI-023 Property / invariant tests
 
-状态：TODO｜优先级：P1｜依赖：PI-007、PI-016、PI-017
+状态：TODO（部分覆盖）｜优先级：P1｜依赖：PI-007、PI-016、PI-017
+
+> 核对（2026-10-08）：第 3 项「session 历史不污染」已由
+> `tests/test_session_invariants.py` 覆盖；其余 5 项（normalize(parse(x)) 噪声、
+> edit path 恒在 root、自动 nudge 最多一次、执行后 final plain text 不 nudge、
+> 同 tool_call_id 不重复执行）目前散落在 `test_toolcalls.py` /
+> `test_streaming.py` 的定向用例中，尚未抽成统一的 property 测试文件。
 
 至少覆盖：
 
@@ -593,7 +606,12 @@ E5 必须检查输入框最后一次被填充的内容，确保 bridge 没有追
 
 ## PI-024 API contract tests
 
-状态：TODO｜优先级：P2｜依赖：PI-003、PI-004
+状态：TODO（部分覆盖）｜优先级：P2｜依赖：PI-003、PI-004
+
+> 核对（2026-10-08）：Chat SSE 契约已由 `tests/test_streaming.py` 覆盖；
+> Responses 事件契约由 `tests/test_responses.py` 覆盖；adapter 层契约由
+> `tests/test_api_package.py` 覆盖。尚未有统一命名的 contract 测试文件，
+> 也缺 usage / errors 的端到端契约断言。
 
 ### Chat Completions
 
@@ -621,18 +639,16 @@ E5 必须检查输入框最后一次被填充的内容，确保 bridge 没有追
 
 ## PI-025 拆分 toolcalls.py
 
-状态：TODO｜优先级：P2｜依赖：PI-007、PI-008、PI-010
+状态：DONE（由 P2 模块拆分计划 PI-901 吸收）｜优先级：P2｜依赖：PI-007、PI-008、PI-010
 
-建议：
+> 说明：本任务的拆分目标已在 doc/tasks_pi_9_subtasks.md 的 PI-901 中完成。
+> 实际落地结构与本文建议文件名不同——见下。
 
-text
-tool_schema.py
-tool_parser.py
-tool_runtime.py
-tool_format.py
+建议文件名：`tool_schema.py` / `tool_parser.py` / `tool_runtime.py` / `tool_format.py`
 
-
-toolcalls.py 保留兼容 facade，逐步迁移调用方。
+实际落地：`chatgpt_web/tools/`（`parser` / `validator` / `policy` / `executor` /
+`ledger` / `serializer`）；`chatgpt_web/toolcalls.py` 保留为兼容 facade。
+独立回归测试：`tests/test_tools_package.py`。
 
 ## PI-026 拆分 chat_io.py
 
@@ -935,20 +951,22 @@ perf: establish browser request baseline
 
 # 15. 汇总任务表
 
+> 状态核对：2026-10-08（对照代码与测试）。正文各任务的状态与此表已对齐。
+
 | ID | 任务 | 优先级 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- |
-| PI-001 | 统一任务状态机 | P0 | - | TODO |
-| PI-002 | 状态机不变量测试 | P0 | PI-001 | TODO |
+| PI-001 | 统一任务状态机 | P0 | - | DONE |
+| PI-002 | 状态机不变量测试 | P0 | PI-001 | DONE |
 | PI-003 | Bridge Event Model | P0 | PI-001 | DONE |
 | PI-004 | Chat / Responses Adapter | P0 | PI-003 | DONE |
-| PI-005 | DOM Adapter | P0 | - | TODO |
-| PI-006 | DOM 黄金回归 | P0 | PI-005 | TODO |
-| PI-007 | ToolCall 强类型 | P1 | PI-003 | TODO |
-| PI-008 | ToolCall pipeline | P1 | PI-007 | TODO |
-| PI-009 | Execution ledger | P1 | PI-008 | TODO |
-| PI-010 | ToolPolicy | P1 | PI-008 | TODO |
-| PI-011 | edit_markdown 安全回归 | P1 | PI-010 | TODO |
-| PI-012 | 领域异常层 | P1 | PI-005/008 | TODO |
+| PI-005 | DOM Adapter | P0 | - | DONE |
+| PI-006 | DOM 黄金回归 | P0 | PI-005 | BLOCKED |
+| PI-007 | ToolCall 强类型 | P1 | PI-003 | DONE |
+| PI-008 | ToolCall pipeline | P1 | PI-007 | DONE |
+| PI-009 | Execution ledger | P1 | PI-008 | DONE |
+| PI-010 | ToolPolicy | P1 | PI-008 | DONE |
+| PI-011 | edit_markdown 安全回归 | P1 | PI-010 | DONE |
+| PI-012 | 领域异常层 | P1 | PI-005/008 | DONE |
 | PI-013 | 宽泛异常审计 | P1 | PI-012 | DONE |
 | PI-014 | 配置分层 | P1 | - | DONE |
 | PI-015 | RequestLimits | P2 | PI-014 | TODO |
@@ -956,12 +974,12 @@ perf: establish browser request baseline
 | PI-017 | Session 并发测试 | P1 | PI-016 | DONE |
 | PI-018 | Session 不变量 | P1 | PI-017 | DONE |
 | PI-019 | health / readiness / diagnostics | P1 | PI-005 | DONE |
-| PI-020 | metrics | P1 | PI-019 | TODO |
+| PI-020 | metrics | P1 | PI-019 | DONE |
 | PI-021 | 日志 correlation | P2 | PI-020 | TODO |
 | PI-022 | 五个黄金 E2E | P1 | PI-005/003 | TODO |
-| PI-023 | 性质 / 不变量测试 | P1 | PI-007/016/017 | TODO |
-| PI-024 | API contract tests | P2 | PI-003/004 | TODO |
-| PI-025 | 拆分 toolcalls.py | P2 | PI-007/008/010 | TODO |
+| PI-023 | 性质 / 不变量测试 | P1 | PI-007/016/017 | TODO（部分：session 不变量已覆盖） |
+| PI-024 | API contract tests | P2 | PI-003/004 | TODO（部分：streaming/responses/api_package 已覆盖） |
+| PI-025 | 拆分 toolcalls.py | P2 | PI-007/008/010 | DONE（由 PI-901 吸收，见 §9 说明） |
 | PI-026 | 拆分 chat_io.py | P2 | PI-005/012 | TODO |
 | PI-027 | Mixin → composition | P0/P1 | PI-005/003 | TODO |
 | PI-028 | RetryPolicy | P2 | PI-001/012 | TODO |
