@@ -11,7 +11,7 @@
 | 二 | PI-902 Completion 拆分 | ✅ 已完成 | `chatgpt_web/completion/`（lifecycle/generator/extractor）；`completion/__init__.py` 即 facade；`tests/test_completion_package.py` |
 | 三 | PI-903 Browser 层拆分 | ✅ 已完成 | `chatgpt_web/browser/`（selectors/dom_adapter/diagnostics/driver）；`dom_adapter.py` 为 facade；`tests/test_browser_package.py` |
 | 四 | PI-904 API Adapter 拆分 | ⬜ 未开始 | 无 `api/`；`server.py`(717行)/`responses.py`(692行)/`streaming.py`(247行) 仍分立 |
-| 五 | PI-905 Session 模块化 | ⬜ 未开始 | 无 `session/`；`session_store.py`(357行) 仍是单模块 |
+| 五 | PI-905 Session 模块化 | ✅ 已完成 | `chatgpt_web/session/`（schema/migration/lock/store）；`session_store.py` 为 facade；`tests/test_session_package.py` |
 | 六 | PI-906 Config 模块化 | ✅ 已完成 | `chatgpt_web/config/`（_core + server/browser/session/tools/limits/debug）；`config/__init__.py` 为兼容 facade；`tests/test_config.py` 含包结构回归 |
 
 ## 总体原则
@@ -318,46 +318,49 @@ api/
 
 # PI-905 Session 模块化
 
-## 状态：未开始
+## 状态：已完成（2026-10-08）
 
-现状：`chatgpt_web/session/` 不存在；`session_store.py`（~15KB）仍是单模块，
-schema / store / migration / lock 未拆分。
-
-## 子任务
-
-### PI-905-1 创建 session package
-
-结构：
+实际落地结构：
 
 ```
-session/
-├── schema.py
-├── store.py
-├── migration.py
-└── lock.py
+chatgpt_web/session/
+├── __init__.py   组装 + re-export
+├── schema.py     SessionState + STATE_SCHEMA_VERSION + 文档校验/payload 过滤
+├── migration.py  v1(legacy root/default) -> v2
+├── lock.py       落盘串行化锁 STATE_FILE_LOCK
+└── store.py      SessionStoreMixin（分桶状态 + 磁盘读写 + 轮转判定）
 ```
 
-### PI-905-2 Schema 拆分
+兼容契约（``chatgpt_web/session_store.py`` 仍是 facade）：
 
-负责：
+- ``from chatgpt_web.session_store import SessionState, SessionStoreMixin`` 不变；
+- ``session_store.STATE_SCHEMA_VERSION`` / ``session_store.json`` /
+  ``session_store._warned_bad_state`` / ``session_store.logger`` 仍可
+  ``patch.object``：store 层在**调用时**经 ``_facade()`` 回读这些名字；
+- 日志 logger 名保持 ``chatgpt_web.session_store``，``assertLogs(...)`` 不变；
+- ``SessionStoreMixin._read_state_file`` / ``_save_session_state`` 等方法仍在
+  同一个 mixin 类上，class-level patch 生效。
 
-- session 数据模型；
-- schema version。
+独立回归测试：``tests/test_session_package.py``；既有
+``test_state_persistence.py`` / ``test_sessions.py`` / ``test_session_concurrency.py``
+/ ``test_session_invariants.py`` 全部通过。
 
-### PI-905-3 Migration 拆分
+## 子任务（全部完成）
 
-负责：
+### PI-905-1 创建 session package  ✅
 
-```
-v1 -> v2 -> v3
-```
+### PI-905-2 Schema 拆分  ✅
 
-### PI-905-4 Lock 拆分
+- session 数据模型（SessionState）；schema version（STATE_SCHEMA_VERSION=2）。
 
-负责：
+### PI-905-3 Migration 拆分  ✅
 
-- 并发控制；
-- timeout。
+- v1（legacy root/default）-> v2；未知版本抛 ValueError。
+  （当前最高 schema 为 v2；v3 待有需要时再引入。）
+
+### PI-905-4 Lock 拆分  ✅
+
+- 并发控制：``STATE_FILE_LOCK`` 保护整文件「读改写」，原子写（tmp+replace）。
 
 ---
 

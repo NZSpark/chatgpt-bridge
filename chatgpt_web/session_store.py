@@ -1,357 +1,48 @@
-"""会话状态与持久化（``SessionStoreMixin``）。
+"""会话状态与持久化（``SessionStoreMixin``）——兼容 facade。
 
-负责：按任务分桶的 :class:`SessionState`、磁盘读写、轮转判定、
-以及默认桶的属性别名（``session_has_history`` 等），保持既有调用与测试不变。
+PI-905 之后实现拆到 :mod:`chatgpt_web.session` 包：
+
+    session/schema.py     SessionState + schema 常量/校验
+    session/migration.py  v1 -> v2 迁移
+    session/lock.py       落盘串行化锁
+    session/store.py      SessionStoreMixin
+
+本模块保留历史 import 路径，并把测试/旧代码直接 ``patch.object`` 的旋钮
+（``json`` / ``_warned_bad_state`` / ``logger`` / ``STATE_SCHEMA_VERSION``）
+继续暴露在这里；:mod:`chatgpt_web.session.store` 在**调用时**回读本 facade，
+故这些 patch 依旧生效。
 """
 
-
-import asyncio
-import json
+import json  # noqa: F401  (facade 契约：测试 patch.object(session_store.json, ...))
 import logging
-import threading
-import time
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
 
-from . import config
-from .errors import DEFAULT_SESSION_KEY
+from .session import (  # noqa: F401  (re-export)
+    STATE_FILE_LOCK as _STATE_FILE_LOCK,
+    STATE_SCHEMA_VERSION,
+    SessionState,
+    SessionStoreMixin,
+    empty_state_document as _empty_state_document,
+    migrate_state_document as _migrate_state_document,
+    session_payload_only as _session_payload_only,
+    validate_state_document as _validate_state_document,
+)
+from .session.migration import migrate_state_document  # noqa: F401
+from .session.schema import (  # noqa: F401
+    empty_state_document,
+    session_payload_only,
+    validate_state_document,
+)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("chatgpt_web.session_store")
 
-# 状态文件损坏时只提醒一次（每轮都会读它，反复 warning 会刷屏）
+#: 状态文件损坏时只提醒一次的标记；由 store 层通过本 facade 读写。
 _warned_bad_state = False
 
-# 状态文件是「整个文件读改写」的共享资源；跨线程（asyncio.to_thread）并发
-# 落盘时必须串行化，否则后写会把先写的整个覆盖掉（T3.3 验收用例）。
-_STATE_FILE_LOCK = threading.Lock()
-STATE_SCHEMA_VERSION = 2
-_SESSION_FIELDS = frozenset({
-    "has_history",
-    "turns",
-    "est_tokens",
-    "cap_hit",
-    "pending_rotation",
-    "last_error",
-    "cap_failures",
-    "updated_at",
-})
-
-
-def _empty_state_document() -> Dict[str, Any]:
-    return {"schema_version": STATE_SCHEMA_VERSION, "sessions": {}}
-
-
-def _validate_state_document(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a v2 state document without changing session payload semantics."""
-    if not isinstance(data, dict):
-        raise ValueError("session state root must be an object")
-    version = data.get("schema_version")
-    if version != STATE_SCHEMA_VERSION:
-        raise ValueError(f"unsupported session state schema_version: {version!r}")
-    sessions = data.get("sessions")
-    if sessions is None:
-        data["sessions"] = {}
-    elif not isinstance(sessions, dict):
-        raise ValueError("session state sessions must be an object")
-    else:
-        data["sessions"] = {
-            key: value
-            for key, value in sessions.items()
-            if isinstance(key, str) and isinstance(value, dict)
-        }
-    return data
-
-
-def _migrate_state_document(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Migrate the legacy root/default + sessions format to schema v2."""
-    if not isinstance(data, dict):
-        raise ValueError("session state root must be an object")
-    version = data.get("schema_version")
-    legacy_version = data.get("version")
-    if version == STATE_SCHEMA_VERSION:
-        return _validate_state_document(dict(data))
-    if version not in (None, 1) or legacy_version not in (None, 1):
-        raise ValueError(
-            f"unsupported session state schema marker: {version!r}/{legacy_version!r}"
-        )
-
-    migrated = dict(data)
-    migrated.pop("version", None)
-    migrated["schema_version"] = STATE_SCHEMA_VERSION
-    sessions = migrated.get("sessions")
-    migrated["sessions"] = dict(sessions) if isinstance(sessions, dict) else {}
-    logger.info("会话状态文件已由旧格式迁移到 schema v%d。", STATE_SCHEMA_VERSION)
-    return _validate_state_document(migrated)
-
-
-def _session_payload_only(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: payload[key] for key in _SESSION_FIELDS if key in payload}
-
-
-@dataclass
-class SessionState:
-    """单个会话桶的状态。会话的“是否新开 / 能否复用”都由它决定。"""
-
-    has_history: bool = False
-    turns: int = 0
-    est_tokens: int = 0
-    cap_hit: bool = False
-    pending_rotation: bool = False
-    last_error: Optional[str] = None
-    # 连续“到顶”失败次数：播种过大时会陷入「到顶→失败→下轮仍播种→再
-    # 到顶」的死循环。累计到阈值后，重试时会改用更小的播种预算。成功
-    # 收到回复或轮转到新会话时清零。
-    cap_failures: int = 0
-    updated_at: int = 0
-
-    def to_payload(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_payload(cls, payload: Dict[str, Any]) -> "SessionState":
-        state = cls()
-        if not isinstance(payload, dict):
-            return state
-        for name in ("has_history", "cap_hit", "pending_rotation"):
-            if name in payload:
-                setattr(state, name, bool(payload.get(name)))
-        for name in ("turns", "est_tokens", "updated_at", "cap_failures"):
-            try:
-                setattr(state, name, int(payload.get(name) or 0))
-            except (TypeError, ValueError):
-                setattr(state, name, 0)
-        last_error = payload.get("last_error")
-        state.last_error = last_error if isinstance(last_error, str) else None
-        return state
-
-
-class SessionStoreMixin:
-    # ---------- 会话桶 ----------
-    def _state(self, key: Optional[str] = None) -> SessionState:
-        """取出某个会话桶的状态；首次访问时从磁盘恢复。"""
-        bucket = key or DEFAULT_SESSION_KEY
-        state = self._sessions.get(bucket)
-        if state is None:
-            state = SessionState.from_payload(self._load_session_state(bucket))
-            self._sessions[bucket] = state
-            self._evict_session_cache()
-        return state
-
-    def _evict_session_cache(self) -> None:
-        """内存会话缓存超限时按最久未用逐出（状态已落盘，安全）。
-
-        默认桶永不逐出；正在持有锁 / 活跃的桶也不逐出，避免打断进行中的请求。
-        """
-        limit = config.MAX_SESSION_STATE_CACHE
-        if limit <= 0 or len(self._sessions) <= limit:
-            return
-        candidates = [
-            bucket for bucket in self._sessions
-            if bucket != DEFAULT_SESSION_KEY and not self.bucket_busy(bucket)
-        ]
-        # 用页面最近使用时间作为 LRU 依据；没有页面记录的排在最前（最旧）。
-        candidates.sort(key=lambda b: self._page_last_used.get(b, 0.0))
-        for bucket in candidates[: max(0, len(self._sessions) - limit)]:
-            self._sessions.pop(bucket, None)
-            self._last_prompts.pop(bucket, None)
-
-    def _page_for(self, key: Optional[str] = None):
-        """取出某个会话桶的页面；默认桶就是 ``self.page``。"""
-        bucket = key or DEFAULT_SESSION_KEY
-        if bucket == DEFAULT_SESSION_KEY:
-            return self.page
-        return self._pages.get(bucket)
-
-    def sent_prompt(self, key: Optional[str] = None) -> Optional[str]:
-        """某个会话桶最近一次真正发给网页版的 prompt（可能因轮转由增量改选播种版）。"""
-        return self._last_prompts.get(key or DEFAULT_SESSION_KEY)
-
-    # ---- 默认桶的状态：保留为属性，兼容既有调用与测试 ----
-    @property
-    def session_has_history(self) -> bool:
-        return self._state().has_history
-
-    @session_has_history.setter
-    def session_has_history(self, value: bool) -> None:
-        self._state().has_history = bool(value)
-
-    @property
-    def session_turns(self) -> int:
-        return self._state().turns
-
-    @session_turns.setter
-    def session_turns(self, value: int) -> None:
-        self._state().turns = int(value)
-
-    @property
-    def session_est_tokens(self) -> int:
-        return self._state().est_tokens
-
-    @session_est_tokens.setter
-    def session_est_tokens(self, value: int) -> None:
-        self._state().est_tokens = int(value)
-
-    @property
-    def session_cap_hit(self) -> bool:
-        return self._state().cap_hit
-
-    @session_cap_hit.setter
-    def session_cap_hit(self, value: bool) -> None:
-        self._state().cap_hit = bool(value)
-
-    @property
-    def last_error(self) -> Optional[str]:
-        return self._state().last_error
-
-    @last_error.setter
-    def last_error(self, value: Optional[str]) -> None:
-        self._state().last_error = value
-
-    @property
-    def _pending_rotation(self) -> bool:
-        return self._state().pending_rotation
-
-    @_pending_rotation.setter
-    def _pending_rotation(self, value: bool) -> None:
-        self._state().pending_rotation = bool(value)
-
-    # ---------- 会话状态持久化（不再涉及会话 URL）----------
-    def _read_state_file(self) -> Dict[str, Any]:
-        """读取原始状态文件（解析失败或非 JSON 时返回空字典）。
-
-        文件**存在但读不出来/解析不了**时记一条 warning：以前静默返回 ``{}``，
-        结果是全部会话桶的预算与到顶标记被无声丢弃（文件损坏无从得知）。
-        为免每次访问都刷屏，同一个进程只提醒一次。
-        """
-        global _warned_bad_state
-        try:
-            if not config.SESSION_FILE.exists():
-                return {}
-            raw = config.SESSION_FILE.read_text(encoding="utf-8").strip()
-        except Exception:  # noqa: BLE001
-            if not _warned_bad_state:
-                _warned_bad_state = True
-                logger.warning("读取会话状态文件失败（%s）：本次按空状态继续。",
-                               config.SESSION_FILE, exc_info=True)
-            return {}
-        if not raw.startswith("{"):
-            if raw and not _warned_bad_state:
-                _warned_bad_state = True
-                logger.warning("会话状态文件不是 JSON（%s）：本次按空状态继续。",
-                               config.SESSION_FILE)
-            return {}
-        try:
-            data = json.loads(raw)
-            return _migrate_state_document(data)
-        except Exception:  # noqa: BLE001
-            if not _warned_bad_state:
-                _warned_bad_state = True
-                logger.warning("会话状态文件解析失败或迁移失败（%s）：本次按空状态继续。",
-                               config.SESSION_FILE, exc_info=True)
-            return _empty_state_document()
-
-    def _load_session_state(self, key: Optional[str] = None) -> Dict[str, Any]:
-        """读取某个会话桶的状态（轮数 / 体积 / 是否到顶 / 上次错误）。"""
-        bucket = key or DEFAULT_SESSION_KEY
-        data = self._read_state_file()
-        if bucket == DEFAULT_SESSION_KEY:
-            return _session_payload_only(data)
-        extra = data.get("sessions")
-        own = extra.get(bucket) if isinstance(extra, dict) else None
-        return _session_payload_only(own) if isinstance(own, dict) else {}
-
-    def _save_session_state(self, key: Optional[str] = None) -> None:
-        """落盘某个会话桶的状态，供轮转决策与跨重启延续预算使用。
-
-        整段「读改写」由 :data:`_STATE_FILE_LOCK` 保护：并发落盘（多桶 / 多
-        Agent）时不会互相覆盖——旧实现的后写会把先写的那份整个覆盖掉。
-        写入用「临时文件 + ``replace``」原子替换，中途失败不会损坏原文件。
-        """
-        bucket = key or DEFAULT_SESSION_KEY
-        state = self._state(bucket)
-        state.updated_at = int(time.time())
-        payload = state.to_payload()
-
-        with _STATE_FILE_LOCK:
-            data = self._read_state_file()
-            extra = data.get("sessions")
-            extra = dict(extra) if isinstance(extra, dict) else {}
-            if bucket == DEFAULT_SESSION_KEY:
-                payload = {
-                    "schema_version": STATE_SCHEMA_VERSION,
-                    **_session_payload_only(payload),
-                    "sessions": extra,
-                }
-            else:
-                extra[bucket] = _session_payload_only(payload)
-                data = {k: v for k, v in data.items() if k != "sessions"}
-                data["schema_version"] = STATE_SCHEMA_VERSION
-                data["sessions"] = extra
-                payload = data
-            try:
-                config.SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-                # 原子写（临时文件 + replace）：中途挂掉也不会留下半截 JSON
-                tmp = config.SESSION_FILE.with_name(config.SESSION_FILE.name + ".tmp")
-                tmp.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-                tmp.replace(config.SESSION_FILE)
-            except Exception:  # noqa: BLE001
-                # 状态落盘失败不该静默：会让轮转决策与重启后的预算延续失真
-                logger.warning("会话状态落盘失败（key=%s）：已忽略，下一轮会重试。",
-                               bucket, exc_info=True)
-
-    async def _remember_session(self, key: Optional[str] = None) -> None:
-        """刷新落盘的会话状态（保留此名字，兼容既有调用）。
-
-        文件 I/O 放到线程里执行（``asyncio.to_thread``）：写的是整个状态文件，
-        大时同步执行会卡住事件循环，拖慢 SSE keep-alive 与其它会话桶（T3.3）。
-        """
-        await asyncio.to_thread(self._save_session_state, key)
-
-    def session_keys(self) -> List[str]:
-        """当前在用的会话桶（至少包含默认桶）。"""
-        return sorted({DEFAULT_SESSION_KEY, *self._sessions})
-
-    def needs_seed(self, key: Optional[str] = None) -> bool:
-        """某个会话桶的网页会话里没有可用上下文时，需要把完整历史播种进去。"""
-        return not self._state(key).has_history
-
-    def session_stats(self, key: Optional[str] = None) -> Dict[str, Any]:
-        """供 /healthz 观察会话增长情况。"""
-        state = self._state(key)
-        return {
-            "has_history": state.has_history,
-            "needs_seed": self.needs_seed(key),
-            "turns": state.turns,
-            "est_tokens": state.est_tokens,
-            "cap_hit": state.cap_hit,
-            "pending_rotation": state.pending_rotation,
-            "last_error": state.last_error,
-            # 连续“到顶”失败次数：>=2 时播种内容会被自动压缩（防死循环）
-            "cap_failures": getattr(state, "cap_failures", 0),
-            "buckets": self.session_keys(),
-        }
-
-    def _session_over_budget(self, key: Optional[str] = None) -> bool:
-        """会话体积是否已达到轮转阈值（0 表示禁用该维度）。"""
-        state = self._state(key)
-        if config.SESSION_MAX_TURNS and state.turns >= config.SESSION_MAX_TURNS:
-            return True
-        if config.SESSION_MAX_TOKENS and state.est_tokens >= config.SESSION_MAX_TOKENS:
-            return True
-        return False
-
-    def reset_session(self, key: Optional[str] = None) -> None:
-        """把某个会话桶标记为“下一轮开新会话”（手动逃生口）。
-
-        只改状态、不碰页面：下一轮的 ``send_chat`` 会先轮转，并用“播种”
-        prompt 重放历史，所以不会丢上下文。
-        """
-        bucket = key or DEFAULT_SESSION_KEY
-        state = self._state(bucket)
-        state.pending_rotation = True
-        state.cap_hit = False
-        state.has_history = False
-        self._save_session_state(key=bucket)
-        logger.info(f"[会话] 已请求重置 key={bucket} 的会话，下一轮将开启新会话并播种上下文。")
+__all__ = [
+    "SessionStoreMixin",
+    "SessionState",
+    "STATE_SCHEMA_VERSION",
+    "_STATE_FILE_LOCK",
+    "_warned_bad_state",
+    "logger",
+]
