@@ -103,6 +103,62 @@ class ChatRouteTests(unittest.TestCase):
         self.assertTrue(data['readiness']['ready'])
         self.assertEqual(data['selectors']['INPUT_SELECTORS'], [])
 
+    @patch('chatgpt_web.server.tasks')
+    @patch('chatgpt_web.server.driver')
+    def test_bash_fence_reply_is_recovered_as_tool_call(self, mock_driver, mock_tasks):
+        """用户报的原例（端到端）：模型回 `bash` 代码块，桥仍要交出 tool_calls。
+
+        背景（2026-10-07 用户实测）：提示词要求 ```tool_call 围栏后，模型回的却是
+
+            ```bash
+            git status --short
+            ```
+
+        旧行为：非流式路径解析出 0 条 → 回复被当纯文本返回，客户端以为任务结束。
+        这里钉住修复后的行为：同一段回复必须返回 finish_reason=tool_calls。
+        """
+        import json as _json
+
+        mock_driver.page = MagicMock()
+        mock_driver.needs_seed.return_value = False
+        mock_driver.sent_prompt.return_value = None
+        mock_driver.send_chat = AsyncMock(
+            return_value=("```bash\ngit status --short\n```", [])
+        )
+        mock_tasks.resume_block.return_value = None
+
+        body = {
+            'model': 'gpt-4o',
+            'messages': [{'role': 'user', 'content': '看看仓库状态'}],
+            'tools': [{
+                'type': 'function',
+                'function': {
+                    'name': 'bash',
+                    'description': 'Execute a bash command.',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {'command': {'type': 'string'}},
+                        'required': ['command'],
+                    },
+                },
+            }],
+        }
+        res = self.client.post(
+            '/v1/chat/completions',
+            json=body,
+            headers={'X-ChatGPT-Session': 't-shell-fence'},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        choice = res.json()['choices'][0]
+        self.assertEqual(choice['finish_reason'], 'tool_calls')
+        calls = choice['message'].get('tool_calls') or []
+        self.assertEqual(len(calls), 1, choice)
+        self.assertEqual(calls[0]['function']['name'], 'bash')
+        self.assertEqual(
+            _json.loads(calls[0]['function']['arguments']),
+            {'command': 'git status --short'},
+        )
+
     def test_models_endpoint(self):
         res = self.client.get('/v1/models')
         self.assertEqual(res.status_code, 200)

@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from . import config
 from .errors import (
@@ -101,6 +101,26 @@ _TOOL_CALL_FENCE_RE = re.compile(r"```\s*(tool[-_]call)\s*\n(.*?)```", re.DOTALL
 _MD_ESCAPED_CHAR_RE = re.compile(r"\\([_*`~\[\]()#+.!\-])")
 # "json" 围栏仅在内容明显是工具调用时才采纳（兜底，兼容模型不听话的情况）
 _JSON_FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+# ==================== shell 围栏修复（2026-10-07 用户实测） ====================
+# 现象：模型不写 tool_call JSON，而是直接回一个 ```` ```bash ```` / ```` ```sh ```` 代码块，
+# 内容就是裸命令（用户报的原例：`git status --short`）。旧解析链只认 tool_call 系列载体，
+# 于是整条回复被当成纯文本、任务静默结束。
+#
+# 恢复成调用有严格前提（任一不满足就不解析——宁可让模型下一轮重出，也不要执行一条
+# 猜出来的命令）：
+#   * 标签是 shell 类标签（见 _SHELL_FENCE_LABELS）；
+#   * 全篇只有**一个**这样的围栏（一份回复只跑一条命令）；
+#   * 能**唯一**对应到客户端工具集里的某个 shell 类工具（复用 DSML 的名字映射）；
+#   * 该工具声明了明确的命令参数键（command / cmd / ...），或全局只有一个参数键；
+#   * 回复里没有任何 tool_call 尝试（否则那是格式错误，按格式错误处理，不去跑近似命令）。
+_SHELL_FENCE_LABELS = frozenset({
+    "bash", "sh", "shell", "zsh", "fish", "cmd", "powershell", "ps1", "console", "terminal",
+})
+# 通用围栏提取（标签 → 内容）；是否采纳由 _SHELL_FENCE_LABELS 决定。
+_SHELL_FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_+.-]+)[ \t]*\n(.*?)```", re.DOTALL)
+# 命令参数键的优先顺序：声明里命中哪个就把命令写进哪个。
+_COMMAND_KEYS = ("command", "cmd", "script", "input", "code", "shell", "cmdline")
 # 网页版偶尔会输出 DSML 风格的工具调用 XML（全角竖线 ｜｜ 包裹的标签），
 # 形如： <｜｜DSML｜｜ calls>{"tool_uses": [...]}</｜｜DSML｜｜ calls>
 # 这里只取标签之间的 JSON 对象，交由 _consume 解析。
@@ -302,14 +322,17 @@ def edit_markdown_spec() -> str:
     """Usage notes for edit_markdown injected into the prompt (anchors / fences caveats)."""
     return "\n".join([
         EDIT_MD_HEADER,
-        "When editing a Markdown file, prefer edit_markdown over rewriting the whole file and doing plain-text matching:",
+        "When editing a Markdown file, prefer edit_markdown over rewriting the whole file and",
+        "doing plain-text matching:",
         "```tool_call",
-        '{"name": "edit_markdown", "arguments": {"path": "README.md", '
-        '"start": <int>, "end": <int>, "new_text": "<replacement text>"}}',
+        '{"name": "edit_markdown", "arguments": {"path": "README.md", "start": 12, '
+        '"end": 14, "new_text": "..."}}',
         "```",
+        "The line numbers and \"...\" above are placeholders: replace them with the real path,",
+        "start/end and replacement text.",
         "start/end are 1-based inclusive line numbers; content outside the range (including blank lines, indentation, trailing whitespace) is preserved verbatim.",
         "Do not touch ``` fence lines; content inside a fence does not participate in structural positioning.",
-        "By default only a diff is returned; once confirmed, pass write=true to persist to disk.",
+        "By default only a diff is returned (dry-run); pass write=true to persist to disk.",
     ])
 
 
@@ -553,8 +576,10 @@ def format_tool_retry_nudge() -> str:
         "your own knowledge instead of calling a tool means the task FAILED.",
         "Reply now with EXACTLY ONE fenced code block in this form (no other text):",
         "```tool_call",
-        '{"name": "<exact tool name>", "arguments": {"<param>": <value>}}',
+        '{"name": "...", "arguments": {"param": "..."}}',
         "```",
+        "Replace the \"...\" placeholders with the real tool name and its arguments - do NOT copy",
+        "the example literally.",
     ])
 
 
@@ -565,12 +590,74 @@ def tool_call_predicate(tools: Optional[List[Dict[str, Any]]]) -> Callable[[str]
     与最终解析共用同一个 ``parse_tool_calls``，不会出现「重试判定说不合格、
     外面却解析出了 tool_calls」的不一致。
     """
-    names = _tool_names(tools)
-
     def _has_call(text: str) -> bool:
-        return bool(parse_tool_calls(text or "", names))
+        # 与最终解析共用同一条路径（含 shell 围栏修复）：否则修复出的调用会被判为
+        # “没调用工具”，桥会追发一次多余的纠偏指令。
+        return bool(parse_reply_tool_calls(text or "", tools))
 
     return _has_call
+
+
+def _example_arg_value(schema: Any) -> Any:
+    """示例里给某个参数用的占位值：按声明的类型给一个 JSON 合法的最小值。
+
+    历史 bug：示例一律用字符串占位（``"offset": "..."``），而真实参数是整数——
+    模型照抄即得到类型错误的参数。整数/布尔参数直接给同类型字面量，字符串参数
+    才用 ``"..."``（尖括号占位符会被原样照抄，见 :func:`_tool_example_call`）。
+    """
+    kind = schema.get("type") if isinstance(schema, dict) else None
+    if kind in ("integer", "number"):
+        return 0
+    if kind == "boolean":
+        return False
+    if kind == "array":
+        return []
+    if kind == "object":
+        return {}
+    return "..."
+
+
+def _tool_example_call(tools: List[Dict[str, Any]]) -> str:
+    """按第一个工具的真实名字 / 参数键生成一个 ```` ```tool_call ```` 示例块。
+
+    示例要带真实工具名和参数键，否则模型不认；但值必须是「一眼就知道要替换」的
+    占位符——用 ``<command>`` 这种形式模型会原样照抄，把占位符当命令发出来
+    （实测：shell 收到字面量 ``<`` 直接语法报错）。优先用 ``required`` 列出的参数
+    （必填项最容易漏），没有 required 才退回 properties 的前几个键。
+    """
+    first = tools[0] if tools else {}
+    fn0 = first.get("function", first) if isinstance(first, dict) else {}
+    example_name = fn0.get("name") or "tool_name"
+    raw_params = fn0.get("parameters") if isinstance(fn0, dict) else None
+    params: Dict[str, Any] = raw_params if isinstance(raw_params, dict) else {}
+    raw_props = params.get("properties")
+    props: Dict[str, Any] = raw_props if isinstance(raw_props, dict) else {}
+    raw_required = params.get("required")
+    required: List[Any] = raw_required if isinstance(raw_required, list) else []
+    keys = [k for k in required if isinstance(k, str)][:4] or list(props.keys())[:4]
+    example_args = {key: _example_arg_value(props.get(key)) for key in keys}
+    return "```tool_call\n" + json.dumps(
+        {"name": example_name, "arguments": example_args}, ensure_ascii=False
+    ) + "\n```"
+
+
+def _truncate_description(desc: str, limit: int) -> str:
+    """按句末/词边界截断工具描述，避免出现 ``whichever is hit firs…`` 这类半截词。
+
+    半截词既可疑又丢信息：被切断的往往正是关键约束（read 的 offset 语义、bash 的
+    输出截断规则）。优先在预算内的最后一个句末标点处收尾，退而求其次取最后一个
+    空格，都没有才硬截。
+    """
+    if not limit or len(desc) <= limit:
+        return desc
+    window = desc[:limit]
+    cut = max(window.rfind(". "), window.rfind("。"), window.rfind("; "))
+    if cut >= limit // 2:
+        return window[: cut + 1] + " …"
+    space = window.rfind(" ")
+    if space >= limit // 2:
+        window = window[:space]
+    return window.rstrip() + " …"
 
 
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
@@ -578,31 +665,31 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
 
     实测（联网真机验证）：模型很容易**无视工具、直接凭知识作答**——例如问它
     “查看当前目录”时，它会直接编一份 ls 输出，parse 结果为空。让模型真正调用
-    工具的关键有三点：
+    工具的关键有四点：
       1. 明确切断退路：“你没有直接的 shell/文件系统访问，唯一方式是输出
-         TOOL_CALL 行，直接作答＝任务失败”；
+         ```` ```tool_call ```` 围栏块，直接作答＝任务失败”；
       2. 给一个**具体到参数**的调用示例（只给格式模板不够）；
-      3. 指令要短、聚焦，长段 meta 说明会稀释掉核心要求。
-    因此这里把命令式要求 + 工具清单 + 具体示例放在一起，规则尽量精简。
+      3. **载体只有一种**。旧措辞在同一段里既说“唯一方式是输出 TOOL_CALL 行”，
+         又在规则里禁止纯文本行（自相矛盾），实测模型会在这两种写法之间二选一
+         失败。现在全篇不再出现纯文本行的写法，禁止项也只做抽象描述——不给出
+         具体形态，避免“负向示范”把禁用写法教给模型（列举即示范）；
+      4. 指令要短、聚焦，长段 meta 说明会稀释掉核心要求。
+    因此这里把命令式要求 + 工具清单 + 具体示例放在一起，规则编号精简。
     """
-    # 示例要带真实工具名和参数键，否则模型不认；但值必须是「一眼就知道要替换」的
-    # 占位符——用 <command> 这种形式模型会原样照抄，把占位符当命令发出来
-    # （实测：shell 收到字面量 <command> 直接语法报错）。这里用 "..." 并显式声明。
-    first = tools[0] if tools else {}
-    fn0 = first.get("function", first) if isinstance(first, dict) else {}
-    example_name = fn0.get("name") or "tool_name"
-    props = (fn0.get("parameters") or {}).get("properties") or {}
-    example_args = {key: "..." for key in list(props.keys())[:2]} or {}
-    example_call = "```tool_call\n" + json.dumps(
-        {"name": example_name, "arguments": example_args}, ensure_ascii=False
-    ) + "\n```"
+    example_call = _tool_example_call(tools)
 
     lines = [
         TOOLCALL_HEADER,
         "You are an agent connected to external tools. You have NO direct access to a shell,",
-        "filesystem, or the internet — the ONLY way to perform an action or fetch real data is",
-        "to emit a TOOL_CALL line. If the task needs a tool and you answer from your own",
-        "knowledge instead, the task FAILS. Never fabricate tool output.",
+        "filesystem, or the internet: the ONLY way to perform an action or fetch real data is to",
+        "output a tool call in the format below. If the task needs a tool and you answer from",
+        "your own knowledge instead, the task FAILS. Never fabricate tool output.",
+        "",
+        "A tool call is ONE fenced code block whose info string (the word right after the opening",
+        "```) is exactly `tool_call`, containing one JSON object and nothing else:",
+        example_call,
+        "(Replace the \"...\" placeholders above with the real values. Do NOT copy the example",
+        "literally.)",
         "",
         "Available tools (use these exact names):",
     ]
@@ -614,9 +701,7 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         desc = fn.get("description", "")
         params = fn.get("parameters", {}) or {}
         # 描述截断：超长描述对“选对工具”帮助有限，却显著撑大 prompt。
-        limit = config.TOOLS_DESC_MAX_CHARS
-        if limit and len(desc) > limit:
-            desc = desc[:limit] + "…"
+        desc = _truncate_description(desc, config.TOOLS_DESC_MAX_CHARS)
         if config.TOOLS_INSTRUCTION_VERBOSE:
             # 旧行为：完整 JSON Schema（调试 / 复杂工具用）
             lines.append(f"- {name}: {desc}")
@@ -644,59 +729,73 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
     # DOM 里只剩 info string（`tool_call`）单独一行 + JSON（parse_tool_calls 的裸标签兜底）。
     lines += [
         "",
-        "To call a tool, output a fenced code block whose info string is exactly `tool_call`,",
-        "containing ONE JSON object and nothing else:",
-        example_call,
-        "(In the example above, \"...\" is a placeholder: replace it with the real value.",
-        "Do NOT copy the example literally.)",
         "Rules:",
-        "- The fence info string MUST be exactly `tool_call` (not json, not text, not empty):",
-        "  a block labelled anything else, or a JSON object written as plain text, will NOT be",
-        "  executed. Do not write the call as a plain `TOOL_CALL: {...}` line — the web UI",
-        "  mangles plain-text lines (it eats backslash escapes and collapses indentation).",
-        "- `arguments` must be a valid JSON object matching the tool's parameters.",
-        "- Inside JSON strings, escape double quotes as \\\" and newlines as \\n; keep the JSON on",
-        "  one line inside the fence.",
-        "- Paste command/script text into the JSON string verbatim - the fenced block preserves it.",
-        "- For shell commands, prefer single quotes inside the command.",
-        "- Output EXACTLY ONE tool_call block per reply. Never emit two or more blocks",
-        "  together; the client can only process a single call at a time. If you need several",
-        "  tools, issue one call, wait for its result, then issue the next in your next reply.",
-        "- When you call a tool, output ONLY the single fenced block: no explanation, no preamble.",
-        "- Only if the task needs no tool at all, answer directly with no tool_call block.",
-        "- If a tool result is EMPTY (e.g. shows \"(no output)\"), the command SUCCEEDED and",
-        "  genuinely printed nothing. That is a valid result, not a failure: move on to the NEXT",
-        "  command or give the final answer. Never re-run the exact same command and never assume",
-        "  the tool failed — repeating it loops forever.",
-        "- Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter> — they will not be executed.",
+        "1. The info string (the word right after the opening ```) MUST be exactly `tool_call` - not",
+        "   json, not text, not empty - and the JSON must sit INSIDE the fence. A block labelled",
+        "   anything else, or a call written",
+        "   as plain text instead of a fenced block, will NOT be executed.",
+        "2. `arguments` must be a JSON object using the tool's own parameter names, with values of",
+        "   the declared type (numbers and booleans unquoted, strings in double quotes).",
+        "3. Keep the JSON on ONE line inside the fence: escape double quotes as \\\" and line breaks",
+        "   as \\n; never put a raw line break inside a JSON string.",
+        "4. Paste command / script / file text into the JSON string verbatim - the fenced block",
+        "   preserves it exactly. A shell command always travels as the `command` value inside the",
+        "   tool_call JSON: never reply with the bare command in a `bash` style code block.",
+        "   Prefer single quotes inside the command (e.g. git commit -m 'msg') so they never clash",
+        "   with the JSON quotes.",
+        "5. Output EXACTLY ONE tool_call block per reply - never two or more; the client processes",
+        "   a single call at a time. If you need several tools, issue one call, wait for its result,",
+        "   then issue the next in your next reply.",
+        "6. When you call a tool, output ONLY the single fenced block: no explanation, no preamble,",
+        "   no text before or after it.",
+        "7. Only if the task needs no tool at all, answer directly with no tool_call block.",
+        "8. If a tool result is EMPTY (e.g. shows \"(no output)\"), the command SUCCEEDED and",
+        "   genuinely printed nothing. That is a valid result, not a failure: move on to the NEXT",
+        "   command or give the final answer. Never re-run the exact same command and never assume",
+        "   the tool failed - repeating it loops forever.",
+        "9. Never emit XML / DSL tags (native tool markers of that shape are not executed): the",
+        "   fenced `tool_call` block above is the only carrier this client accepts.",
     ]
     return "\n".join(lines)
 
 
-def format_tool_call_emphasis() -> str:
+def format_tool_call_emphasis(tools: Optional[List[Dict[str, Any]]] = None) -> str:
     """Format-emphasis block placed at the start of the seed prompt for a new / reset session.
 
     A new bucket has no history turns that demonstrate the correct format, so the model is
     most likely to fall back to native DSML markers (or ignore tools entirely) at that point;
     repeating the mandate + full format is a second safeguard.
+
+    ``tools``（可选）用于生成**具体**示例；不给才退回通用模板。与主注入块共用
+    :func:`_tool_example_call`，保证两处示例永远是同一种（可解析的）形态——旧版这里写的是
+    ``{"name": "tool name", "arguments": {arguments object}}`` 这种非法 JSON 模板，
+    模型照抄即整条调用失效。
     """
+    if tools:
+        example_call = _tool_example_call(tools)
+    else:
+        example_call = "```tool_call\n" + json.dumps(
+            {"name": "...", "arguments": {"param": "..."}}, ensure_ascii=False
+        ) + "\n```"
     return "\n".join([
         f"{EMPHASIS_HEADER} This is a new session (or one that was just reset); "
         "the following rules stay in effect for this whole session:",
         "You MUST use the provided tools whenever the task needs real action or data; never fabricate tool output.",
-        "To call a tool, output a fenced code block whose info string is exactly `tool_call`:",
-        "```tool_call",
-        "{\"name\": \"tool name\", \"arguments\": {arguments object}}",
-        "```",
-        "The fence label must be `tool_call` (not json/text/empty); a call written as plain text will NOT be executed.",
-        "arguments must be valid JSON: escape double quotes inside strings as \\\" and newlines as \\n; never write a bare double quote or a raw newline inside a JSON string.",
-        "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
-        "to avoid a clash between double quotes in the command and the JSON boundary quotes.",
-        "Use the exact tool names given in the tool instructions; do not invent generic names like bash / shell.",
-        "Output EXACTLY ONE tool_call block per reply - never two or more in the same message.",
-        "If you need several tools, call one now and the next only after you receive its result.",
-        "Output only the single fenced tool_call block when calling a tool: no explanation, no preamble.",
-        "Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter>, <tool_calls> - they will not be executed.",
+        "To call a tool, output ONE fenced code block labelled `tool_call` (that exact word right after",
+        "the opening ```):",
+        example_call,
+        "(Replace the \"...\" placeholders above with the real values; never copy the example literally.)",
+        "The fence label must be `tool_call` - not json, not text, not empty - and the JSON must sit inside the fence;",
+        "a call written as plain text will NOT be executed.",
+        "Keep the JSON on one line: escape double quotes as \\\" and line breaks as \\n; for shell commands",
+        "prefer single quotes inside the command (e.g. git commit -m 'msg') so they never clash with the JSON quotes.",
+        "A shell command always travels as the `command` value inside that JSON - never as the bare",
+        "command in a `bash` style code block.",
+        "Use the exact tool names given in the tool instructions; never invent tool names.",
+        "Output EXACTLY ONE tool_call block per reply - never two or more in the same message; if you need",
+        "several tools, call one now and the next only after you receive its result.",
+        "When you call a tool, output only the single fenced block: no explanation, no preamble.",
+        "Never emit XML / DSL tags - only the fenced `tool_call` block is executed.",
     ])
 
 
@@ -808,6 +907,130 @@ def _tool_names(tools: Optional[List[Dict[str, Any]]]) -> set:
         if name:
             names.add(name)
     return names
+
+
+def tool_parameter_names(tools: Optional[List[Dict[str, Any]]]) -> Dict[str, List[str]]:
+    """从 OpenAI tools 描述里收集「工具名 → 声明的参数键（按声明顺序）」。
+
+    供 shell 围栏修复使用：把 ```` ```bash ```` 块恢复成调用时必须知道命令该写进哪个
+    参数（`command`？`cmd`？），否则只能猜键名——猜错等于发出一条参数非法、
+    必然执行失败的调用。
+    """
+    out: Dict[str, List[str]] = {}
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not name:
+            continue
+        params = fn.get("parameters") if isinstance(fn, dict) else None
+        params = params if isinstance(params, dict) else {}
+        props = params.get("properties")
+        keys = [str(k) for k in props] if isinstance(props, dict) else []
+        if not keys:
+            raw_required = params.get("required")
+            if isinstance(raw_required, list):
+                keys = [str(k) for k in raw_required if isinstance(k, str)]
+        out.setdefault(str(name), keys)
+    return out
+
+
+def parse_reply_tool_calls(
+    text: str, tools: Optional[List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """``parse_tool_calls`` 的「带完整 tools 描述」入口（server / streaming / responses 共用）。
+
+    一次提供两样东西：名字过滤（防幻觉工具名）+ 参数键表（shell 围栏修复需要）。
+    必须与 :func:`tool_call_predicate` 用同一条路径，否则会出现「纠偏判定说不合格、
+    外面却解析出了 tool_calls」的不一致。
+    """
+    return parse_tool_calls(
+        text, _tool_names(tools), tool_parameter_names(tools)
+    )
+
+
+def _dedent_command(body: str) -> str:
+    """去掉命令块的首尾空行，并消除「整块被缩进」的共同前导空白。
+
+    放在列表 / 引用里的围栏会被整体缩进几格，而 shell 对缩进敏感情形（heredoc、
+    续行）会因此变形；只在所有非空行都有**相同**前导空白时才统一左移。
+    """
+    lines = body.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    indents = [len(line) - len(line.lstrip(" \t")) for line in lines if line.strip()]
+    if indents and min(indents) > 0:
+        cut = min(indents)
+        lines = [(line[cut:] if line.strip() else "") for line in lines]
+    return "\n".join(lines)
+
+
+def _shell_command_key(
+    name: str, parameter_names: Optional[Mapping[str, Sequence[str]]]
+) -> Optional[str]:
+    """该工具的哪个参数键用来装命令；无法确定时返回 None（不猜）。"""
+    keys = list((parameter_names or {}).get(name) or [])
+    if not keys:
+        return None
+    for preferred in _COMMAND_KEYS:
+        if preferred in keys:
+            return preferred
+    # 只有一个参数键时才敢用（多键时无法判断哪个装命令）
+    return keys[0] if len(keys) == 1 else None
+
+
+def _shell_fence_calls(
+    text: str,
+    valid_names: Optional[set],
+    parameter_names: Optional[Mapping[str, Sequence[str]]],
+) -> List[Dict[str, Any]]:
+    """把 ```` ```bash ```` / ```` ```sh ```` 代码块恢复成一条工具调用（前提见 _SHELL_FENCE_LABELS）。
+
+    :return: 0 或 1 条调用；任何前提不满足都返回空列表（保持旧行为：不解析）。
+    """
+    if not valid_names:
+        return []
+    # 回复里已经有 tool_call 尝试（围栏或历史标记）时不走修复：那是格式错误，
+    # 应该按格式错误处理（下一轮重出），而不是去跑一个“近似”命令。
+    if _TOOL_CALL_FENCE_RE.search(text) or _TOOL_CALL_LINE_RE.search(text):
+        return []
+    fences = [
+        (match.group(1).strip().lower(), match.group(2))
+        for match in _SHELL_FENCE_RE.finditer(text)
+        if match.group(1).strip().lower() in _SHELL_FENCE_LABELS
+    ]
+    if len(fences) != 1:
+        return []
+    label, body = fences[0]
+    command = _dedent_command(body)
+    if not command.strip():
+        return []
+    name = _resolve_dsml_name(label, valid_names)
+    if name not in valid_names:
+        return []
+    # 形态 A：围栏里其实是调用 JSON（标签写错、内容对）——直接按调用收下。
+    if command.lstrip().startswith("{"):
+        try:
+            data = json.loads(command)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            normalized = _normalize_tool_entry(data)
+            if normalized and normalized.get("name") in valid_names:
+                return [normalized]
+    # 形态 B：围栏里是裸命令——写进该工具声明的命令参数。
+    key = _shell_command_key(name, parameter_names)
+    if key is None:
+        return []
+    logger.warning(
+        "shell 围栏修复：模型用 ```%s 代码块代替了 tool_call JSON，"
+        "已按唯一匹配的工具 %s(%s) 恢复调用（SHELL_FENCE_FALLBACK=false 可关闭）",
+        label,
+        name,
+        key,
+    )
+    return [{"name": name, "arguments": {key: command}}]
 
 
 def _strip_redundant_value_quotes(raw: str) -> str:
@@ -1181,7 +1404,11 @@ def _iter_balanced_objects(text: str):
                     start = -1
 
 
-def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[str, Any]]:
+def parse_tool_calls(
+    text: str,
+    valid_names: Optional[set] = None,
+    parameter_names: Optional[Mapping[str, Sequence[str]]] = None,
+) -> List[Dict[str, Any]]:
     """从模型回复中解析出工具调用列表。返回 [{"name": ..., "arguments": {...}}, ...]
 
     需要兼容多种形态：
@@ -1190,7 +1417,14 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
          网页版会把这行当 markdown 渲染并改坏它，见 doc/code_block_fence.md；
       2. **无围栏**的 ``tool_call`` 标签 + JSON 对象——这是从 ChatGPT 网页 DOM
          提取 inner_text 后的常见形态：代码块被渲染成 <pre>，围栏退化为标题文字，
-         于是只剩 ``tool_call`` 标签与裸 JSON（当前注入格式被渲染后的实际形态）。
+         于是只剩 ``tool_call`` 标签与裸 JSON（当前注入格式被渲染后的实际形态）；
+      3. ```` ```bash ```` / ```` ```sh ```` 代码块（内容为裸命令）——模型写错载体的
+         修复路径，需要 ``parameter_names`` 才能确定命令参数键，见
+         :func:`_shell_fence_calls`。
+
+    :param valid_names: 客户端声明的合法工具名（过滤幻觉；为空时不启用 shell 围栏修复）。
+    :param parameter_names: ``{工具名: [参数键, ...]}``，来自 :func:`tool_parameter_names`；
+        只用于 shell 围栏修复（确定命令写进哪个参数），缺省时该修复不生效。
     """
     if not text:
         return []
@@ -1322,6 +1556,12 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
                 break
             if not parsed:
                 pos = marker_match.end()
+
+    if not calls and config.SHELL_FENCE_FALLBACK:
+        # 最后一道修复：模型写错载体（```bash + 裸命令，2026-10-07 用户实测）。放在
+        # 所有正规载体分支**之后**——只有前面的分支一条都没解析出来时才尝试，
+        # 避免把一个“近似命令”抢在真正要跑的调用前面执行。
+        calls.extend(_shell_fence_calls(text, valid_names, parameter_names))
 
     # 护栏：若传入了 valid_names，则过滤掉不在其中的幻觉工具名；否则保留全部解析出的工具调用。
     if valid_names is not None:

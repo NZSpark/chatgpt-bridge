@@ -17,8 +17,7 @@ from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
 from .protocol_adapters import chat_sse_choice_for_event, responses_function_call_arguments
 from .toolcalls import (
     EDIT_MARKDOWN_TOOL_NAME,
-    _tool_names,
-    parse_tool_calls,
+    parse_reply_tool_calls,
     run_local_edit_markdown,
 )
 
@@ -87,7 +86,7 @@ async def _stream_chat_completion(
                     ),
                 )
 
-                parsed_tool_calls = parse_tool_calls(reply, _tool_names(request.tools)) if wants_tools else []
+                parsed_tool_calls = parse_reply_tool_calls(reply, request.tools) if wants_tools else []
                 bridge_events = completion_events(reply, parsed_tool_calls)
                 bridge_tool_calls = [event for event in bridge_events if isinstance(event, ToolCall)]
                 local_events = (
@@ -202,7 +201,7 @@ async def _stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
-    parsed_tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+    parsed_tool_calls = parse_reply_tool_calls(reply_content, request.tools) if wants_tools else []
     bridge_events = completion_events(reply_content, parsed_tool_calls)
     bridge_tool_calls = [event for event in bridge_events if isinstance(event, ToolCall)]
 

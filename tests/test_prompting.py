@@ -413,6 +413,73 @@ class ToolsInstructionDesignTests(unittest.TestCase):
             self.assertNotIn("several tool_call", text)
             self.assertNotIn("multiple tools at once", text)
 
+    def test_instruction_never_advertises_plain_text_calls(self):
+        """两块注入指令都只能宣传围栏块。
+
+        2026-10-06 真机教训：旧措辞在头段落写「唯一方式是输出 TOOL_CALL 行」、
+        又在规则里禁止纯文本行——同一段文字自相矛盾，模型两种写法都会试一遍。
+        """
+        from chatgpt_web.toolcalls import (
+            format_tool_call_emphasis,
+            format_tools_instruction,
+        )
+
+        for text in (
+            format_tools_instruction(self.TOOLS),
+            format_tool_call_emphasis(self.TOOLS),
+        ):
+            self.assertIn("```tool_call", text)
+            self.assertNotIn("TOOL_CALL", text)
+
+    def test_example_uses_required_params_with_declared_types(self):
+        """示例只列必填参数，且非字符串参数不能写成字符串占位。
+
+        旧版把第一个工具的前两个属性一律填成 ``"..."``——`read` 的示例就是
+        ``{"path": "...", "offset": "..."}``，模型照抄即得到一个字符串 offset。
+        """
+        from chatgpt_web.toolcalls import format_tools_instruction
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "with_line_numbers": {"type": "boolean"},
+                    },
+                    "required": ["path", "offset"],
+                },
+            },
+        }]
+        text = format_tools_instruction(tools)
+        _, body = _fenced_example(text, with_json=True)
+        args = json.loads(body)["arguments"]
+        self.assertEqual(list(args), ["path", "offset"])
+        self.assertEqual(args["path"], "...")
+        self.assertEqual(args["offset"], 0)
+
+    def test_instruction_forbids_bare_bash_code_block(self):
+        """必须写明「命令永远写在 command 参数里」（2026-10-07 用户实测）。
+
+        用户实测：模型把命令直接回成 `bash` 代码块（`git status --short`），
+        解析链拿不到 tool_call 载体。两块提示词都要提前说清楚，解析层的
+        shell 围栏修复（SHELL_FENCE_FALLBACK）只是兜底，不是正路。
+        """
+        from chatgpt_web.toolcalls import (
+            format_tool_call_emphasis,
+            format_tools_instruction,
+        )
+
+        for text in (
+            format_tools_instruction(self.TOOLS),
+            format_tool_call_emphasis(self.TOOLS),
+        ):
+            self.assertIn("A shell command always travels as the `command` value", text)
+
     def test_instruction_explains_empty_output(self):
         """工具说明必须写明「空输出 = 成功，不要重发同一条命令」
         （用户实测死循环的第一道防线）。"""

@@ -447,8 +447,10 @@ def _build_edit_prompt(doc: MdDoc, instruction: str) -> str:
         "可用工具：edit_markdown\n"
         "调用格式（代码围栏，info string 必须是 tool_call；围栏内只有这一个 JSON 对象）：\n"
         "```tool_call\n"
-        '{"name": "edit_markdown", "arguments": {"start": <int>, "end": <int>, "new_text": "<替换内容>"}}\n'
+        '{"name": "edit_markdown", "arguments": {"start": 12, "end": 14, "new_text": "..."}}\n'
         "```\n"
+        "上面的 12/14 与 \"...\" 只是占位示例，必须换成真实行号与真实替换内容；"
+        "不要照抄示例（尖括号占位符会被原样当成参数值发出去）。\n"
         "start/end 为 1-based 闭区间行号，必须落在下面视图的行号范围内。\n"
         "代码围栏（[[fence...]] 标记的行）内部不要做结构改动，除非明确要求。"
     )

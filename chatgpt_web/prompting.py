@@ -423,8 +423,9 @@ def build_prompt(
     use_tools = bool(tools) and tool_choice != "none"
     if seed and use_tools:
         # 新 bucket / 重置后的第一轮：在播种开头再放一次格式强调（强制要求），
-        # 模型最容易在这种时候退回原生 DSML 标记或干脆无视工具。
-        parts.insert(1, format_tool_call_emphasis())
+        # 模型最容易在这种时候退回原生 DSML 标记或干脆无视工具。传入 tools 让它
+        # 也带一个**具体**示例（与主注入块共用同一份生成逻辑，两处形态永不漂移）。
+        parts.insert(1, format_tool_call_emphasis(list(tools or [])))
 
     # 历史（播种）或增量消息从这里开始追加；工具说明要插在它们**内部**。
     history_start = len(parts)

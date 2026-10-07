@@ -256,6 +256,13 @@ TOOL_NUDGE_UNTIL_FIRST_CALL = env_bool("TOOL_NUDGE_UNTIL_FIRST_CALL", True)
 TOOLS_INSTRUCTION_VERBOSE = env_bool("TOOLS_INSTRUCTION_VERBOSE", False)
 # 工具说明里单条描述的最大字符数（0 = 不限制）。过长的描述无助于模型选对工具。
 TOOLS_DESC_MAX_CHARS = env_int("TOOLS_DESC_MAX_CHARS", 200)
+# shell 围栏修复（2026-10-07 用户实测）：模型有时不写 tool_call JSON，而是直接回一个
+# ```bash / ```sh 代码块，内容只有裸命令。旧解析链只认 tool_call 围栏，于是整条回复被
+# 当成纯文本、任务静默结束。
+# true（默认）时把这类围栏恢复成一条工具调用，但仅当它能**唯一**对应到客户端工具集里
+# 的一个 shell 类工具、且该工具声明了明确的命令参数键；无法唯一确定时保持不解析。
+# false = 关闭修复（只认 tool_call 系列载体，模型写错就让它下一轮重出）。
+SHELL_FENCE_FALLBACK = env_bool("SHELL_FENCE_FALLBACK", True)
 # 单次 fill() 入参（整段 prompt）的最大字符数硬上限，兜底防止输入框溢出。
 # 这是发送侧最后一道护栏：无论上游怎么拼 prompt，都不超过它。0 = 不限制。
 PROMPT_MAX_CHARS = env_int("PROMPT_MAX_CHARS", 1000000)

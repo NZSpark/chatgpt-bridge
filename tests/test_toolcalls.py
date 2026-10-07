@@ -4,9 +4,11 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from chatgpt_web import config  # noqa: E402
 from chatgpt_web.toolcalls import (  # noqa: E402
     ToolCallExecutionError,
     ToolCallParseError,
@@ -23,6 +25,7 @@ from chatgpt_web.toolcalls import (  # noqa: E402
     execute_tool_call_requests,
     format_tools_instruction,
     normalize_tool_call_requests,
+    parse_reply_tool_calls,
     parse_tool_call_requests,
     parse_tool_calls,
     run_tool_call_pipeline,
@@ -53,9 +56,16 @@ class FormatInstructionTests(unittest.TestCase):
         self.assertIn("get_weather", text)
         self.assertIn("查询天气", text)
 
-    def test_contains_call_template(self):
+    def test_contains_fenced_call_template(self):
+        """调用模板必须是一个 ```tool_call 围栏块，且不得再宣传纯文本行写法。
+
+        旧断言查的是 "TOOL_CALL"（**已废弃的纯文本行载体**）：注入格式自
+        2026-10-06 起改为围栏块（doc/code_block_fence.md），提示词里同时保留
+        「唯一方式是 TOOL_CALL 行」就等于自相矛盾——模型会两种写法都试一遍再失败。
+        """
         text = format_tools_instruction(TOOLS)
-        self.assertIn("TOOL_CALL", text.upper())
+        self.assertIn("```tool_call", text)
+        self.assertNotIn("TOOL_CALL", text)
 
     def test_template_is_stable(self):
         self.assertEqual(
@@ -64,6 +74,36 @@ class FormatInstructionTests(unittest.TestCase):
 
     def test_empty_tools(self):
         self.assertIsInstance(format_tools_instruction([]), str)
+
+
+class DescriptionTruncationTests(unittest.TestCase):
+    """工具描述截断不得切在词中间（旧版会产出 "whichever is hit firs…"）。
+
+    半截词本身就丢信息：被切掉的往往是关键约束（read 的 offset 语义、bash 的
+    输出截断规则）。
+    """
+
+    def test_short_description_is_untouched(self):
+        from chatgpt_web.toolcalls import _truncate_description
+
+        self.assertEqual(_truncate_description("Short.", 200), "Short.")
+
+    def test_prefers_sentence_boundary(self):
+        from chatgpt_web.toolcalls import _truncate_description
+
+        desc = "First sentence is complete. Second sentence is much longer than the budget allows."
+        self.assertEqual(_truncate_description(desc, 40), "First sentence is complete. …")
+
+    def test_does_not_cut_a_word_in_half(self):
+        from chatgpt_web.toolcalls import _truncate_description
+
+        desc = "Output is truncated to last 2000 lines or 50KB (whichever is hit first). Extra detail."
+        out = _truncate_description(desc, 60)
+        self.assertTrue(out.endswith("…"))
+        stem = out[:-1].rstrip()
+        self.assertTrue(desc.startswith(stem))
+        # 断点落在空白处 = 没有切碎单词
+        self.assertEqual(desc[len(stem):len(stem) + 1], " ")
 
 
 class ToolNamesTests(unittest.TestCase):
@@ -514,6 +554,132 @@ tool_call
         text = 'json\n{"name": "bash", "arguments": {"command": "echo hi"}}'
         self.assertEqual(parse_tool_calls(text, {"bash"}), [])
 
+
+class ShellFenceRepairTests(unittest.TestCase):
+    """模型写错载体（`bash` 代码块 + 裸命令）时的修复路径（2026-10-07 用户实测）。
+
+    用户报的原例：提示词要求 ```tool_call 围栏后，模型回的却是
+
+    ````text
+    ```bash
+    git status --short
+    ```
+    ````
+
+    旧解析链只认 tool_call 系列载体 → 解析出 0 条 → 客户端把回复当纯文本，任务静默结束。
+    修复必须**保守**：只有能唯一对应到一个 shell 类工具、且已知命令写进哪个参数时才恢复；
+    任何不确定的情形都保持不解析（宁可让模型下一轮重出，也不要执行一条猜出来的命令）。
+    """
+
+    BASH_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a bash command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    EXEC_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "description": "Run a command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        },
+    }]
+
+    def test_user_reported_case_is_recovered(self):
+        calls = parse_reply_tool_calls("```bash\ngit status --short\n```", self.BASH_TOOLS)
+        self.assertEqual(
+            calls, [{"name": "bash", "arguments": {"command": "git status --short"}}]
+        )
+
+    def test_generic_label_maps_to_unique_shell_tool(self):
+        """`sh` / `shell` 这类通用标签 → 客户端里唯一的 shell 类工具，键名按声明（cmd）。"""
+        for label in ("sh", "shell"):
+            with self.subTest(label=label):
+                calls = parse_reply_tool_calls(f"```{label}\nls -la\n```", self.EXEC_TOOLS)
+                self.assertEqual(
+                    calls, [{"name": "exec_command", "arguments": {"cmd": "ls -la"}}]
+                )
+
+    def test_ambiguous_shell_tools_are_not_guessed(self):
+        tools = self.BASH_TOOLS + self.EXEC_TOOLS
+        self.assertEqual(parse_reply_tool_calls("```sh\nls\n```", tools), [])
+
+    def test_non_shell_label_is_ignored(self):
+        self.assertEqual(
+            parse_reply_tool_calls("```python\nprint(1)\n```", self.BASH_TOOLS), []
+        )
+
+    def test_unmapped_shell_label_is_ignored(self):
+        # zsh 不在 DSML 通用名表里，且客户端没有同名工具 → 不猜
+        self.assertEqual(
+            parse_reply_tool_calls("```zsh\nls\n```", self.BASH_TOOLS), []
+        )
+
+    def test_without_tool_definitions_nothing_is_recovered(self):
+        self.assertEqual(parse_reply_tool_calls("```bash\nls\n```", None), [])
+
+    def test_without_parameter_names_nothing_is_recovered(self):
+        # 直接调 parse_tool_calls（未传参数键表）＝旧行为，不猜键名
+        self.assertEqual(parse_tool_calls("```bash\nls\n```", {"bash"}), [])
+
+    def test_multiple_shell_fences_are_not_executed(self):
+        text = "```bash\nls\n```\n\n```sh\npwd\n```"
+        self.assertEqual(parse_reply_tool_calls(text, self.BASH_TOOLS), [])
+
+    def test_tool_call_fence_wins_over_shell_fence(self):
+        # 正规载体在场时不去跑“近似命令”（后者可能只是模型贴的示例）
+        text = (
+            '```tool_call\n{"name": "bash", "arguments": {"command": "ls"}}\n```\n'
+            "```bash\nrm -rf /tmp/x\n```"
+        )
+        calls = parse_reply_tool_calls(text, self.BASH_TOOLS)
+        self.assertEqual([c["arguments"]["command"] for c in calls], ["ls"])
+
+    def test_json_body_inside_shell_fence_is_taken_as_call(self):
+        text = '```bash\n{"name": "bash", "arguments": {"command": "ls -la"}}\n```'
+        calls = parse_reply_tool_calls(text, self.BASH_TOOLS)
+        self.assertEqual([c["arguments"]["command"] for c in calls], ["ls -la"])
+
+    def test_indented_block_is_dedented(self):
+        text = "```bash\n  git status --short\n  git log --oneline -1\n```"
+        calls = parse_reply_tool_calls(text, self.BASH_TOOLS)
+        self.assertEqual(
+            calls[0]["arguments"]["command"],
+            "git status --short\ngit log --oneline -1",
+        )
+
+    def test_unbalanced_quotes_are_dropped(self):
+        # 既有护栏仍生效：引号不配对的命令几乎必然是解析截断，宁可丢弃
+        self.assertEqual(
+            parse_reply_tool_calls('```bash\necho "oops\n```', self.BASH_TOOLS), []
+        )
+
+    def test_config_flag_disables_repair(self):
+        with mock.patch.object(config, "SHELL_FENCE_FALLBACK", False):
+            self.assertEqual(
+                parse_reply_tool_calls("```bash\nls\n```", self.BASH_TOOLS), []
+            )
+
+    def test_flag_default_is_on(self):
+        self.assertTrue(config.SHELL_FENCE_FALLBACK)
+
+    def test_parameter_names_collected_from_tools(self):
+        from chatgpt_web.toolcalls import tool_parameter_names
+
+        self.assertEqual(tool_parameter_names(self.BASH_TOOLS), {"bash": ["command"]})
+        self.assertEqual(tool_parameter_names(self.EXEC_TOOLS), {"exec_command": ["cmd"]})
+        self.assertEqual(tool_parameter_names(None), {})
 
 
 class ToolCallRequestTests(unittest.TestCase):

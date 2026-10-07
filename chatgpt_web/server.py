@@ -44,7 +44,7 @@ from .toolcalls import (
     EDIT_MARKDOWN_TOOL,
     EDIT_MARKDOWN_TOOL_NAME,
     _tool_names,
-    parse_tool_calls,
+    parse_reply_tool_calls,
     run_local_edit_markdown,
     to_tool_call_models,
 )
@@ -605,7 +605,7 @@ async def chat_completions(
     sent_prompt = driver.sent_prompt(session_key) or prompt
     blocks = code_blocks
     while True:
-        parsed_tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+        parsed_tool_calls = parse_reply_tool_calls(reply_content, request.tools) if wants_tools else []
         events = completion_events(reply_content, parsed_tool_calls)
         all_tool_calls = completed_tool_calls(events)
         local_tool_calls = (

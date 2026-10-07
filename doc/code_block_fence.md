@@ -184,25 +184,46 @@ tool_call
 | `toolcalls.edit_markdown_spec`（`:122`） | 本地 `edit_markdown` 工具说明 | 示例改围栏 |
 | `markdown_io._build_edit_prompt`（`markdown_io.py:448`） | Markdown 编辑链的注入 | `tools_doc` 改为「调用格式（代码围栏，info string 必须是 `tool_call`…）」+ 围栏模板；解析复用同一个 `parse_tool_calls` |
 
-主注入块的实际措辞（节选）：
+主注入块的实际措辞（节选，**已含 §5.5 的收紧**）：
 
 ````text
-To call a tool, output a fenced code block whose info string is exactly `tool_call`,
-containing ONE JSON object and nothing else:
+A tool call is ONE fenced code block whose info string is exactly `tool_call`,
+containing one JSON object and nothing else:
 ```tool_call
-{"name": "bash", "arguments": {"command": "..."}}
+{"name": "read", "arguments": {"path": "..."}}
 ```
 Rules:
-- The fence info string MUST be exactly `tool_call` (not json, not text, not empty):
-  a block labelled anything else, or a JSON object written as plain text, will NOT be
-  executed. Do not write the call as a plain `TOOL_CALL: {...}` line — the web UI
-  mangles plain-text lines (it eats backslash escapes and collapses indentation).
-- Inside JSON strings, escape double quotes as \" and newlines as \n; keep the JSON on
-  one line inside the fence.
-- Paste command/script text into the JSON string verbatim - the fenced block preserves it.
+1. The fence info string MUST be exactly `tool_call` - not json, not text, not empty - and
+   the JSON must sit INSIDE the fence. A block labelled anything else, or a call written
+   as plain text instead of a fenced block, will NOT be executed.
+3. Keep the JSON on ONE line inside the fence: escape double quotes as \" and line breaks
+   as \n; never put a raw line break inside a JSON string.
+4. Paste command / script / file text into the JSON string verbatim - the fenced block
+   preserves it exactly. For shell commands prefer single quotes inside the command
+   (e.g. git commit -m 'msg') so they never clash with the JSON quotes.
 ````
 
 （「一次只回一个调用」「空输出＝成功不要重发」等既有关键规则**原样保留**，本次只换载体。）
+
+### 5.5 后续收紧：矛盾措辞与占位符形态（2026-10-07）
+
+载体切换本身是对的，但落地措辞里有四处会让模型「理解错」的缺陷，用户实测反馈后逐条修掉：
+
+| 缺陷 | 为什么会让模型失败 | 修法 |
+| --- | --- | --- |
+| 头段落写「the ONLY way … is to **emit a TOOL_CALL line**」，规则里又禁止纯文本行 | **同一段自相矛盾**：模型两种写法都会试，而纯文本行会被网页渲染改写（§2.13）→ 调用丢失 | 头段落改为「output a tool call **in the format below**」；全篇不再出现 `TOOL_CALL` 这个 token |
+| 规则里写「Do not write the call as a plain `TOOL_CALL: {...}` line」并解释 UI 如何吃掉转义 | **负向示范**：把禁用写法的具体形态教给了模型（列举即示范），反而提高它写出该形态的概率 | 禁止项改为抽象描述：「A block labelled anything else, or a call written as plain text instead of a fenced block, will NOT be executed」 |
+| 示例一律用字符串占位：`read` 的示例是 `{"path": "...", "offset": "..."}` | 参数类型被教错（offset 是整数，照抄得到字符串）；且示例只取「前两个属性」，必填项可能根本没出现在示例里 | 新增 `_tool_example_call`：优先 `required` 参数（最多 4 个），值按声明的 `type` 生成（整数/布尔/数组/对象给同类型字面量，字符串才用 `"..."`） |
+| 强调块与 `edit_markdown` 说明里的模板不是合法 JSON：`{arguments object}`、`<int>`、`<value>` | 照抄即非法 JSON；尖括号占位符还可能被 shell 当重定向符 | 强调块改为复用 `_tool_example_call(tools)`（`format_tool_call_emphasis` 新增可选 `tools` 参数）；`edit_markdown` / 纠偏块 / `markdown_io._build_edit_prompt` 的示例改成可解析的字面量 + 「Replace the "..." placeholders」说明 |
+
+顺带两处可读性修复：
+
+- **规则改成编号列表**（1–9）并去掉解释性 meta（「web UI 怎么吃掉转义」这类实现细节对模型没有决策价值，只稀释核心要求）；
+- **工具描述截断按句末/词边界**（`_truncate_description`）：旧实现硬切在 `TOOLS_DESC_MAX_CHARS`，实际产出过 `whichever is hit firs…`、`saved to a tem…` 这种半截词，而被切掉的往往正是偏移量语义、输出截断规则这类关键约束。
+
+落地后（2026-10-07）：`ruff check .` / `mypy chatgpt_web` 全绿，`.venv/bin/python -m pytest` **439 passed / 17 skipped**（新增 8 条用例锁定上述不变量：两块提示词里不得出现 `TOOL_CALL`、示例参数按声明类型生成、`edit_markdown` / 强调块 / 纠偏块的示例必须能被 `parse_tool_calls` 解析、描述截断不得切碎单词）。
+
+**未做（有意）**：`parse_tool_calls` 仍保留行首 `TOOL_CALL:` 的历史兼容分支（老客户端 / 历史回放），只是不再在提示词里宣传它。
 
 ### 5.2 解析侧：判定链与兼容矩阵
 
@@ -381,6 +402,10 @@ tool_call
 | `test_prompting::test_example_roundtrips_through_parser` | 从注入指令里抽出 ` ```tool_call ` 示例，直接喂 `parse_tool_calls` → 1 条，且围栏内 JSON 能被 `json.loads`（**提示词与解析器同源**） |
 | `test_prompting::test_emphasis_block_states_mandate` | 强调块必须出现 ` ```tool_call `，且不得再出现「no code fences」旧措辞 |
 | `test_prompting::test_instruction_mandates_single_call` | 两块提示词均为 `ONE tool_call`，不得出现旧版多调用措辞 |
+| `test_prompting::test_instruction_never_advertises_plain_text_calls`（§5.5） | 两块提示词里都不得再出现 `TOOL_CALL`（只允许围栏载体） |
+| `test_prompting::test_example_uses_required_params_with_declared_types`（§5.5） | 示例只列 `required` 参数，整数参数不得写成字符串占位 |
+| `test_tool_injection::ExampleShapeTests`（§5.5） | `edit_markdown` 说明 / 强调块 / 纠偏块里的示例必须能被 `json.loads` + `parse_tool_calls` 往返 |
+| `test_toolcalls::DescriptionTruncationTests`（§5.5） | 描述截断优先落在句末/空白处，不得切碎单词 |
 | `test_tool_injection::RetryNudgeTests::test_nudge_demands_single_tool_call` | 纠偏文本含围栏模板，且 `tool_call_predicate(TOOLS)` 对其返回 True |
 
 ### 7.2 区分力实验（证明用例不是「必然通过」）

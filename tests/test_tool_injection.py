@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import json
 import unittest
 from unittest import mock
 
@@ -21,6 +22,7 @@ from chatgpt_web.toolcalls import (
     RETRY_HEADER,
     TOOLCALL_HEADER,
     edit_markdown_spec,
+    format_tool_call_emphasis,
     format_tool_retry_nudge,
     format_tools_instruction,
     tool_call_predicate,
@@ -94,6 +96,44 @@ class HeaderConstantTests(unittest.TestCase):
         ]
         prompt = build_prompt(messages, tools=EDIT_TOOLS, seed=True)
         self.assertEqual(prompt.count(EDIT_MD_HEADER), 1)
+
+
+class ExampleShapeTests(unittest.TestCase):
+    """注入块里的示例必须是**可解析的合法 JSON**。
+
+    背景：旧版示例把占位符写成尖括号（`edit_markdown` 的 `"start": <int>`、
+    强调块的 `{arguments object}`），模型会把占位符原样照抄 → JSON 非法 / 参数类型错
+    （shell 收到字面量 `<` 直接语法报错）。示例必须与解析器同源、可往返。
+    """
+
+    def _fenced_body(self, text: str) -> str:
+        start = text.index("```tool_call\n") + len("```tool_call\n")
+        end = text.index("\n```", start)
+        return text[start:end]
+
+    def test_edit_markdown_spec_example_parses(self) -> None:
+        from chatgpt_web.toolcalls import parse_tool_calls
+
+        body = self._fenced_body(edit_markdown_spec())
+        self.assertEqual(json.loads(body)["name"], "edit_markdown")
+        parsed = parse_tool_calls(
+            f"```tool_call\n{body}\n```", {"edit_markdown"}
+        )
+        self.assertEqual([c["name"] for c in parsed], ["edit_markdown"])
+
+    def test_emphasis_block_example_parses_when_tools_given(self) -> None:
+        from chatgpt_web.toolcalls import parse_tool_calls
+
+        body = self._fenced_body(format_tool_call_emphasis(TOOLS))
+        self.assertEqual(json.loads(body)["name"], "bash")
+        parsed = parse_tool_calls(f"```tool_call\n{body}\n```", {"bash"})
+        self.assertEqual([c["name"] for c in parsed], ["bash"])
+
+    def test_retry_nudge_example_parses(self) -> None:
+        body = self._fenced_body(format_tool_retry_nudge())
+        # 占位符形式必须是合法 JSON（否则模型照抄时整条调用失效）
+        self.assertIsInstance(json.loads(body), dict)
+        self.assertNotIn("<", body)
 
 
 class SeedOrderTests(unittest.TestCase):
