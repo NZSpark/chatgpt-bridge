@@ -587,13 +587,12 @@ E5 必须检查输入框最后一次被填充的内容，确保 bridge 没有追
 
 ## PI-023 Property / invariant tests
 
-状态：TODO（部分覆盖）｜优先级：P1｜依赖：PI-007、PI-016、PI-017
+状态：DONE｜优先级：P1｜依赖：PI-007、PI-016、PI-017
 
-> 核对（2026-10-08）：第 3 项「session 历史不污染」已由
-> `tests/test_session_invariants.py` 覆盖；其余 5 项（normalize(parse(x)) 噪声、
-> edit path 恒在 root、自动 nudge 最多一次、执行后 final plain text 不 nudge、
-> 同 tool_call_id 不重复执行）目前散落在 `test_toolcalls.py` /
-> `test_streaming.py` 的定向用例中，尚未抽成统一的 property 测试文件。
+> 核对（2026-10-08）：6 项不变量均已有自动化覆盖。`tests/test_property_invariants.py` 显式覆盖
+> normalize(parse(x)) 噪声、edit path 恒在 root、自动 nudge 最多一次、执行后 final plain text 不 nudge、
+> 同 tool_call_id 不重复执行；第 3 项「session 历史不污染」由 `tests/test_session_invariants.py` 覆盖。
+> PI-023 因此完成，无需新增运行时实现。
 
 至少覆盖：
 
@@ -977,7 +976,7 @@ perf: establish browser request baseline
 | PI-020 | metrics | P1 | PI-019 | DONE |
 | PI-021 | 日志 correlation | P2 | PI-020 | TODO |
 | PI-022 | 五个黄金 E2E | P1 | PI-005/003 | TODO |
-| PI-023 | 性质 / 不变量测试 | P1 | PI-007/016/017 | TODO（部分：session 不变量已覆盖） |
+| PI-023 | 性质 / 不变量测试 | P1 | PI-007/016/017 | DONE |
 | PI-024 | API contract tests | P2 | PI-003/004 | TODO（部分：streaming/responses/api_package 已覆盖） |
 | PI-025 | 拆分 toolcalls.py | P2 | PI-007/008/010 | DONE（由 PI-901 吸收，见 §9 说明） |
 | PI-026 | 拆分 chat_io.py | P2 | PI-005/012 | TODO |
