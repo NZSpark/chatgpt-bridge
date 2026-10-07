@@ -110,6 +110,39 @@ class EnvFileTests(unittest.TestCase):
         config._load_env_file(Path("/nonexistent/path/to/.env"))
 
 
+class ConfigPackageTests(unittest.TestCase):
+    """PI-906：config 拆包后，domain 模块与兼容 facade 必须都能用。"""
+
+    def test_domain_modules_reexport_typed_snapshots(self):
+        from chatgpt_web.config.browser import BrowserConfig
+        from chatgpt_web.config.debug import DebugConfig
+        from chatgpt_web.config.limits import CompletionConfig, LimitConfig, StorageConfig
+        from chatgpt_web.config.server import ServerConfig
+        from chatgpt_web.config.session import SessionConfig
+        from chatgpt_web.config.tools import ToolConfig
+
+        self.assertIs(ServerConfig, config.ServerConfig)
+        self.assertIs(BrowserConfig, config.BrowserConfig)
+        self.assertIs(SessionConfig, config.SessionConfig)
+        self.assertIs(ToolConfig, config.ToolConfig)
+        self.assertIs(DebugConfig, config.DebugConfig)
+        self.assertIs(CompletionConfig, config.CompletionConfig)
+        self.assertIs(StorageConfig, config.StorageConfig)
+        # LimitConfig 是 PI-906 文档名，指向 completion limits 快照。
+        self.assertIs(LimitConfig, CompletionConfig)
+
+    def test_legacy_module_level_names_survive(self):
+        # 历史代码大量使用 ``config.<NAME>``；拆包后必须继续可读。
+        for name in ("HOST", "PORT", "INPUT_SELECTORS", "RESET_TOKEN", "DEBUG"):
+            self.assertTrue(hasattr(config, name), name)
+
+    def test_project_root_points_at_repo_root(self):
+        # 包内 _core.py 比原 config.py 深一层，PROJECT_ROOT 必须仍然指向仓库根。
+        self.assertTrue((config.PROJECT_ROOT / "chatgpt_web").is_dir())
+        self.assertTrue((config.PROJECT_ROOT / ".env.example").exists())
+        self.assertNotEqual(config.PROJECT_ROOT.name, "chatgpt_web")
+
+
 class TypedConfigTests(unittest.TestCase):
     def test_build_config_bundle_is_typed_and_read_only(self):
         bundle = config.build_config_bundle()

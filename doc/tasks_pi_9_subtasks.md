@@ -3,6 +3,17 @@
 > 来源：doc/tasks_pi_9.md
 > 目标：将模块拆分建议转换为可执行工程任务。
 
+## 状态汇总（2026-10-07 核对代码后更新）
+
+| 阶段 | 任务 | 状态 | 落地位置 / 备注 |
+|---|---|---|---|
+| 一 | PI-901 Tool Runtime 拆分 | ✅ 已完成 | `chatgpt_web/tools/`（parser/validator/policy/executor/ledger/serializer）；`toolcalls.py` 为 facade；`tests/test_tools_package.py` |
+| 二 | PI-902 Completion 拆分 | ✅ 已完成 | `chatgpt_web/completion/`（lifecycle/generator/extractor）；`completion/__init__.py` 即 facade；`tests/test_completion_package.py` |
+| 三 | PI-903 Browser 层拆分 | ✅ 已完成 | `chatgpt_web/browser/`（selectors/dom_adapter/diagnostics/driver）；`dom_adapter.py` 为 facade；`tests/test_browser_package.py` |
+| 四 | PI-904 API Adapter 拆分 | ⬜ 未开始 | 无 `api/`；`server.py`(717行)/`responses.py`(692行)/`streaming.py`(247行) 仍分立 |
+| 五 | PI-905 Session 模块化 | ⬜ 未开始 | 无 `session/`；`session_store.py`(357行) 仍是单模块 |
+| 六 | PI-906 Config 模块化 | ✅ 已完成 | `chatgpt_web/config/`（_core + server/browser/session/tools/limits/debug）；`config/__init__.py` 为兼容 facade；`tests/test_config.py` 含包结构回归 |
+
 ## 总体原则
 
 - 保持现有 API 行为不变。
@@ -14,6 +25,12 @@
 ---
 
 # PI-901 Tool Runtime 拆分
+
+## 状态：已完成（2026-10-07）
+
+落地：`chatgpt_web/tools/`（parser / validator / policy / executor / ledger /
+serializer）；`chatgpt_web/toolcalls.py` 作为兼容 facade 再导出；
+`tests/test_tools_package.py` 为独立回归测试。
 
 ## 目标
 
@@ -254,6 +271,11 @@ browser/
 
 # PI-904 API Adapter 拆分
 
+## 状态：未开始
+
+现状：`chatgpt_web/api/` 不存在；`server.py`（~29KB）/ `responses.py` /
+`streaming.py` 仍是独立模块，协议转换与 HTTP 处理仍混在 server 里。
+
 ## 子任务
 
 ### PI-904-1 创建 api package
@@ -296,6 +318,11 @@ api/
 
 # PI-905 Session 模块化
 
+## 状态：未开始
+
+现状：`chatgpt_web/session/` 不存在；`session_store.py`（~15KB）仍是单模块，
+schema / store / migration / lock 未拆分。
+
 ## 子任务
 
 ### PI-905-1 创建 session package
@@ -336,32 +363,48 @@ v1 -> v2 -> v3
 
 # PI-906 Config 模块化
 
-## 子任务
+## 状态：已完成（2026-10-08）
 
-### PI-906-1 创建 config package
+实际落地结构：
 
-拆分：
+```
+chatgpt_web/config/
+├── __init__.py   兼容 facade：`from ._core import *` + 再导出 domain 类型
+├── _core.py      .env 加载 + 全部可调参数 + typed 快照 + build/load/summary
+├── server.py     ServerConfig
+├── browser.py    BrowserConfig
+├── session.py    SessionConfig
+├── tools.py      ToolConfig
+├── limits.py     LimitConfig（=CompletionConfig 别名）+ StorageConfig
+└── debug.py      DebugConfig
+```
 
-- ServerConfig
-- BrowserConfig
-- SessionConfig
-- ToolConfig
-- LimitConfig
-- DebugConfig
+关键兼容点：
 
-### PI-906-2 保持环境变量兼容
+- `chatgpt_web/config.py` 单文件删除，改为包；`import chatgpt_web.config` /
+  `from chatgpt_web import config` 仍解析到 `config/__init__.py`。
+- `config.<NAME>`（历史代码与测试的 `patch.object(config, ...)`）不变：
+  `__init__` 把 `_core` 全部公开名字再导出。
+- `build_config_bundle()` 通过 `_facade()` 在**调用时**读 `chatgpt_web.config`
+  属性（而非捕获 `_core` 全局），故 `patch.object(config, "HOST", ...)` 生效。
+- `PROJECT_ROOT` 修正为 `_core.py.parent.parent.parent`（包比原模块深一层）。
 
-验收：
+测试：`tests/test_config.py`（含 `ConfigPackageTests`）、`tests/test_config_drift.py`
+与 `tests/test_doc_sync.py` 改为扫描 `chatgpt_web/config/*.py`。
 
-- 原 `.env` 不需要修改。
+## 子任务（全部完成）
 
-### PI-906-3 增加配置测试
+### PI-906-1 创建 config package  ✅
 
-覆盖：
+- ServerConfig / BrowserConfig / SessionConfig / ToolConfig / LimitConfig / DebugConfig
 
-- 默认值；
-- 非法值；
-- 环境覆盖。
+### PI-906-2 保持环境变量兼容  ✅
+
+- 原 `.env` 不需要修改（键与默认值不变）。
+
+### PI-906-3 增加配置测试  ✅
+
+- 默认值、非法值回退、环境覆盖、包结构、facade 契约。
 
 ---
 

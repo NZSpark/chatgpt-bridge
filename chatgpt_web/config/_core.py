@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # 这里用一个极简的 .env 解析器，避免为读取配置引入额外依赖：
 #   * 已存在的真实环境变量优先于 .env（便于临时覆盖 / CI）；
 #   * 支持 `KEY=value`、`#` 注释、空行、值两侧引号。
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 ENV_FILE = PROJECT_ROOT / ".env"
 
 
@@ -540,91 +540,119 @@ class ConfigBundle:
     debug: DebugConfig
 
 
+def _facade():
+    """Return the module whose attributes hold the live config values.
+
+    Historically ``config.py`` was a single module and tests patch
+    ``config.<NAME>`` directly. Now that config is a package, the public
+    facade is ``chatgpt_web.config`` (the package ``__init__``). We resolve it
+    at call time so ``patch.object(config, ...)`` keeps working, falling back
+    to this ``_core`` module when imported in isolation.
+    """
+    import sys
+
+    return sys.modules.get("chatgpt_web.config", sys.modules[__name__])
+
+
 def build_config_bundle() -> ConfigBundle:
-    """Build a typed snapshot from the legacy module-level configuration facade."""
+    """Build a typed snapshot from the live configuration facade.
+
+    Values are read through :func:`_facade` **at call time** (not captured as
+    module globals), so tests can ``patch.object(config, "<NAME>", value)``.
+    """
+    cfg = _facade()
     return ConfigBundle(
         server=ServerConfig(
-            host=HOST,
-            port=PORT,
-            reset_token=RESET_TOKEN,
-            enable_responses_api=ENABLE_RESPONSES_API,
-            session_key_header=SESSION_KEY_HEADER,
+            host=cfg.HOST,
+            port=cfg.PORT,
+            reset_token=cfg.RESET_TOKEN,
+            enable_responses_api=cfg.ENABLE_RESPONSES_API,
+            session_key_header=cfg.SESSION_KEY_HEADER,
         ),
         browser=BrowserConfig(
-            user_data_dir=USER_DATA_DIR,
-            headless=HEADLESS,
-            ready_timeout_ms=READY_TIMEOUT_MS,
-            fill_timeout_ms=FILL_TIMEOUT_MS,
-            fill_retries=FILL_RETRIES,
-            input_selectors=tuple(INPUT_SELECTORS),
-            send_button_selectors=tuple(SEND_BUTTON_SELECTORS),
-            response_selectors=RESPONSE_SELECTORS,
-            ready_selector=READY_SELECTOR,
-            new_chat_selector=NEW_CHAT_SELECTOR,
-            think_mode_default=THINK_MODE_DEFAULT,
-            think_mode_selector=THINK_MODE_SELECTOR,
-            think_mode_texts=THINK_MODE_TEXTS,
-            code_block_selector=CODE_BLOCK_SELECTOR,
-            code_tag_selector=CODE_TAG_SELECTOR,
+            user_data_dir=cfg.USER_DATA_DIR,
+            headless=cfg.HEADLESS,
+            ready_timeout_ms=cfg.READY_TIMEOUT_MS,
+            fill_timeout_ms=cfg.FILL_TIMEOUT_MS,
+            fill_retries=cfg.FILL_RETRIES,
+            input_selectors=tuple(cfg.INPUT_SELECTORS),
+            send_button_selectors=tuple(cfg.SEND_BUTTON_SELECTORS),
+            response_selectors=cfg.RESPONSE_SELECTORS,
+            ready_selector=cfg.READY_SELECTOR,
+            new_chat_selector=cfg.NEW_CHAT_SELECTOR,
+            think_mode_default=cfg.THINK_MODE_DEFAULT,
+            think_mode_selector=cfg.THINK_MODE_SELECTOR,
+            think_mode_texts=cfg.THINK_MODE_TEXTS,
+            code_block_selector=cfg.CODE_BLOCK_SELECTOR,
+            code_tag_selector=cfg.CODE_TAG_SELECTOR,
         ),
         session=SessionConfig(
-            session_file=str(SESSION_FILE),
-            session_scoping=SESSION_SCOPING,
-            session_scoping_by_ua=SESSION_SCOPING_BY_UA,
-            session_key_max_len=SESSION_KEY_MAX_LEN,
-            max_session_buckets=MAX_SESSION_BUCKETS,
-            max_session_state_cache=MAX_SESSION_STATE_CACHE,
-            bucket_idle_ttl_s=BUCKET_IDLE_TTL_S,
-            parallel_buckets=PARALLEL_BUCKETS,
-            bucket_lock_timeout_s=BUCKET_LOCK_TIMEOUT_S,
-            bucket_lock_queue=BUCKET_LOCK_QUEUE,
-            session_max_turns=SESSION_MAX_TURNS,
-            session_max_tokens=SESSION_MAX_TOKENS,
-            new_session_on_start=NEW_SESSION_ON_START,
+            session_file=str(cfg.SESSION_FILE),
+            session_scoping=cfg.SESSION_SCOPING,
+            session_scoping_by_ua=cfg.SESSION_SCOPING_BY_UA,
+            session_key_max_len=cfg.SESSION_KEY_MAX_LEN,
+            max_session_buckets=cfg.MAX_SESSION_BUCKETS,
+            max_session_state_cache=cfg.MAX_SESSION_STATE_CACHE,
+            bucket_idle_ttl_s=cfg.BUCKET_IDLE_TTL_S,
+            parallel_buckets=cfg.PARALLEL_BUCKETS,
+            bucket_lock_timeout_s=cfg.BUCKET_LOCK_TIMEOUT_S,
+            bucket_lock_queue=cfg.BUCKET_LOCK_QUEUE,
+            session_max_turns=cfg.SESSION_MAX_TURNS,
+            session_max_tokens=cfg.SESSION_MAX_TOKENS,
+            new_session_on_start=cfg.NEW_SESSION_ON_START,
         ),
         completion=CompletionConfig(
-            chat_keepalive_s=CHAT_KEEPALIVE_S,
-            response_timeout_s=RESPONSE_TIMEOUT_S,
-            response_timeout_extend_s=RESPONSE_TIMEOUT_EXTEND_S,
-            poll_interval_s=POLL_INTERVAL_S,
-            stable_polls=STABLE_POLLS,
-            len_stable_polls=LEN_STABLE_POLLS,
-            resume_quiet_polls=RESUME_QUIET_POLLS,
-            stall_polls=STALL_POLLS,
-            max_upstream_retries=MAX_UPSTREAM_RETRIES,
-            retry_backoff_s=RETRY_BACKOFF_S,
-            cap_check_every=CAP_CHECK_EVERY,
-            seed_max_chars=SEED_MAX_CHARS,
-            seed_system_max_chars=SEED_SYSTEM_MAX_CHARS,
-            seed_env_note=SEED_ENV_NOTE,
-            prompt_max_chars=PROMPT_MAX_CHARS,
-            tool_nudge_until_first_call=TOOL_NUDGE_UNTIL_FIRST_CALL,
-            tools_instruction_verbose=TOOLS_INSTRUCTION_VERBOSE,
-            tools_desc_max_chars=TOOLS_DESC_MAX_CHARS,
+            chat_keepalive_s=cfg.CHAT_KEEPALIVE_S,
+            response_timeout_s=cfg.RESPONSE_TIMEOUT_S,
+            response_timeout_extend_s=cfg.RESPONSE_TIMEOUT_EXTEND_S,
+            poll_interval_s=cfg.POLL_INTERVAL_S,
+            stable_polls=cfg.STABLE_POLLS,
+            len_stable_polls=cfg.LEN_STABLE_POLLS,
+            resume_quiet_polls=cfg.RESUME_QUIET_POLLS,
+            stall_polls=cfg.STALL_POLLS,
+            max_upstream_retries=cfg.MAX_UPSTREAM_RETRIES,
+            retry_backoff_s=cfg.RETRY_BACKOFF_S,
+            cap_check_every=cfg.CAP_CHECK_EVERY,
+            seed_max_chars=cfg.SEED_MAX_CHARS,
+            seed_system_max_chars=cfg.SEED_SYSTEM_MAX_CHARS,
+            seed_env_note=cfg.SEED_ENV_NOTE,
+            prompt_max_chars=cfg.PROMPT_MAX_CHARS,
+            tool_nudge_until_first_call=cfg.TOOL_NUDGE_UNTIL_FIRST_CALL,
+            tools_instruction_verbose=cfg.TOOLS_INSTRUCTION_VERBOSE,
+            tools_desc_max_chars=cfg.TOOLS_DESC_MAX_CHARS,
         ),
         tool=ToolConfig(
-            tool_result_max_chars=TOOL_RESULT_MAX_CHARS,
-            edit_markdown_local=EDIT_MARKDOWN_LOCAL,
-            edit_markdown_backup_dir=EDIT_MARKDOWN_BACKUP_DIR,
-            edit_markdown_root=EDIT_MARKDOWN_ROOT,
-            edit_markdown_write=EDIT_MARKDOWN_WRITE,
-            edit_markdown_max_file_bytes=EDIT_MARKDOWN_MAX_FILE_BYTES,
-            responses_tool_buffer=RESPONSES_TOOL_BUFFER,
+            tool_result_max_chars=cfg.TOOL_RESULT_MAX_CHARS,
+            edit_markdown_local=cfg.EDIT_MARKDOWN_LOCAL,
+            edit_markdown_backup_dir=cfg.EDIT_MARKDOWN_BACKUP_DIR,
+            edit_markdown_root=cfg.EDIT_MARKDOWN_ROOT,
+            edit_markdown_write=cfg.EDIT_MARKDOWN_WRITE,
+            edit_markdown_max_file_bytes=cfg.EDIT_MARKDOWN_MAX_FILE_BYTES,
+            responses_tool_buffer=cfg.RESPONSES_TOOL_BUFFER,
         ),
         storage=StorageConfig(
-            output_dir=OUTPUT_DIR,
-            save_files=SAVE_FILES,
-            output_max_files=OUTPUT_MAX_FILES,
-            output_max_age_days=OUTPUT_MAX_AGE_DAYS,
-            task_snapshot_enabled=TASK_SNAPSHOT_ENABLED,
-            task_file_dir=TASK_FILE_DIR,
-            task_namespace=TASK_NAMESPACE,
-            task_goal_max_chars=TASK_GOAL_MAX_CHARS,
-            task_keep_messages=TASK_KEEP_MESSAGES,
-            task_recent_item_max_chars=TASK_RECENT_ITEM_MAX_CHARS,
+            output_dir=cfg.OUTPUT_DIR,
+            save_files=cfg.SAVE_FILES,
+            output_max_files=cfg.OUTPUT_MAX_FILES,
+            output_max_age_days=cfg.OUTPUT_MAX_AGE_DAYS,
+            task_snapshot_enabled=cfg.TASK_SNAPSHOT_ENABLED,
+            task_file_dir=cfg.TASK_FILE_DIR,
+            task_namespace=cfg.TASK_NAMESPACE,
+            task_goal_max_chars=cfg.TASK_GOAL_MAX_CHARS,
+            task_keep_messages=cfg.TASK_KEEP_MESSAGES,
+            task_recent_item_max_chars=cfg.TASK_RECENT_ITEM_MAX_CHARS,
         ),
-        debug=DebugConfig(debug=DEBUG),
+        debug=DebugConfig(debug=cfg.DEBUG),
     )
+
+
+def load_config() -> ConfigBundle:
+    """Build and return the current typed configuration snapshot.
+
+    Kept as the public compatibility entry point from the former single-file
+    ``config.py`` implementation.
+    """
+    return build_config_bundle()
 
 
 def effective_config_summary() -> Dict[str, Any]:

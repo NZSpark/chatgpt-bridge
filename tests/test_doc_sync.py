@@ -48,14 +48,18 @@ class DesignDocSyncTests(unittest.TestCase):
         对照的是 config.py 源码里的字面量默认值（而非被 .env 覆盖后的运行值）。
         """
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        config_src = (ROOT / "chatgpt_web" / "config.py").read_text(encoding="utf-8")
+        # PI-906 之后 config 是包：合并包内全部 *.py 再抽取字面量默认值。
+        config_dir = ROOT / "chatgpt_web" / "config"
+        config_src = "\n".join(
+            p.read_text(encoding="utf-8") for p in sorted(config_dir.glob("*.py"))
+        )
 
         # README 表格行：| `KEY` | `VALUE` | 说明 |
         rows = re.findall(r"^\|\s*`([A-Z][A-Z0-9_]+)`\s*\|\s*`([^`]*)`\s*\|", readme, re.MULTILINE)
         self.assertTrue(rows, "README 未解析到任何变量表行")
 
         def builtin_default(key: str):
-            """从 config.py 取 env_*("KEY", <default>) 的字面量默认值；取不到返回 None。"""
+            """从 config 包取 env_*("KEY", <default>) 的字面量默认值；取不到返回 None。"""
             match = re.search(
                 rf'env_(?:int|float|bool|str)\(\s*"{re.escape(key)}"\s*,\s*([^)\n]+?)\s*\)',
                 config_src,
@@ -77,7 +81,7 @@ class DesignDocSyncTests(unittest.TestCase):
                 same = str(actual).lower() == str(documented).lower()
             self.assertTrue(
                 same,
-                f"{key}: README 写 {documented}，config.py 内置默认 {actual}",
+                f"{key}: README 写 {documented}，config 内置默认 {actual}",
             )
         self.assertGreater(checked, 0, "没有校验到任何 README 变量表默认值")
 
