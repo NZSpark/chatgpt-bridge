@@ -13,6 +13,11 @@
 """
 
 from . import config, tasks
+from .driver import (
+    DEFAULT_SESSION_KEY,
+    ChatGPTWebDriver,
+    SessionState,
+)
 from .errors import (
     BridgeError,
     BrowserError,
@@ -31,11 +36,6 @@ from .errors import (
     ToolCallValidationError,
     ToolError,
     ToolParseError,
-)
-from .driver import (
-    DEFAULT_SESSION_KEY,
-    ChatGPTWebDriver,
-    SessionState,
 )
 from .models import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
 from .prompting import build_prompt, estimate_tokens

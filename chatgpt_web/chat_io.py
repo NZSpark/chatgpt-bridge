@@ -21,6 +21,7 @@ from .errors import (
     ChatGPTContextLimitError,
     ChatGPTTimeoutError,
 )
+from .metrics import metrics
 from .prompting import _delta_piece, estimate_tokens
 from .task_state import TaskState, TaskStateName
 
@@ -105,6 +106,8 @@ class ChatIOMixin:
         await self._ensure_page(bucket)
 
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                metrics.inc("request_retry_total")
             state = self._state(bucket)
             if state.pending_rotation:
                 # 体积超预算或上次检测到“到顶”：先轮转，再播种
@@ -628,6 +631,7 @@ class ChatIOMixin:
                 )
             chat_input = filled
             await self._submit_prompt(page, chat_input)
+            generation_started_at = time.monotonic()
 
             # 2. 轮询等待回复完成
             await asyncio.sleep(config.POLL_INTERVAL_S)
@@ -704,6 +708,7 @@ class ChatIOMixin:
                     if poll % cap_check_every == 0:
                         if await self._page_shows_context_limit(bucket):
                             self._mark_context_limit(bucket)
+                            metrics.observe("browser_generation_latency", time.monotonic() - generation_started_at)
                             raise self._context_limit_error()
                     generating = await self._page_is_generating(bucket)
                 else:
@@ -724,6 +729,7 @@ class ChatIOMixin:
                     and not empty_nodes_reported
                 ):
                     empty_nodes_reported = True
+                    metrics.inc("browser_selector_miss_total")
                     await self._log_empty_reply_nodes(page)
 
                 # 判定逻辑全部在纯函数里（生成中不结束 / 停止按钮消失但内容仍在变 /
@@ -757,7 +763,9 @@ class ChatIOMixin:
                     await self._remember_session(bucket)
                     if await self._page_shows_context_limit(bucket):
                         self._mark_context_limit(bucket)
+                        metrics.observe("browser_generation_latency", time.monotonic() - generation_started_at)
                         raise self._context_limit_error()
+                    metrics.observe("browser_generation_latency", time.monotonic() - generation_started_at)
                     raise ChatGPTTimeoutError(
                         f"页面连续 {verdict.state.stalled} 次未产生任何回复内容"
                         "（疑似未登录或会话失效），已提前中止。"
@@ -780,7 +788,9 @@ class ChatIOMixin:
                     # 超时前最后确认一次是否“到顶”，否则错误信息会误导排查方向
                     if await self._page_shows_context_limit(bucket):
                         self._mark_context_limit(bucket)
+                        metrics.observe("browser_generation_latency", time.monotonic() - generation_started_at)
                         raise self._context_limit_error()
+                    metrics.observe("browser_generation_latency", time.monotonic() - generation_started_at)
                     raise ChatGPTTimeoutError(
                         f"等待 ChatGPT 响应超时（{int(config.RESPONSE_TIMEOUT_S)}s）。"
                     )
@@ -808,7 +818,15 @@ class ChatIOMixin:
                 await asyncio.sleep(config.POLL_INTERVAL_S)
 
             # 3. 从最新回复节点中提取代码块
-            extracted_blocks = await self._extract_code_blocks(latest_node)
+            extraction_started_at = time.monotonic()
+            try:
+                extracted_blocks = await self._extract_code_blocks(latest_node)
+            except Exception:
+                metrics.inc("reply_extraction_failure_total")
+                metrics.observe("reply_extraction_latency", time.monotonic() - extraction_started_at)
+                raise
+            metrics.observe("reply_extraction_latency", time.monotonic() - extraction_started_at)
+            metrics.observe("browser_generation_latency", time.monotonic() - generation_started_at)
 
             # 4. 更新会话状态：已建立历史，并累计体积；超预算则下一轮轮转
             state.has_history = True

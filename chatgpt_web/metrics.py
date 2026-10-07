@@ -10,8 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Dict, Mapping, Optional
-
+from typing import Any, Dict, Optional
 
 COUNTERS = (
     "request_total",
@@ -44,9 +43,9 @@ class MetricsRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._counters = defaultdict(int)
-        self._latency_totals = defaultdict(float)
-        self._latency_counts = defaultdict(int)
+        self._counters: Dict[str, int] = defaultdict(int)
+        self._latency_totals: Dict[str, float] = defaultdict(float)
+        self._latency_counts: Dict[str, int] = defaultdict(int)
         self._started_at = time.monotonic()
 
     def inc(self, name: str, value: int = 1) -> int:

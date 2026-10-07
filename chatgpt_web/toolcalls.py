@@ -231,9 +231,9 @@ class ToolExecutionLedger:
                 event = threading.Event()
                 event.set()
                 return existing, event, False
-            event = self._inflight.get(key)
-            if event is not None:
-                return None, event, False
+            pending = self._inflight.get(key)
+            if pending is not None:
+                return None, pending, False
             event = threading.Event()
             self._inflight[key] = event
             return None, event, True
@@ -1336,6 +1336,7 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     # 调用都没能交出去。以前这里是静默的：客户端只收到纯文本、把回复当最终答案，
     # 任务就悄悄结束了，日志里没有任何线索（2026-10-06 真机回归，见 update.md §2.13）。
     if not calls and (matches or _TOOL_CALL_FENCE_RE.search(text)):
+        metrics.inc("tool_parse_failure_total")
         logger.warning(
             "回复里有 %d 个 TOOL_CALL 标记，但没解析出任何可用调用，整条调用已丢弃"
             "（客户端只会收到纯文本，可能把回复当成最终答案并结束任务）。"

@@ -13,9 +13,14 @@ from . import config
 from .driver import ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
 from .events import AssistantTextDelta, ToolCall, completion_events
 from .models import ChatCompletionRequest, ChatMessage
-from .protocol_adapters import chat_sse_choice_for_event, responses_function_call_arguments
 from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
-from .toolcalls import EDIT_MARKDOWN_TOOL_NAME, _tool_names, parse_tool_calls, run_local_edit_markdown
+from .protocol_adapters import chat_sse_choice_for_event, responses_function_call_arguments
+from .toolcalls import (
+    EDIT_MARKDOWN_TOOL_NAME,
+    _tool_names,
+    parse_tool_calls,
+    run_local_edit_markdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +189,7 @@ async def _stream_chat_completion(
         if kind == "delta":
             streamed = True
             choice = chat_sse_choice_for_event(AssistantTextDelta(payload))
+            assert choice is not None  # 文本增量一定被适配器投影为 choice（断言只为类型收窄）
             yield encode(choice["delta"], finish=choice["finish_reason"])
         else:
             reply_content, _blocks, error, error_type = payload
@@ -203,6 +209,7 @@ async def _stream_chat_completion(
     if bridge_tool_calls:
         for index, event in enumerate(bridge_tool_calls):
             choice = chat_sse_choice_for_event(event, tool_index=index)
+            assert choice is not None  # 工具调用事件带 index，一定投影为 choice
             yield encode(choice["delta"], finish=choice["finish_reason"])
             arguments_str = responses_function_call_arguments(event)
             for piece in _chunk_text(arguments_str):
@@ -212,6 +219,7 @@ async def _stream_chat_completion(
         if not streamed and reply_content:
             for piece in _chunk_text(reply_content):
                 choice = chat_sse_choice_for_event(AssistantTextDelta(piece))
+                assert choice is not None  # 文本增量一定被适配器投影为 choice
                 yield encode(choice["delta"], finish=choice["finish_reason"])
         yield encode(None, finish="stop")
 

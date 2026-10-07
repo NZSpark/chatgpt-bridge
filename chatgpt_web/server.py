@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -22,13 +22,14 @@ from .driver import (
     ChatGPTTimeoutError,
     ChatGPTWebDriver,
 )
+from .events import completion_events
 from .logging_setup import new_request_id, set_request_id
 from .metrics import metrics
 from .models import (
     SUPPORTED_MODELS,
     ChatCompletionRequest,
-    ChatMessage,
     ChatCompletionResponse,
+    ChatMessage,
     Choice,
     ChoiceMessage,
     ModelCard,
@@ -198,7 +199,7 @@ async def _readiness_snapshot() -> dict:
         "composer_ready": False,
         "new_chat_ready": False,
     }
-    details = {"url": None, "title": None, "errors": []}
+    details: dict[str, Any] = {"url": None, "title": None, "errors": []}
     if page is None:
         details["errors"].append("browser page is not initialized")
         return {"ready": False, "checks": checks, "details": details}

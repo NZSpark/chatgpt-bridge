@@ -21,13 +21,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, ConfigDict
 
 from . import config, tasks
-from .events import AssistantTextDelta, ToolCall as BridgeToolCall, completion_events
 from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTBusyError,
     ChatGPTContextLimitError,
     ChatGPTTimeoutError,
 )
+from .events import AssistantTextDelta, completion_events
+from .events import ToolCall as BridgeToolCall
 from .models import ChatCompletionRequest, ChatMessage, FunctionCall, ToolCall
 from .prompting import build_prompt, estimate_tokens, tool_nudge_predicate
 from .protocol_adapters import (
