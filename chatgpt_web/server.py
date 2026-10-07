@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from typing import List, Optional, Union
 
@@ -22,6 +23,7 @@ from .driver import (
     ChatGPTWebDriver,
 )
 from .logging_setup import new_request_id, set_request_id
+from .metrics import metrics
 from .models import (
     SUPPORTED_MODELS,
     ChatCompletionRequest,
@@ -99,6 +101,24 @@ def _error_response(status_code: int, message: str, err_type: str):
 app = FastAPI(title="ChatGPT Web-to-API Bridge", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    started_at = time.monotonic()
+    metrics.inc("request_total")
+    try:
+        response = await call_next(request)
+        if response.status_code < 400:
+            metrics.inc("request_success_total")
+        else:
+            metrics.inc("request_error_total")
+        return response
+    except Exception:
+        metrics.inc("request_error_total")
+        raise
+    finally:
+        metrics.observe("request_latency", time.monotonic() - started_at)
+
+
 def _client_from_ua(ua: str) -> Optional[str]:
     """从 User-Agent 中提取客户端标识，用于自动按客户端分桶。
 
@@ -168,6 +188,54 @@ def _session_key(
     return sanitized or None
 
 
+async def _readiness_snapshot() -> dict:
+    """Probe the minimum browser/ChatGPT UI surfaces required to serve requests."""
+    page = driver.page
+    checks = {
+        "browser_ready": page is not None and getattr(driver, "context", None) is not None,
+        "chatgpt_page_ready": False,
+        "authenticated": False,
+        "composer_ready": False,
+        "new_chat_ready": False,
+    }
+    details = {"url": None, "title": None, "errors": []}
+    if page is None:
+        details["errors"].append("browser page is not initialized")
+        return {"ready": False, "checks": checks, "details": details}
+
+    try:
+        details["url"] = str(page.url)
+    except Exception as exc:  # noqa: BLE001
+        details["errors"].append(f"page.url: {exc!r}")
+    try:
+        details["title"] = await page.title()
+    except Exception as exc:  # noqa: BLE001
+        details["errors"].append(f"page.title: {exc!r}")
+
+    url = details["url"] or ""
+    title = (details["title"] or "").lower()
+    is_chatgpt_host = "chatgpt.com" in url or "chat.openai.com" in url
+    is_auth_surface = any(token in url.lower() for token in ("/auth", "/login", "/sign-in", "/signup"))
+    is_challenge = any(token in title for token in ("just a moment", "checking your browser", "verify you are human"))
+    checks["chatgpt_page_ready"] = is_chatgpt_host and not is_challenge
+    checks["authenticated"] = checks["chatgpt_page_ready"] and not is_auth_surface
+
+    try:
+        checks["composer_ready"] = await driver.dom.find_input(page) is not None
+    except Exception as exc:  # noqa: BLE001
+        details["errors"].append(f"composer probe: {exc!r}")
+    try:
+        checks["new_chat_ready"] = await driver.dom.find_new_chat(page) is not None
+    except Exception as exc:  # noqa: BLE001
+        details["errors"].append(f"new-chat probe: {exc!r}")
+
+    return {
+        "ready": all(checks.values()),
+        "checks": checks,
+        "details": details,
+    }
+
+
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
     """健康检查：Pi 等客户端可用来探活。"""
@@ -187,6 +255,56 @@ async def healthz():
             "init_error": driver.init_error,
         },
     )
+
+
+@app.get("/readiness", include_in_schema=False)
+async def readiness():
+    """服务是否已具备执行 ChatGPT Web 请求的最低条件。"""
+    snapshot = await _readiness_snapshot()
+    return JSONResponse(status_code=200 if snapshot["ready"] else 503, content=snapshot)
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint():
+    """Return the in-process runtime metrics snapshot."""
+    return metrics.snapshot()
+
+
+@app.get("/diagnostics", include_in_schema=False)
+async def diagnostics():
+    """汇总浏览器、DOM readiness、session 与 selector 诊断信息。"""
+    snapshot = await _readiness_snapshot()
+    content = {
+        "status": "ok" if snapshot["ready"] else "degraded",
+        "readiness": snapshot,
+        "headless": config.HEADLESS,
+        "session": driver.session_stats(),
+        "session_keys": driver.session_keys(),
+        "session_scoping": config.SESSION_SCOPING,
+        "cluster": driver.cluster_stats(),
+        "buckets": driver.bucket_map(),
+        "init_error": driver.init_error,
+        "metrics": metrics.snapshot(),
+    }
+    if driver.page is not None:
+        groups = {
+            "INPUT_SELECTORS": list(config.INPUT_SELECTORS),
+            "SEND_BUTTON_SELECTORS": list(config.SEND_BUTTON_SELECTORS),
+            "RESPONSE_SELECTORS": [config.RESPONSE_SELECTORS],
+            "READY_SELECTOR": [config.READY_SELECTOR],
+            "NEW_CHAT_SELECTOR": config.NEW_CHAT_SELECTOR.split("||"),
+            "THINK_MODE_SELECTOR": config.THINK_MODE_SELECTOR.split("||"),
+            "CODE_BLOCK_SELECTOR": [config.CODE_BLOCK_SELECTOR],
+        }
+        selector_result = driver.dom.selector_diagnostics(driver.page, groups)
+        if inspect.isawaitable(selector_result):
+            selector_result = await selector_result
+        if isinstance(selector_result, tuple) and len(selector_result) == 2:
+            content["selectors"], content["selector_health"] = selector_result
+        else:
+            content["selectors"] = selector_result
+            content["selector_health"] = {}
+    return JSONResponse(status_code=200 if snapshot["ready"] else 503, content=content)
 
 
 @app.post("/session/reset", include_in_schema=False)
@@ -459,6 +577,7 @@ async def chat_completions(
             ),
         )
     except ChatGPTContextLimitError as exc:
+        metrics.inc("request_context_limit_total")
         logger.error("\n[ERR] 网页会话已达上下文长度上限:", exc_info=True)
         return _error_response(400, str(exc), "context_length_exceeded")
     except ChatGPTBusyError as exc:
@@ -466,6 +585,7 @@ async def chat_completions(
         logger.warning(f"\n[繁忙] {exc}")
         return _error_response(503, str(exc), "upstream_busy")
     except ChatGPTTimeoutError as exc:
+        metrics.inc("request_timeout_total")
         logger.error("\n[ERR] 等待 ChatGPT 回复超时（已重试）:", exc_info=True)
         return _error_response(504, str(exc), "timeout")
     except RuntimeError as exc:

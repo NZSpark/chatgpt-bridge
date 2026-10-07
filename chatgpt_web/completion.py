@@ -15,6 +15,7 @@ from .errors import (
     HOME_URL,
     ChatGPTContextLimitError,
 )
+from .metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,7 @@ class CompletionMixin:
 
     async def _start_new_session(self, key: Optional[str] = None) -> None:
         """轮转到新会话，并重置会话状态（调用方必须使用“播种”prompt）。"""
+        metrics.inc("session_rotation_total")
         page = self._page_for(key)
         if page is None:
             return
@@ -213,22 +215,24 @@ class CompletionMixin:
 
         上下文不会丢：调用方在本轮失败后会以「播种」prompt 重发历史。
         """
+        metrics.inc("session_recovery_total")
         page = self._page_for(key)
         if page is None:
             logger.warning("[恢复] 没有可用页面，无法恢复。")
             return False
-        try:
-            await page.goto(HOME_URL, wait_until="domcontentloaded")
-            await self._open_new_chat(page)
-            if not await self._wait_ready(page):
-                logger.warning("[恢复] 已打开页面，但未检测到输入框，请检查登录状态。")
+        with metrics.timer("session_recovery_latency"):
+            try:
+                await page.goto(HOME_URL, wait_until="domcontentloaded")
+                await self._open_new_chat(page)
+                if not await self._wait_ready(page):
+                    logger.warning("[恢复] 已打开页面，但未检测到输入框，请检查登录状态。")
+                    return False
+                self._state(key).has_history = False
+                logger.info("[恢复] 已重开新对话（本轮将重新播种上下文）。")
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[恢复] 重开会话失败: {exc}")
                 return False
-            self._state(key).has_history = False
-            logger.info("[恢复] 已重开新对话（本轮将重新播种上下文）。")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[恢复] 重开会话失败: {exc}")
-            return False
 
     async def _page_is_generating(self, key: Optional[str] = None) -> Optional[bool]:
         """检测页面是否仍在生成回复。

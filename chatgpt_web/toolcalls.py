@@ -27,6 +27,7 @@ from .errors import (
     ToolCallSerializationError,
     ToolCallValidationError,
 )
+from .metrics import metrics
 from .models import FunctionCall, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -366,6 +367,7 @@ def run_local_edit_markdown(
     out: List[Dict[str, Any]] = []
     for call in tool_calls:
         if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
+            metrics.inc("tool_call_total")
             call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}")
             arguments = dict(call.get("arguments") or {})
             existing, done, owner = ledger.claim(session_key, call_id)
@@ -377,6 +379,7 @@ def run_local_edit_markdown(
                     result = {"ok": False, "error": "tool execution did not produce a ledger result"}
                     out.append({**call, "id": call_id, "result": result, "duplicate": True})
                     continue
+                metrics.inc("tool_duplicate_total")
                 logger.warning(
                     "重复工具执行被跳过：session_key=%r tool_call_id=%s tool=%s",
                     session_key or "default",
@@ -386,14 +389,17 @@ def run_local_edit_markdown(
                 out.append({**call, "id": call_id, "result": existing.result, "duplicate": True})
                 continue
             started_at = time.monotonic()
-            try:
-                result = execute_edit_markdown(arguments, backup_dir=backup_dir)
-                success = bool(result.get("ok"))
-                error_type = None if success else "ToolExecutionError"
-            except Exception as exc:  # noqa: BLE001
-                error_type = type(exc).__name__
-                result = {"ok": False, "error": str(exc)}
-                success = False
+            with metrics.timer("tool_execution_latency"):
+                try:
+                    result = execute_edit_markdown(arguments, backup_dir=backup_dir)
+                    success = bool(result.get("ok"))
+                    error_type = None if success else "ToolExecutionError"
+                except Exception as exc:  # noqa: BLE001
+                    error_type = type(exc).__name__
+                    result = {"ok": False, "error": str(exc)}
+                    success = False
+            if not success:
+                metrics.inc("tool_execution_failure_total")
             ledger.record(
                 session_key=session_key,
                 tool_call_id=call_id,
