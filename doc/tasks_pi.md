@@ -482,7 +482,14 @@ browser restart while request waits
 
 ## PI-020 基础 metrics
 
-状态：TODO｜优先级：P1｜依赖：PI-019
+状态：DONE｜优先级：P1｜依赖：PI-019
+
+已完成第一阶段进程内 metrics：
+
+- `/metrics` 提供运行时 metrics 快照，并并入 `/diagnostics`；
+- request retry、browser selector miss、reply extraction failure、tool parse failure 已接入实际运行路径；
+- metrics registry 提供线程安全计数、延迟累计、平均值与 reset，并拒绝未知指标名；
+- 新增 `tests/test_metrics.py`，覆盖指标契约、计数、计时、reset 与非法指标。
 
 增加 counters：
 
@@ -512,8 +519,6 @@ reply_extraction_latency
 tool_execution_latency
 session_recovery_latency
 
-
-第一阶段不要求 Prometheus，可先做内存统计。
 
 ## PI-021 日志 correlation
 
