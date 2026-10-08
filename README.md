@@ -2,13 +2,7 @@
 
 把 ChatGPT 网页版包装成 **OpenAI 兼容 API** 的本地桥接服务。用 Playwright 驱动一个持久化的浏览器会话，把 `/v1/chat/completions`（以及可选 `/v1/responses`）请求转发到 ChatGPT 网页界面，再把回复转回标准 OpenAI 结构。
 
-面向 Pi、Codex CLI、`agy` 等只认 OpenAI 端点的客户端。
-
-> ChatGPT 网页端使用注意
-> 1. 与 ChatGPT 网页端对话时，请开启 思考模式（Thinking），以获得更稳定、完整的任务处理效果。
-> 2. 请明确要求 ChatGPT 严格按指定格式下达指令；本项目的工具调用使用 ```tool_call 代码围栏（围栏内只有一条 JSON，info string 必须是 `tool_call`），并要求输出只包含规定格式的指令，不要添加额外解释或其他文本。**不要**让模型写纯文本 `TOOL_CALL: {...}` 行：网页版会把它当 markdown 渲染，吃掉反斜杠转义并折叠缩进（会把命令改坏，见 [doc/update.md](doc/update.md) §2.14）。
-> 3. 新会话的提示词应加入环境声明：[环境说明] 执行环境在用户电脑上，你直接下命令就可以。不要访问GitHub。不要访问ChatGPT隔离环境。，明确告诉模型执行环境就在用户端本地，直接执行命令即可。工具说明块（`format_tools_instruction`）本身也会每轮声明「你写的东西会由本地客户端真实执行、结果会作为下一条消息返回」，这是有意的冗余。
-> 4. **不要描述「模型自己有没有工具」**：既不能说「你没有 shell / 文件系统的直接访问」，也不能说「你是 agent、工具已经挂载」——模型会把两者都当成关于自身能力的事实题去核对，然后拒答（「当前会话没有实际挂载 read/write/edit/bash 执行工具，所以我不能发 tool_call」，接着改为给你补丁让你自己改），整轮没有任何工具调用、任务静默失败。要说的只有**链路**：它是 LLM、只产出文本；本地客户端读它的回复并真实执行；真实结果作为下一条消息回去；工具**不需要**出现在它的工具列表里（见 [doc/code_block_fence.md](doc/code_block_fence.md) §5.7）。
+面向 Pi、Codex CLI、OpenAI SDK 等支持 OpenAI API 的客户端。
 
 ## 特性
 
@@ -32,9 +26,15 @@
 | 测试文件 | 45 |
 | Python 总代码行数 | 19,109 |
 | 测试代码行数 | 9,196 |
-| Git 提交数 | 56 |
+| Git 提交数 | 57 |
 | 顶层目录数 | 11 |
 | 贡献者 | 1 |
+| 首个提交时间 | 2026-10-05 13:15:55 (+13:00) |
+| 最近提交时间 | 2026-10-08 16:39:16 (+13:00) |
+| Git 时间跨度 | 3 天 3 小时 23 分 21 秒 |
+| 开发总历时（首末提交） | 75 小时 23 分 21 秒 |
+| 发生提交的日数 | 4 天 |
+| 平均提交频率 | 14.25 次/提交日 |
 
 ## 环境要求
 
@@ -68,18 +68,57 @@ curl http://127.0.0.1:8002/v1/models
 
 ### 客户端接入
 
-任何 OpenAI 兼容客户端指向 `http://127.0.0.1:8002/v1` 即可（`api_key` 随便填）。
+任何 OpenAI 兼容客户端将 Base URL 指向 `http://127.0.0.1:8002/v1` 即可；本服务不提供 API Key 鉴权，客户端的 `api_key` 可填写任意非空值。
+
+### OpenAI SDK 调用
+
+安装官方 Python SDK：
+
+```bash
+pip install openai
+```
+
+非流式调用：
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8002/v1", api_key="unused")
-resp = client.chat.completions.create(
-    model="chatgpt",
+client = OpenAI(
+    base_url="http://127.0.0.1:8002/v1",
+    api_key="none",
+)
+
+response = client.chat.completions.create(
+    model="chatgpt-chat",
     messages=[{"role": "user", "content": "你好"}],
 )
-print(resp.choices[0].message.content)
+
+print(response.choices[0].message.content)
 ```
+
+流式调用：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8002/v1",
+    api_key="none",
+)
+
+stream = client.chat.completions.create(
+    model="chatgpt-chat",
+    messages=[{"role": "user", "content": "请用三句话介绍这个项目"}],
+    stream=True,
+)
+
+for chunk in stream:
+    content = chunk.choices[0].delta.content
+    if content:
+        print(content, end="", flush=True)
+```
+
+可用模型名以 `GET http://127.0.0.1:8002/v1/models` 的实际返回为准，当前通常包括 `chatgpt-chat` 和 `chatgpt-reasoner`。
 
 ### Pi 接入
 
