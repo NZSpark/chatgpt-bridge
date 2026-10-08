@@ -605,12 +605,12 @@ E5 必须检查输入框最后一次被填充的内容，确保 bridge 没有追
 
 ## PI-024 API contract tests
 
-状态：TODO（部分覆盖）｜优先级：P2｜依赖：PI-003、PI-004
+状态：DONE｜优先级：P2｜依赖：PI-003、PI-004
 
-> 核对（2026-10-08）：Chat SSE 契约已由 `tests/test_streaming.py` 覆盖；
-> Responses 事件契约由 `tests/test_responses.py` 覆盖；adapter 层契约由
-> `tests/test_api_package.py` 覆盖。尚未有统一命名的 contract 测试文件，
-> 也缺 usage / errors 的端到端契约断言。
+> 核对（2026-10-08）：`tests/test_api_contracts.py` 新增统一 API contract 回归，冻结 Chat Completions
+> 非流式 usage / errors，以及 Responses usage / errors / exception mapping；原有
+> `tests/test_streaming.py`、`tests/test_responses.py`、`tests/test_api_package.py` 继续覆盖 SSE、
+> Responses 事件与 adapter re-export 契约。所有 contract 测试均不依赖真实 Playwright。
 
 ### Chat Completions
 
@@ -977,7 +977,7 @@ perf: establish browser request baseline
 | PI-021 | 日志 correlation | P2 | PI-020 | TODO |
 | PI-022 | 五个黄金 E2E | P1 | PI-005/003 | TODO |
 | PI-023 | 性质 / 不变量测试 | P1 | PI-007/016/017 | DONE |
-| PI-024 | API contract tests | P2 | PI-003/004 | TODO（部分：streaming/responses/api_package 已覆盖） |
+| PI-024 | API contract tests | P2 | PI-003/004 | DONE |
 | PI-025 | 拆分 toolcalls.py | P2 | PI-007/008/010 | DONE（由 PI-901 吸收，见 §9 说明） |
 | PI-026 | 拆分 chat_io.py | P2 | PI-005/012 | TODO |
 | PI-027 | Mixin → composition | P0/P1 | PI-005/003 | TODO |
