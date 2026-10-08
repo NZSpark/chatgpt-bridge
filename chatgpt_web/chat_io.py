@@ -8,9 +8,11 @@
 import asyncio
 import logging
 import time
+import uuid
 from typing import Callable, List, Optional
 
 from . import config
+from .logging_setup import set_log_context
 from .errors import DEFAULT_SESSION_KEY, ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
 # PI-902：结束判定的纯函数状态机与阈值组装统一由 completion 子包 re-export。
 from .task_state import TaskState, TaskStateName
@@ -68,6 +70,8 @@ class ChatIOMixin(BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin):
         await self._ensure_page(bucket)
 
         for attempt in range(1, max_attempts + 1):
+            attempt_id = f"attempt-{uuid.uuid4().hex[:10]}"
+            set_log_context(session_key=bucket, attempt_id=attempt_id)
             if attempt > 1:
                 metrics.inc("request_retry_total")
             state = self._state(bucket)

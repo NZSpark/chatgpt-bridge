@@ -13,21 +13,40 @@
 import logging
 import time
 import uuid
+from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Iterator
 
 LOGGER_NAME = "chatgpt_web"
-_FORMAT = "%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s"
+_CORRELATION_FIELDS = (
+    "request_id",
+    "session_key",
+    "tool_call_id",
+    "attempt_id",
+    "page_id",
+)
+_FORMAT = (
+    "%(asctime)s %(levelname)s "
+    "[request_id=%(request_id)s session_key=%(session_key)s "
+    "tool_call_id=%(tool_call_id)s attempt_id=%(attempt_id)s page_id=%(page_id)s] "
+    "%(name)s: %(message)s"
+)
 _configured = False
 
-_request_id: ContextVar[str] = ContextVar("chatgpt_request_id", default="-")
+_log_context: ContextVar[dict[str, str]] = ContextVar(
+    "chatgpt_log_context",
+    default={field: "-" for field in _CORRELATION_FIELDS},
+)
 
 
 class _RequestIdFilter(logging.Filter):
-    """把当前上下文的 request_id 注入每条日志记录（格式串用 %(request_id)s）。"""
+    """把当前关联上下文注入每条日志记录。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not hasattr(record, "request_id"):
-            record.request_id = _request_id.get()
+        context = _log_context.get()
+        for field in _CORRELATION_FIELDS:
+            if not hasattr(record, field):
+                setattr(record, field, context.get(field, "-"))
         return True
 
 
@@ -55,10 +74,55 @@ def new_request_id() -> str:
     return f"{int(time.time() % 100000):05d}-{uuid.uuid4().hex[:6]}"
 
 
+def set_log_context(**fields: str) -> None:
+    """更新当前异步任务的日志关联字段。"""
+    unknown = set(fields) - set(_CORRELATION_FIELDS)
+    if unknown:
+        raise ValueError(f"未知日志关联字段：{sorted(unknown)}")
+    current = dict(_log_context.get())
+    for field, value in fields.items():
+        current[field] = str(value) if value is not None else "-"
+    _log_context.set(current)
+
+
+def clear_log_context(*fields: str) -> None:
+    """清除指定关联字段；不传参数时清除全部字段。"""
+    target = fields or _CORRELATION_FIELDS
+    unknown = set(target) - set(_CORRELATION_FIELDS)
+    if unknown:
+        raise ValueError(f"未知日志关联字段：{sorted(unknown)}")
+    current = dict(_log_context.get())
+    for field in target:
+        current[field] = "-"
+    _log_context.set(current)
+
+
+@contextmanager
+def log_context(**fields: str) -> Iterator[None]:
+    """临时绑定日志关联字段，退出时恢复调用方原上下文。"""
+    unknown = set(fields) - set(_CORRELATION_FIELDS)
+    if unknown:
+        raise ValueError(f"未知日志关联字段：{sorted(unknown)}")
+    previous = _log_context.get()
+    current = dict(previous)
+    for field, value in fields.items():
+        current[field] = str(value) if value is not None else "-"
+    token = _log_context.set(current)
+    try:
+        yield
+    finally:
+        _log_context.reset(token)
+
+
 def set_request_id(request_id: str) -> None:
     """把 request_id 绑定到当前任务上下文（异步任务各自独立）。"""
-    _request_id.set(request_id)
+    set_log_context(request_id=request_id)
 
 
 def current_request_id() -> str:
-    return _request_id.get()
+    return str(_log_context.get().get("request_id", "-"))
+
+
+def current_log_context() -> dict[str, str]:
+    """返回当前日志关联上下文的快照。"""
+    return dict(_log_context.get())

@@ -70,6 +70,7 @@ class ChatGPTWebDriver(
         # 否则 build_prompt 只发增量会让模型收到一条没有前因的孤立消息。
         self._sessions: Dict[str, SessionState] = {}
         self._pages: Dict[str, Any] = {}
+        self._page_ids: Dict[str, str] = {}
         # 每个桶页面的最后一次使用时间（time.monotonic），用于空闲回收 / LRU 淘汰
         self._page_last_used: Dict[str, float] = {}
         # 按桶并发时的锁（PARALLEL_BUCKETS=true 才启用；默认桶始终用 self.lock）
@@ -84,6 +85,7 @@ class ChatGPTWebDriver(
         """初始化浏览器实例（生命周期委托 :class:`BrowserLifecycleMixin`）。"""
         await self.launch_persistent_context(self.user_data_dir)
         self.page = await self.new_browser_page()
+        self._page_ids[DEFAULT_SESSION_KEY] = f"page-{id(self.page):x}"
         await self._restore_session_on_startup()
         await self._warn_if_blocked(self.page)
 

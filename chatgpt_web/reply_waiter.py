@@ -5,6 +5,7 @@ import logging
 import time
 
 from . import config
+from .logging_setup import set_log_context
 from .completion.generator import EndState, build_end_limits, evaluate_poll
 from .errors import DEFAULT_SESSION_KEY, ChatGPTContextLimitError, ChatGPTTimeoutError
 from .metrics import metrics
@@ -50,8 +51,10 @@ class ReplyWaiterMixin:
         """
         bucket = key or DEFAULT_SESSION_KEY
         page = self._page_for(bucket)
+        page_id = self._page_ids.get(bucket, f"page-{id(page):x}" if page is not None else "-")
         state = self._state(bucket)
         # 默认所有桶共用 self.lock（串行）；只有 PARALLEL_BUCKETS=true 才按桶各持一把锁
+        set_log_context(session_key=bucket, page_id=page_id)
         async with self._session_lock(bucket):
             if page is None:
                 raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")

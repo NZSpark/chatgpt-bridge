@@ -112,6 +112,7 @@ class PagePoolMixin:
         因此下次用到该桶时会重新打开同一个会话并按需播种上下文。
         """
         page = self._pages.pop(bucket, None)
+        self._page_ids.pop(bucket, None)
         self._page_last_used.pop(bucket, None)
         if page is None:
             return False
@@ -194,6 +195,7 @@ class PagePoolMixin:
                     )
             page = await self.context.new_page()
             self._pages[bucket] = page
+            self._page_ids[bucket] = f"page-{id(page):x}"
             self._touch_page(bucket)
             state = self._state(bucket)
             # 每桶始终新开对话；上下文靠本轮的「播种」重建

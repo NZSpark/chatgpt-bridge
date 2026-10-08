@@ -19,7 +19,7 @@ from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTWebDriver,
 )
-from .logging_setup import new_request_id, set_request_id
+from .logging_setup import new_request_id, set_log_context, set_request_id
 from .metrics import metrics
 from .models import (
     SUPPORTED_MODELS,
@@ -364,6 +364,7 @@ async def responses(
     session_key = _session_key(request, x_chatgpt_session, user_agent)
     request_id = new_request_id()
     set_request_id(request_id)
+    set_log_context(session_key=session_key or DEFAULT_SESSION_KEY)
     response.headers["X-Request-Id"] = request_id
     if config.DEBUG:
         logger.debug("[debug] responses session_key=%r", session_key)
@@ -491,6 +492,7 @@ async def chat_completions(
 
     # 按任务隔离会话：同一客户端 / 同一 X-ChatGPT-Session 取值的请求共用一条网页会话
     session_key = _session_key(request, x_chatgpt_session, user_agent)
+    set_log_context(session_key=session_key or DEFAULT_SESSION_KEY)
     logger.info(
         "请求开始：session_key=%r stream=%s tools=%d",
         session_key, request.stream, len(request.tools or []),
@@ -549,7 +551,7 @@ async def chat_completions(
 
     # ---------- 非流式分支：交给 api.chat_adapter ----------
     try:
-        return await run_chat_completion(
+        result = await run_chat_completion(
             request,
             driver,
             session_key,
@@ -558,7 +560,10 @@ async def chat_completions(
             prompt=prompt,
             seeded_prompt=seeded_prompt,
         )
+        logger.info("请求完成：status=200")
+        return result
     except ChatAdapterError as exc:
+        logger.info("请求完成：status=%d error_type=%s", exc.status_code, exc.err_type)
         if exc.err_type == "context_length_exceeded":
             metrics.inc("request_context_limit_total")
         elif exc.err_type == "timeout":
