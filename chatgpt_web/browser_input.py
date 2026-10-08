@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from . import config
+from .errors import ChatGPTPageLostError, page_alive, page_lost_reason
 
 logger=logging.getLogger(__name__)
 
@@ -199,12 +200,20 @@ class BrowserInputMixin:
 
         首选真实键盘 Enter：合成 KeyboardEvent 对 ProseMirror 不可靠，
         prompt 含换行时合成 Enter 会被当成软换行而非提交（见 _keyboard_enter）。
+
+        三条路径全部失败时要先分辨原因：页面已经没了（标签被关 / 渲染进程崩溃）
+        属于可自愈故障，抛 :class:`ChatGPTPageLostError` 让重试阶梯重建页面；
+        页面活着却没提交出去才是真正的“发送失败”（P0-J）。
         """
+        if not page_alive(page):
+            raise ChatGPTPageLostError(f"提交 prompt 失败：{page_lost_reason(page)}")
         if await self._keyboard_enter(page):
             return
         if await self._dispatch_enter(chat_input):
             return
         if not await self._click_send_button(page):
+            if not page_alive(page):
+                raise ChatGPTPageLostError(f"提交 prompt 失败：{page_lost_reason(page)}")
             raise RuntimeError(
                 "无法提交 prompt：键盘 Enter、输入框 Enter 事件均无效，"
                 "且未找到发送按钮。"

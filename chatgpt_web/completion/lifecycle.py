@@ -176,8 +176,14 @@ class CompletionMixin:
         await self.dom.open_new_chat(page)
 
     async def _start_new_session(self, key: Optional[str] = None) -> None:
-        """轮转到新会话，并重置会话状态（调用方必须使用“播种”prompt）。"""
+        """轮转到新会话，并重置会话状态（调用方必须使用“播种”prompt）。
+
+        轮转前先 ``_ensure_page``：页面可能刚好被关掉（用户关标签 / 渲染进程崩溃），
+        死页面上的 ``goto`` 会抛 ``TargetClosedError``——它不是 ``RuntimeError``，
+        会一路冒到路由层变成没有文案的裸 500（P0-J）。
+        """
         metrics.inc("session_rotation_total")
+        await self._ensure_page(key)
         page = self._page_for(key)
         if page is None:
             return

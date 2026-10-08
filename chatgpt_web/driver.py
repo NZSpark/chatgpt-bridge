@@ -75,8 +75,12 @@ class ChatGPTWebDriver(
         self._page_last_used: Dict[str, float] = {}
         # 按桶并发时的锁（PARALLEL_BUCKETS=true 才启用；默认桶始终用 self.lock）
         self._locks: Dict[str, asyncio.Lock] = {}
-        # 正在处理请求（已拿到锁、正在生成）的会话桶，供 /healthz 观察多 Agent 占用。
+        # 正在处理请求的会话桶（``send_chat`` 全程登记、``_session_lock`` 持锁期间登记），
+        # 供 /healthz 观察多 Agent 占用，也用于避免空闲回收 / LRU 淘汰误杀在飞的页面。
         # 不能用“锁是否被持有”来推断：串行模式下所有桶共用一把锁，会把所有桶都算成忙。
+        # ``_active_counts`` 是可重入计数（内层退出不撤掉外层的保护，P0-L），
+        # ``_active_buckets`` 保留为同一批桶的集合视图（``busy_keys`` / 旧测试读它）。
+        self._active_counts: Dict[str, int] = {}
         self._active_buckets: set = set()
         # 所有 ChatGPT Web DOM 查询集中经过这一 adapter；mixin 仅保留兼容 facade。
         self.dom = ChatGPTDOMAdapter()

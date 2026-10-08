@@ -139,6 +139,22 @@ CAP_CHECK_JS_TEMPLATE = (
     " return text; }"
 )
 
+# 定位输入框失败时的现场探测：URL / readyState / 是否有弹层 / 是否像登录墙。
+# **只回布尔与状态字符串，不回显页面正文**；选择器命中数在 Python 侧统计
+# （INPUT_SELECTORS 可被 .env 覆盖/测试打补丁，不能写死在 JS 里）。
+INPUT_PROBE_JS = """
+    () => {
+      const count = (s) => { try { return document.querySelectorAll(s).length; } catch (e) { return -1; } };
+      return {
+        url: location.href,
+        ready: document.readyState,
+        dialog: count('[role="dialog"]') + count('[data-testid*="modal"]') > 0,
+        login: count('input[type="password"]') + count('form[action*="login"]')
+          + count('a[href*="/auth/login"]') + count('[data-testid*="login"]') > 0,
+      };
+    }
+    """
+
 # 停止控件候选的硬编码 fallback 选择器（探测/诊断共用）。
 STOP_CONTROL_SELECTOR = (
     '[data-testid*="stop"], button, [role="button"], '
@@ -155,4 +171,5 @@ __all__ = [
     "STOP_CANDIDATES_JS",
     "CAP_CHECK_JS_TEMPLATE",
     "STOP_CONTROL_SELECTOR",
+    "INPUT_PROBE_JS",
 ]

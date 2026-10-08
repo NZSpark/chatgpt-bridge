@@ -40,6 +40,37 @@ class DiagnosticsMixin:
             body_text_len = -1
         return lines, body_text_len
 
+    async def input_probe(self, page) -> str:
+        """定位输入框失败时的现场信息（**只回布尔，不回显页面正文**）。
+
+        旧文案只有一句「请检查是否登录」，把「页面已经没了」这种**可自愈**的
+        故障说成用户操作问题，真机上因此被误认很久（P0-J）。这里带上 URL /
+        readyState / 是否有弹层 / 是否像登录墙，以及每条 INPUT_SELECTORS 的命中数，
+        让「改版 / 未登录 / 页面已死」三种情况在日志里就能分开。
+        """
+        hits: List[str] = []
+        for selector in config.INPUT_SELECTORS:
+            selector = selector.strip()
+            if not selector:
+                continue
+            try:
+                hits.append(f"{selector}:{len(await page.query_selector_all(selector))}")
+            except Exception as exc:  # noqa: BLE001
+                hits.append(f"{selector}:{type(exc).__name__}")
+        try:
+            info = await page.evaluate(selectors.INPUT_PROBE_JS) or {}
+        except Exception as exc:  # noqa: BLE001
+            return (
+                f"现场探测失败（{type(exc).__name__}: {exc}）；"
+                f"选择器命中 {', '.join(hits)}"
+            )
+        return (
+            f"URL={info.get('url') or '?'} readyState={info.get('ready') or '?'} "
+            f"弹层={'有' if info.get('dialog') else '无'} "
+            f"登录墙={'疑似' if info.get('login') else '未见'}；"
+            f"选择器命中 {', '.join(hits)}"
+        )
+
     async def stop_diagnostics(self, page) -> List[dict]:
         """返回候选停止控件（不含页面文本），供 DOM 诊断。"""
         if page is None:

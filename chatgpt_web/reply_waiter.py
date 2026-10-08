@@ -7,7 +7,14 @@ import time
 from . import config
 from .logging_setup import set_log_context
 from .completion.generator import EndState, build_end_limits, evaluate_poll
-from .errors import DEFAULT_SESSION_KEY, ChatGPTContextLimitError, ChatGPTTimeoutError
+from .errors import (
+    DEFAULT_SESSION_KEY,
+    ChatGPTPageLostError,
+    ChatGPTContextLimitError,
+    ChatGPTTimeoutError,
+    page_alive,
+    page_lost_reason,
+)
 from .metrics import metrics
 from .prompting import _delta_piece, estimate_tokens
 
@@ -17,6 +24,20 @@ _EMPTY_NODE_REPORT_AFTER=3
 
 class ReplyWaiterMixin:
     """Own the browser generation polling loop while keeping driver APIs intact."""
+
+    def _input_missing_message(self) -> str:
+        """「找不到输入框」的错误文案：带上现场信息（不回显正文）。
+
+        只说「请检查是否登录」会把「页面已经没了」这种**可自愈**故障说成用户
+        操作问题（本次真机故障因此被误认很久）；把 URL / readyState / 选择器命中数 /
+        弹层 / 登录墙带进错误里，排查时一眼能分开三种情况。
+        """
+        base = "无法找到对话输入框，请检查 ChatGPT 网页是否打开或处于登录状态。"
+        hint = ""
+        probe_hint = getattr(self.dom, "input_probe_hint", None)
+        if callable(probe_hint):
+            hint = probe_hint()
+        return f"{base}（现场：{hint}）" if hint else base
 
     async def _log_empty_reply_nodes(self, page) -> None:
         """回复节点持续为 0 时，打印每条 RESPONSE_SELECTORS 的命中数。
@@ -56,16 +77,23 @@ class ReplyWaiterMixin:
         # 默认所有桶共用 self.lock（串行）；只有 PARALLEL_BUCKETS=true 才按桶各持一把锁
         set_log_context(session_key=bucket, page_id=page_id)
         async with self._session_lock(bucket):
+            # 锁内**重取**一次页面：从取页面到这里之间，页面可能被重建
+            # （重试阶梯的页面失效恢复）或被别的桶回收（P0-J / P0-L）。
+            page = self._page_for(bucket)
             if page is None:
                 raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")
+            page_id = self._page_ids.get(bucket, f"page-{id(page):x}")
+            set_log_context(session_key=bucket, page_id=page_id)
             self._touch_page(bucket)  # 正在用的页面不会被空闲回收 / LRU 淘汰
 
             # 1. 定位输入框。只做 DOM 查询与重试，绝不 bring_to_front / focus：
             #    那会抢 OS 前台、干扰用户正在使用的其它窗口；而提交走页面内
             #    事件派发（见 _submit_prompt），本就不依赖窗口是否在前台。
+            #    页面已死时 `_find_input` 会抛 ChatGPTPageLostError（可重建恢复），
+            #    只有「页面活着但选择器全不中」才走到下面这条文案（P0-J）。
             chat_input = await self._find_input(page)
             if not chat_input:
-                raise RuntimeError("无法找到对话输入框，请检查 ChatGPT 网页是否打开或处于登录状态。")
+                raise RuntimeError(self._input_missing_message())
 
             # 记录发送前最后一条回复的文本，用来判断“新回复是否已经出现”。
             # 注意：绝不能用“回复节点数量变多”来判断。
@@ -127,6 +155,14 @@ class ReplyWaiterMixin:
 
             while True:
                 poll += 1
+                # 每轮开头判活：标签被用户关掉 / 渲染进程崩溃后，页面对象上的任何
+                # 操作都会立刻失败。这里主动识别并归到 ChatGPTPageLostError，
+                # 交给重试阶梯重建页面（否则 playwright 的 TargetClosedError 不是
+                # RuntimeError，会冒到路由层变成没有文案的裸 500）。
+                if not page_alive(page):
+                    raise ChatGPTPageLostError(
+                        f"生成过程中页面失效：{page_lost_reason(page)}（本轮回复未完成）"
+                    )
                 responses = await self.dom.find_assistant_messages(page)
                 current_text = ""
                 generating = None

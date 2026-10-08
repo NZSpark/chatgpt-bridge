@@ -25,6 +25,12 @@ import time
 from typing import Any, List, Optional
 
 from .. import config
+from ..errors import (
+    ChatGPTPageLostError,
+    is_page_lost_error,
+    page_alive,
+    page_lost_reason,
+)
 from . import selectors
 from .diagnostics import DiagnosticsMixin
 
@@ -47,24 +53,48 @@ class ChatGPTDOMAdapter(DiagnosticsMixin):
     CAP_CHECK_JS_TEMPLATE = selectors.CAP_CHECK_JS_TEMPLATE
 
     async def find_input(self, page):
-        """Find the composer using attached-state fallback selectors."""
+        """Find the composer using attached-state fallback selectors.
+
+        **只有超时才算「没命中」**（P0-J）：页面已关闭 / 渲染进程崩溃时
+        ``wait_for_selector`` 会**立刻**抛 ``TargetClosedError``，旧实现把它也
+        归进「尝试过的选择器」列表，于是上层提示用户去检查登录，页面池里却留着
+        一具尸体——该桶从此永久失败。这里改成抛
+        :class:`~chatgpt_web.errors.ChatGPTPageLostError`，让重试阶梯重建页面。
+
+        页面活着但选择器全不中（改版 / 未登录 / 弹层遮挡）仍返回 ``None``，
+        并把现场信息（URL / readyState / 命中数 / 弹层 / 登录墙）留在
+        ``last_input_probe`` 里，供上层错误文案与日志使用（不回显正文）。
+        """
+        if not page_alive(page):
+            raise ChatGPTPageLostError(f"定位对话输入框失败：{page_lost_reason(page)}")
         errors = []
         for selector in config.INPUT_SELECTORS:
             try:
                 element = await page.wait_for_selector(
                     selector, timeout=2000, state="attached"
                 )
-                if element:
-                    if config.DEBUG:
-                        logger.debug("[输入] 命中选择器：%s", selector)
-                    return element
-                errors.append(f"{selector}: 未命中")
             except Exception as exc:  # noqa: BLE001
+                if is_page_lost_error(exc) or not page_alive(page):
+                    raise ChatGPTPageLostError(
+                        f"定位对话输入框失败：{page_lost_reason(page)}（{exc}）"
+                    ) from exc
                 errors.append(f"{selector}: {exc}")
-        logger.warning("[输入] 未找到输入框，尝试过的选择器：")
+                continue
+            if element:
+                if config.DEBUG:
+                    logger.debug("[输入] 命中选择器：%s", selector)
+                self.last_input_probe = ""
+                return element
+            errors.append(f"{selector}: 未命中")
+        self.last_input_probe = await self.input_probe(page)
+        logger.warning("[输入] 未找到输入框（页面仍在运行）。%s", self.last_input_probe)
         for line in errors:
             logger.info("        - %s", line)
         return None
+
+    def input_probe_hint(self) -> str:
+        """最近一次 ``find_input`` 失败时的现场摘要（没失败过则为空串）。"""
+        return getattr(self, "last_input_probe", "") or ""
 
     async def click_send_button(self, page) -> bool:
         """Find and DOM-click the configured send button."""
@@ -82,8 +112,21 @@ class ChatGPTDOMAdapter(DiagnosticsMixin):
         return False
 
     async def find_assistant_messages(self, page):
-        """Return nodes matching the configured assistant-reply selectors."""
-        return await page.query_selector_all(config.RESPONSE_SELECTORS)
+        """Return nodes matching the configured assistant-reply selectors.
+
+        轮询每轮都会调它：页面在**生成过程中**失效（标签被关 / 渲染进程崩溃）时，
+        ``playwright`` 抛的 ``TargetClosedError`` 不是 ``RuntimeError``，会一路冒到
+        路由层变成**裸 500**（连错误文案都没有）。这里统一归一到
+        :class:`~chatgpt_web.errors.ChatGPTPageLostError`，交给重试阶梯恢复。
+        """
+        try:
+            return await page.query_selector_all(config.RESPONSE_SELECTORS)
+        except Exception as exc:  # noqa: BLE001
+            if is_page_lost_error(exc) or not page_alive(page):
+                raise ChatGPTPageLostError(
+                    f"读取回复节点失败：{page_lost_reason(page)}（{exc}）"
+                ) from exc
+            raise
 
     async def find_stop_button(self, page):
         """Return the first visible stop-generation control, if any."""

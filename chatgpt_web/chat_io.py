@@ -13,7 +13,14 @@ from typing import Callable, List, Optional
 
 from . import config
 from .logging_setup import set_log_context
-from .errors import DEFAULT_SESSION_KEY, ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
+from .metrics import metrics
+from .errors import (
+    DEFAULT_SESSION_KEY,
+    ChatGPTPageLostError,
+    ChatGPTBusyError,
+    ChatGPTContextLimitError,
+    ChatGPTTimeoutError,
+)
 # PI-902：结束判定的纯函数状态机与阈值组装统一由 completion 子包 re-export。
 from .task_state import TaskState, TaskStateName
 
@@ -25,10 +32,13 @@ logger = logging.getLogger(__name__)
 _EMPTY_NODE_REPORT_AFTER = 3
 
 from .browser_input import BrowserInputMixin
+from .page_pool import BucketActivityMixin
 from .reply_extractor import ReplyExtractorMixin
 from .reply_waiter import ReplyWaiterMixin
 
-class ChatIOMixin(BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin):
+class ChatIOMixin(
+    BucketActivityMixin, BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin
+):
     async def send_chat(
         self,
         prompt: str,
@@ -59,23 +69,65 @@ class ChatIOMixin(BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin):
 
         页面完全没有新回复（超时）最常见的原因是会话已到顶 / 已失效；
         由于我们无法可靠回填会话 URL，与其重开同一个会话，不如直接新开 + 播种。
+
+        **页面失效（P0-J）单独一条支线**：标签被用户关掉 / 渲染进程崩溃时，
+        driver 抛 :class:`~chatgpt_web.errors.ChatGPTPageLostError`。这类故障**不占**
+        重试阶梯额度，也不走「轮转 / 换新会话」分支——重建一条新页面后直接重发
+        （新页面本身就是空白会话，``has_history=False`` 会让本轮用播种 prompt 重放
+        历史，上下文不丢）。否则会把刚恢复的会话又轮转掉，白白丢上下文。
+
+        另外，「有请求在飞」从本方法第一行就登记（可重入计数）：
+        ``_ensure_page`` → ``_session_lock`` 之间页面还没有锁保护，空闲回收 /
+        LRU 淘汰只跳过「在飞」的桶，否则这段窗口里页面会被别的桶顺手关掉
+        （表现成随机 502，P0-L）。
         """
+        bucket = key or DEFAULT_SESSION_KEY
+        self._mark_bucket_active(bucket)
+        try:
+            return await self._send_chat_with_ladder(
+                prompt,
+                on_delta=on_delta,
+                seeded_prompt=seeded_prompt,
+                key=bucket,
+                validate_reply=validate_reply,
+            )
+        finally:
+            self._unmark_bucket_active(bucket)
+
+    async def _send_chat_with_ladder(
+        self,
+        prompt: str,
+        on_delta=None,
+        seeded_prompt: Optional[str] = None,
+        key: Optional[str] = None,
+        validate_reply: Optional[Callable[[str], bool]] = None,
+    ) -> tuple[str, List[dict]]:
+        """发送与重试阶梯本体，供 :meth:`send_chat` 调用（见那里的说明）。"""
         bucket = key or DEFAULT_SESSION_KEY
         seeded = seeded_prompt or prompt
         max_attempts = max(1, config.MAX_UPSTREAM_RETRIES)
+        # 页面失效的自愈额度：重建页面**不占**重试阶梯次数（见下面的页面失效分支）
+        page_rebuilds_left = max(1, config.MAX_UPSTREAM_RETRIES)
         last_error: Optional[RuntimeError] = None
         task_state = TaskState()
 
-        # 额外的会话桶需要自己的页面（默认桶就是 self.page，不涉及创建）
+        # 额外的会话桶需要自己的页面；页面已死（标签被关 / 渲染进程崩溃）时会在这里重建
         await self._ensure_page(bucket)
 
-        for attempt in range(1, max_attempts + 1):
+        attempt = 1              # 已消耗的重试阶梯次数（页面失效重建不消耗）
+        rebuild_pending = False  # 上一轮刚重建过页面：下一轮直接重发，不轮转
+        while attempt <= max_attempts:
             attempt_id = f"attempt-{uuid.uuid4().hex[:10]}"
             set_log_context(session_key=bucket, attempt_id=attempt_id)
             if attempt > 1:
                 metrics.inc("request_retry_total")
             state = self._state(bucket)
-            if state.pending_rotation:
+            if rebuild_pending:
+                # 页面刚重建：新页面已是空白会话（has_history=False → 本轮播种），
+                # 这里退避 / 轮转 / 换新会话都只会白等或丢掉刚恢复的上下文
+                rebuild_pending = False
+                logger.info("[恢复] 页面已重建，直接重发同一会话（不轮转、不退避）。")
+            elif state.pending_rotation:
                 # 体积超预算或上次检测到“到顶”：先轮转，再播种
                 await self._start_new_session(bucket)
             elif attempt == 1:
@@ -108,6 +160,31 @@ class ChatIOMixin(BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin):
                 reply_text, blocks = await self._send_chat_locked(
                     active_prompt, on_delta, key=bucket
                 )
+            except ChatGPTPageLostError as exc:
+                # 页面没了（标签被关 / 渲染进程崩溃）——与「改版 / 未登录」完全不同：
+                # 重建一条页面后直接重发，**不进**下面的轮转 / 换新会话分支。
+                last_error = exc
+                self._state(bucket).last_error = str(exc)
+                if page_rebuilds_left > 0:
+                    page_rebuilds_left -= 1
+                    # 任务状态机只允许「生成中 → 会话恢复 → 重新构建 prompt」这条链，
+                    # 下一轮开头的 transition(PROMPT_BUILT/MODEL_GENERATING) 会接着走
+                    task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
+                    logger.warning(
+                        f"[恢复] 会话页面已失效（{exc}），重建页面后重发"
+                        f"（剩余重建额度 {page_rebuilds_left} 次，不占重试阶梯）。"
+                    )
+                    # force=True：崩溃的页面可能仍报 is_closed()==False，
+                    # 恢复路径不能依赖判活，必须无条件重建
+                    await self._ensure_page(bucket, force=True)
+                    # 新页面 = 新的网页会话，状态里的轮转请求已无意义
+                    self._state(bucket).pending_rotation = False
+                    rebuild_pending = True
+                    continue  # 不消耗 attempt
+                if attempt < max_attempts:
+                    task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
+                attempt += 1
+                continue
             except ChatGPTContextLimitError as exc:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
                 last_error = exc
@@ -125,6 +202,8 @@ class ChatIOMixin(BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin):
                     )
                 else:
                     logger.warning(f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限。")
+                attempt += 1
+                continue
             except ChatGPTTimeoutError as exc:
                 # 只有「超时 / 到顶」才可重试；找不到输入框、profile 被占用等不可重试
                 last_error = exc
@@ -134,6 +213,8 @@ class ChatIOMixin(BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin):
                     task_state.timeout(str(exc))
                 self._state(bucket).last_error = str(exc)
                 logger.warning(f"[恢复] 第 {attempt}/{max_attempts} 次失败：等待回复超时。")
+                attempt += 1
+                continue
             else:
                 # 回复达标（或调用方没给判定）——直接返回
                 if validate_reply is None or validate_reply(reply_text):
