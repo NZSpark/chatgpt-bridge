@@ -8,7 +8,6 @@
 把请求打挂。
 """
 
-import json
 import logging
 from typing import List
 

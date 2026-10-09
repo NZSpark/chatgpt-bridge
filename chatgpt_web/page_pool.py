@@ -73,6 +73,11 @@ class BucketActivityMixin:
 
 
 class PagePoolMixin(BucketActivityMixin):
+    #: 「默认桶」的页面由宿主持有（``ChatGPTWebDriver.page``）。这里显式声明类型：
+    #: 既写明 mixin 对宿主的契约，也避免 mypy 从本模块内的 ``self.page = None``
+    #: 反推出无法确定的类型（has-type）。
+    page: Any
+
     def busy_keys(self) -> List[str]:
         """当前正在处理请求（有请求在飞 / 已拿到锁、正在生成）的会话桶，供多 Agent 观察占用。"""
         return sorted(self._active_registry()[1])

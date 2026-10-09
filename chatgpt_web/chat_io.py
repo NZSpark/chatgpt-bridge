@@ -7,20 +7,24 @@
 
 import asyncio
 import logging
-import time
 import uuid
 from typing import Callable, List, Optional
 
 from . import config
-from .logging_setup import set_log_context
-from .metrics import metrics
+from .browser_input import BrowserInputMixin
 from .errors import (
     DEFAULT_SESSION_KEY,
-    ChatGPTPageLostError,
     ChatGPTBusyError,
     ChatGPTContextLimitError,
+    ChatGPTPageLostError,
     ChatGPTTimeoutError,
 )
+from .logging_setup import set_log_context
+from .metrics import metrics
+from .page_pool import BucketActivityMixin
+from .reply_extractor import ReplyExtractorMixin
+from .reply_waiter import ReplyWaiterMixin
+
 # PI-902：结束判定的纯函数状态机与阈值组装统一由 completion 子包 re-export。
 from .task_state import TaskState, TaskStateName
 
@@ -31,10 +35,6 @@ logger = logging.getLogger(__name__)
 # 只有**持续**零节点才说明选择器失效（网页版改版）。
 _EMPTY_NODE_REPORT_AFTER = 3
 
-from .browser_input import BrowserInputMixin
-from .page_pool import BucketActivityMixin
-from .reply_extractor import ReplyExtractorMixin
-from .reply_waiter import ReplyWaiterMixin
 
 class ChatIOMixin(
     BucketActivityMixin, BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin

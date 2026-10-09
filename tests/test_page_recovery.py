@@ -37,7 +37,6 @@ from chatgpt_web.errors import (  # noqa: E402
     page_alive,
 )
 
-
 # ==================== 页面替身 ====================
 
 

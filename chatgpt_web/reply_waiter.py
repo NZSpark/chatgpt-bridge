@@ -3,18 +3,18 @@
 import asyncio
 import logging
 import time
+from typing import List, Optional
 
 from . import config
-from .logging_setup import set_log_context
 from .completion.generator import EndState, build_end_limits, evaluate_poll
 from .errors import (
     DEFAULT_SESSION_KEY,
     ChatGPTPageLostError,
-    ChatGPTContextLimitError,
     ChatGPTTimeoutError,
     page_alive,
     page_lost_reason,
 )
+from .logging_setup import set_log_context
 from .metrics import metrics
 from .prompting import _delta_piece, estimate_tokens
 
