@@ -18,6 +18,7 @@ from typing import List, Optional
 
 from .. import config
 from ..errors import (
+    DEFAULT_SESSION_KEY,
     HOME_URL,
     ChatGPTContextLimitError,
 )
@@ -88,17 +89,28 @@ class CompletionMixin:
     }'''
 
     async def _restore_session_on_startup(self) -> None:
-        """启动时一律新开对话（不做 URL 恢复）。
+        """启动时新开对话（例外：用户 ``/link`` 绑定过的会话桶回到那条会话）。
 
-        会话连续性由「每桶新开对话 + 历史播种」保证：桶状态里只记录轮数 /
+        会话连续性默认由「每桶新开对话 + 历史播种」保证：桶状态里只记录轮数 /
         体积 / 是否到顶，页面关闭后下次重开会用 build_prompt(seed=True)
-        重放历史。因此这里不再读取或回填任何会话地址。
+        重放历史。因此这里不读取或回填任何**自动探测到的**会话地址。
+
+        唯一的例外是用户显式绑定的 ``linked_url``：它本来就是“保持连接”的意图，
+        重启后应当直接落回那条会话（否则一次重启就把绑定绕过了）。
         """
         state = self._load_session_state()
         self.session_turns = int(state.get("turns") or 0)
         self.session_est_tokens = int(state.get("est_tokens") or 0)
         self.session_cap_hit = bool(state.get("cap_hit"))
         self.last_error = state.get("last_error") or None
+
+        target = self._state(DEFAULT_SESSION_KEY).linked_url
+        if target:
+            await self._enter_linked_session(
+                DEFAULT_SESSION_KEY, self.page, target, reason="启动恢复"
+            )
+            logger.info("[系统提示] 已按绑定的会话 URL 恢复默认会话：%s", target)
+            return
 
         await self.page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._open_new_chat(self.page)
@@ -187,6 +199,21 @@ class CompletionMixin:
         page = self._page_for(key)
         if page is None:
             return
+        target = self._state(key).linked_url
+        if target:
+            # 绑定了具体会话的桶不真轮转：那会把用户明确指定的那条会话丢掉。
+            # 改为重新打开它（页面上已有上下文，因此不需要播种），顺带把漂移 /
+            # 重建后的页面拉回目标。
+            await self._enter_linked_session(key, page, target, reason="轮转改为回到绑定会话")
+            state = self._state(key)
+            state.turns = 0
+            state.est_tokens = 0
+            state.cap_hit = False
+            state.pending_rotation = False
+            state.last_error = None
+            await asyncio.to_thread(self._save_session_state, key)
+            logger.info("[轮转] 已回到绑定的网页会话（上下文仍在，本轮不重放历史）。")
+            return
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._open_new_chat(page)
         await self._wait_ready(page)
@@ -240,6 +267,7 @@ class CompletionMixin:
         """超时后重开一个干净对话（不做 URL 恢复），成功返回 True。
 
         上下文不会丢：调用方在本轮失败后会以「播种」prompt 重发历史。
+        绑定了会话 URL 的桶（``/link``）改为回到那条会话——它本来就带着上下文。
         """
         metrics.inc("session_recovery_total")
         page = self._page_for(key)
@@ -248,6 +276,13 @@ class CompletionMixin:
             return False
         with metrics.timer("session_recovery_latency"):
             try:
+                target = self._state(key).linked_url
+                if target:
+                    # 绑定了会话：超时恢复不该丢掉用户指定的那条会话（页面漂移 /
+                    # 句柄重建后也靠这条路径回到目标），所以这里只重新打开它。
+                    await self._enter_linked_session(key, page, target, reason="超时恢复")
+                    logger.info("[恢复] 已回到绑定的网页会话（上下文仍在，本轮不重放历史）。")
+                    return True
                 await page.goto(HOME_URL, wait_until="domcontentloaded")
                 await self._open_new_chat(page)
                 if not await self._wait_ready(page):

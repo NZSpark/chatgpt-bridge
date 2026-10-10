@@ -27,6 +27,7 @@ from ..driver import (
 )
 from ..events import AssistantTextDelta, completion_events
 from ..events import ToolCall as BridgeToolCall
+from ..linking import handle_command
 from ..models import ChatCompletionRequest, ChatMessage, FunctionCall, ToolCall
 from ..prompting import build_prompt, estimate_tokens, tool_nudge_predicate
 from ..protocol_adapters import (
@@ -281,7 +282,13 @@ async def run_chat(
     """执行一次上游对话，返回 (reply, code_blocks, tool_calls)。
 
     与 server.py 的 chat 路径共用 driver / prompting / toolcalls，但不改其代码。
+    桥内命令（``/link`` 等）在这里被识别：整条消息就是那一行命令时，直接返回
+    桥自己的应答，**不发给网页版**（非流式与流式两条路径都经过本函数）。
     """
+    command_reply = await handle_command(request.messages, driver, session_key)
+    if command_reply is not None:
+        return command_reply, [], [], command_reply
+
     # 任务快照：记录本轮 messages，轮转播种时用它续接任务（不丢任务目标）。
     bucket = session_key or DEFAULT_SESSION_KEY
     # 任务快照落盘/读取是同步文件 I/O，放线程里跑（T3.3）

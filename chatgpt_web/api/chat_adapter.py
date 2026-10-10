@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from .. import config
 from ..driver import ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
 from ..events import AssistantTextDelta, ToolCall, completion_events
+from ..linking import handle_command
 from ..models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -81,6 +82,19 @@ async def stream_chat_completion(
 
     # 先发 role 头
     yield encode({"role": "assistant"})
+
+    # 桥内命令（``/link`` 等）：整条消息就是那一行命令时由桥直接应答，**不发给网页版**。
+    # 放在这里而不是上游：句柄失效 / 页面漂移时这条命令正好是用户唯一的救命手段，
+    # 不能依赖浏览器可用。
+    command_reply = await handle_command(request.messages, driver, session_key)
+    if command_reply is not None:
+        for piece in chunk_text(command_reply):
+            command_choice = chat_sse_choice_for_event(AssistantTextDelta(piece))
+            assert command_choice is not None  # 文本增量一定被适配器投影为 choice
+            yield encode(command_choice["delta"], finish=command_choice["finish_reason"])
+        yield encode(None, finish="stop")
+        yield "data: [DONE]\n\n"
+        return
 
     queue: "asyncio.Queue[tuple]" = asyncio.Queue()
 
@@ -293,6 +307,9 @@ async def run_chat_completion(
     失败时抛 :class:`ChatAdapterError`（含 HTTP 状态码与错误类型）。
     """
     wants_tools = bool(request.tools) and request.tool_choice != "none"
+    command_response = await bridge_command_response(request, driver, session_key)
+    if command_response is not None:
+        return command_response
     try:
         reply_content, code_blocks = await driver.send_chat(
             prompt,
@@ -441,6 +458,33 @@ async def run_chat_completion(
             total_tokens=estimate_tokens(sent_prompt) + estimate_tokens(reply_content),
         ),
         saved_files=saved_files,
+    )
+
+
+async def bridge_command_response(
+    request: ChatCompletionRequest, driver, session_key: Optional[str]
+) -> Optional[ChatCompletionResponse]:
+    """执行桥内命令（``/link`` 等）并把它包装成一条 assistant 回复；不是命令则 None。
+
+    命令由桥自己应答、**不经过网页版**：句柄失效 / 页面漂移时它必须还能用。
+    usage 按「没有上游 prompt」计（prompt_tokens=0），避免把桥的应答算成网页版用量。
+    """
+    reply = await handle_command(request.messages, driver, session_key)
+    if reply is None:
+        return None
+    completion_tokens = estimate_tokens(reply)
+    return ChatCompletionResponse(
+        model=request.model,
+        choices=[Choice(
+            index=0,
+            message=ChoiceMessage(role="assistant", content=reply),
+            finish_reason="stop",
+        )],
+        usage=Usage(
+            prompt_tokens=0,
+            completion_tokens=completion_tokens,
+            total_tokens=completion_tokens,
+        ),
     )
 
 

@@ -14,7 +14,7 @@ from typing import Any, List, Optional, Union
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, tasks
+from . import config, linking, tasks
 from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTWebDriver,
@@ -320,6 +320,60 @@ async def reset_session(
     )
 
 
+@app.post("/session/link", include_in_schema=False)
+async def link_session(
+    url: Optional[str] = None,
+    session: Optional[str] = None,
+    seed: bool = False,
+    x_reset_token: Optional[str] = Header(None, alias="X-Reset-Token"),
+):
+    """把某个会话桶绑定到指定的 ChatGPT 网页会话链接（对话里 ``/link <URL>`` 的 HTTP 版）。
+
+    绑定后这个桶不再落到空白新对话：页面漂移（ChatGPT 自行开新会话）、句柄失效
+    重建、轮转、重启都会回到这条会话，所以一次句柄丢失不会把上下文丢在别处。
+    ``seed=true`` = 那条会话里其实没有此前记录，下一次发送要把完整历史播种进去。
+
+    ``RESET_TOKEN`` 已设置时必须带 ``X-Reset-Token`` 头（与 ``/session/reset`` 同一把锁）。
+    """
+    if config.RESET_TOKEN and x_reset_token != config.RESET_TOKEN:
+        raise HTTPException(status_code=403, detail="RESET_TOKEN 校验失败")
+    bucket = (session or "").strip() or DEFAULT_SESSION_KEY
+    try:
+        target = linking.canonical_conversation_url(url or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    driver.link_session(target, key=bucket, seed=bool(seed))
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "session": bucket,
+            "linked_url": target,
+            "seed": bool(seed),
+            "session_stats": driver.session_stats(bucket),
+        }
+    )
+
+
+@app.post("/session/unlink", include_in_schema=False)
+async def unlink_session(
+    session: Optional[str] = None,
+    x_reset_token: Optional[str] = Header(None, alias="X-Reset-Token"),
+):
+    """解除会话绑定（``/unlink`` 的 HTTP 版）：下一轮开新会话并播种完整历史。"""
+    if config.RESET_TOKEN and x_reset_token != config.RESET_TOKEN:
+        raise HTTPException(status_code=403, detail="RESET_TOKEN 校验失败")
+    bucket = (session or "").strip() or DEFAULT_SESSION_KEY
+    removed = driver.unlink_session(bucket)
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "session": bucket,
+            "unlinked": removed,
+            "session_stats": driver.session_stats(bucket),
+        }
+    )
+
+
 @app.get("/", include_in_schema=False)
 async def root():
     return {
@@ -333,6 +387,8 @@ async def root():
             "/debug/dom",
             "/_debug/selectors",
             "/session/reset",
+            "/session/link",
+            "/session/unlink",
         ],
     }
 

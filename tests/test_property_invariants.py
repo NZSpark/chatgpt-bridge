@@ -29,6 +29,10 @@ class _DummyChatIO(ChatIOMixin):
     async def _ensure_page(self, bucket):
         return None
 
+    async def _ensure_linked_target(self, bucket):
+        # 宿主契约的一部分（PagePoolMixin 提供）：无不绑定即无导航
+        return False
+
     def _state(self, bucket):
         return self._states.setdefault(
             bucket,

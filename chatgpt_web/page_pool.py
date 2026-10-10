@@ -17,7 +17,10 @@ from .errors import (
     HOME_URL,
     ChatGPTBusyError,
     page_alive,
+    page_url,
 )
+from .linking import same_conversation
+from .metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +111,8 @@ class PagePoolMixin(BucketActivityMixin):
                 "last_used": self._page_last_used.get(bucket),
                 "has_history": bool(getattr(state, "has_history", False)),
                 "turns": int(getattr(state, "turns", 0) or 0),
+                # 用户用 /link 绑定的会话（None = 未绑定，见 chatgpt_web.linking）
+                "linked_url": getattr(state, "linked_url", None),
             }
         return out
 
@@ -308,6 +313,9 @@ class PagePoolMixin(BucketActivityMixin):
         首次建页与页面失效重建共用这一条路径：``goto(HOME_URL)`` → 新建对话 →
         等输入框就绪 → 选中思考模式。``has_history=False`` 表示这个网页会话里
         没有上下文，本轮必须「播种」（上下文靠重放历史重建）。
+
+        绑定了会话 URL 的桶（``/link``）例外：新页面直接落到**那条会话**上，
+        所以「句柄失效 → 新开页面重发」不会变成「发进一条空白新对话」。
         """
         page = await self.context.new_page()
         if bucket == DEFAULT_SESSION_KEY:
@@ -316,6 +324,10 @@ class PagePoolMixin(BucketActivityMixin):
             self._pages[bucket] = page
         self._page_ids[bucket] = f"page-{id(page):x}"
         self._touch_page(bucket)
+        target = self._state(bucket).linked_url
+        if target:
+            await self._enter_linked_session(bucket, page, target, reason="新开页面")
+            return page
         # 每桶始终新开对话；上下文靠本轮的「播种」重建
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._open_new_chat(page)
@@ -324,3 +336,47 @@ class PagePoolMixin(BucketActivityMixin):
         await self._select_think_mode(page)
         self._state(bucket).has_history = False
         return page
+
+    async def _enter_linked_session(
+        self, bucket: str, page, target: str, reason: str = ""
+    ) -> None:
+        """把页面导航到该桶绑定的会话 URL（``/link``，见 :mod:`chatgpt_web.linking`）。
+
+        **有意不改** ``has_history``：绑定方式才是那个标记的判据（``/link`` 默认 =
+        该会话已有上下文，只发增量；``/link <URL> --seed`` = 本轮得把历史播种进去），
+        导航本身不能把它推翻。
+
+        为什么需要它：ChatGPT 网页版有时会自行开启一条新的网页会话（页面就此漂移），
+        句柄失效重建时也会落到空白新对话。两种情形都靠这条路径回到用户指定的会话，
+        所以一次句柄丢失不会把上下文丢在别处。
+        """
+        metrics.inc("session_link_navigation_total")
+        await page.goto(target, wait_until="domcontentloaded")
+        await self._wait_ready(page)
+        # 目标会话同样要选中「思考模式」，否则回复质量与别的桶不一致
+        await self._select_think_mode(page)
+        self._touch_page(bucket)
+        logger.info(
+            "[绑定] key=%s 已打开绑定的网页会话 %s%s。",
+            bucket, target, f"（{reason}）" if reason else "",
+        )
+
+    async def _ensure_linked_target(self, key: Optional[str] = None) -> bool:
+        """发送前把页面拉回绑定的会话；返回该桶是否处于绑定状态。
+
+        这是「保持连接」的关键一步：ChatGPT 网页版可能自己跳到新会话（页面漂移），
+        句柄重建后的新页面也可能不在目标会话上。每轮发送前比对一次
+        （``page.url`` 是同步属性，不产生往返），不一致就重新导航——否则这一轮会被
+        发进一条陌生的新会话，上下文在网页端丢掉。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        target = self.linked_url(bucket)
+        if not target:
+            return False
+        page = self._page_for(bucket)
+        if page is None:
+            return True
+        if same_conversation(page_url(page), target):
+            return True
+        await self._enter_linked_session(bucket, page, target, reason="发送前对齐")
+        return True

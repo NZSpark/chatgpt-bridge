@@ -20,6 +20,7 @@ _SESSION_FIELDS = frozenset({
     "last_error",
     "cap_failures",
     "updated_at",
+    "linked_url",
 })
 
 
@@ -67,6 +68,10 @@ class SessionState:
     # 收到回复或轮转到新会话时清零。
     cap_failures: int = 0
     updated_at: int = 0
+    # 用户用 ``/link`` 绑定的网页会话 URL（None = 未绑定，见 :mod:`chatgpt_web.linking`）。
+    # 绑定的桶不再落到空白新对话：页面漂移 / 句柄失效重建 / 轮转 / 启动恢复都会回到
+    # 这条会话，所以一次句柄丢失不会把上下文丢在别处。
+    linked_url: Optional[str] = None
 
     def to_payload(self) -> Dict[str, Any]:
         return asdict(self)
@@ -86,4 +91,6 @@ class SessionState:
                 setattr(state, name, 0)
         last_error = payload.get("last_error")
         state.last_error = last_error if isinstance(last_error, str) else None
+        linked = payload.get("linked_url")
+        state.linked_url = linked.strip() if isinstance(linked, str) and linked.strip() else None
         return state

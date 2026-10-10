@@ -196,6 +196,19 @@ async def page_responds(page, timeout_s: float = PAGE_PROBE_TIMEOUT_S) -> bool:
     return True
 
 
+def page_url(page) -> str:
+    """页面当前 URL（读不到时返回空串）。
+
+    ``page.url`` 是 Playwright 的**同步属性**，读它不产生往返；用于判断页面是否
+    还停在目标会话上（见 ``page_pool._ensure_linked_target`` 的会话绑定）。
+    """
+    try:
+        url = getattr(page, "url", "") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return url if isinstance(url, str) else ""
+
+
 def page_lost_reason(page) -> str:
     """给日志/错误文案用的可读原因（不回显页面正文）。
 
@@ -204,10 +217,7 @@ def page_lost_reason(page) -> str:
     """
     if page is None:
         return "标签已失效（没有可用的会话页面）"
-    try:
-        url = getattr(page, "url", "") or "?"
-    except Exception:  # noqa: BLE001
-        url = "?"
+    url = page_url(page) or "?"
     if not page_alive(page):
         return f"标签已失效（页面已关闭，URL={url}）"
     return f"标签已失效（页面不可用，URL={url}，疑似渲染进程崩溃或页面已被回收）"

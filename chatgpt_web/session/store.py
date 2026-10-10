@@ -150,7 +150,9 @@ class SessionStoreMixin:
     def _pending_rotation(self, value: bool) -> None:
         self._state().pending_rotation = bool(value)
 
-    # ---------- 会话状态持久化（不再涉及会话 URL）----------
+    # ---------- 会话状态持久化 ----------
+    # 注：这里不再保存「自动探测到的」会话 URL（恢复一律靠新开会话 + 播种）；
+    # 唯一被持久化的地址是用户用 ``/link`` **显式绑定**的那条（``linked_url``）。
     def _read_state_file(self) -> Dict[str, Any]:
         """读取原始状态文件（解析失败或非 JSON 时返回空字典）。
 
@@ -264,6 +266,7 @@ class SessionStoreMixin:
             "est_tokens": state.est_tokens,
             "cap_hit": state.cap_hit,
             "pending_rotation": state.pending_rotation,
+            "linked_url": state.linked_url,
             "last_error": state.last_error,
             # 连续“到顶”失败次数：>=2 时播种内容会被自动压缩（防死循环）
             "cap_failures": getattr(state, "cap_failures", 0),
@@ -278,6 +281,54 @@ class SessionStoreMixin:
         if config.SESSION_MAX_TOKENS and state.est_tokens >= config.SESSION_MAX_TOKENS:
             return True
         return False
+
+    # ---------- 会话绑定（/link，见 chatgpt_web.linking）----------
+    def linked_url(self, key: Optional[str] = None) -> Optional[str]:
+        """该桶当前绑定的网页会话 URL（``None`` = 未绑定）。"""
+        return self._state(key).linked_url
+
+    def link_session(self, url: str, key: Optional[str] = None, seed: bool = False) -> str:
+        """把某个会话桶绑定到指定的网页会话 URL，返回实际记录下来的地址。
+
+        ``seed=False``（默认）：该会话被视为**已有此前上下文** → 之后只发增量
+        （这是「ChatGPT 自己开了新会话、用户把会话地址丢过来」的常见情形）；
+        ``seed=True``：下一次发送把完整历史**播种**进去——那条会话里其实没有
+        此前记录时用（代价是历史在网页端会重复一遍）。
+
+        只改状态、**不碰页面**：真正的导航由发送前的
+        ``PagePoolMixin._ensure_linked_target`` 完成（页面漂移 / 句柄重建 /
+        启动恢复都会回到这条会话），所以浏览器没起、句柄已经失效时这条命令照样有效。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        state = self._state(bucket)
+        state.linked_url = url
+        state.has_history = not seed
+        state.cap_hit = False
+        state.pending_rotation = False
+        state.last_error = None
+        self._save_session_state(key=bucket)
+        _log().info(
+            "[绑定] key=%s 已绑定网页会话 %s（播种=%s，之后每轮都会确保页面停在该会话上）。",
+            bucket, url, seed,
+        )
+        return url
+
+    def unlink_session(self, key: Optional[str] = None) -> bool:
+        """解除绑定（返回是否真的解除过）。
+
+        恢复默认行为：下一轮先轮转到一个新会话、再播种完整历史——否则会把下一轮
+        的增量发进那条已经不归我们管的会话里。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        state = self._state(bucket)
+        had = bool(state.linked_url)
+        state.linked_url = None
+        state.has_history = False
+        state.pending_rotation = True
+        self._save_session_state(key=bucket)
+        if had:
+            _log().info("[绑定] key=%s 已解除会话绑定，下一轮将开启新会话并播种上下文。", bucket)
+        return had
 
     def reset_session(self, key: Optional[str] = None) -> None:
         """把某个会话桶标记为“下一轮开新会话”（手动逃生口）。

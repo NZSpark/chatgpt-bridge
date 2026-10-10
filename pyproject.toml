@@ -60,11 +60,18 @@ ignore_missing_imports = true
 # 豁免清单（T4.1）：driver 与三个 mixin 模块采用「Mixin 组合」共享宿主类属性
 # （例如 ChatIOMixin 里引用的 _page_is_generating 由 ChatGPTWebDriver 组合后提供），
 # mypy 静态看不到宿主属性 → 只对这些模块关闭 attr-defined，其余错误码照常检查。
+#
+# 注意：PI-902 / PI-905 把 ``completion`` 与 ``session_store`` 拆成了包，模块名随之
+# 变成 ``chatgpt_web.completion.lifecycle`` / ``chatgpt_web.session.store``。
+# 旧名字在这里**匹配不到任何模块**，于是拆分后的真身反倒裸露出来（attr-defined
+# 全部报出、看起来像新错误）。因此这里按现状列出：包内模块用 ``.*`` 通配，
+# 兼容 facade（``chatgpt_web.session_store``）保留。
 [[tool.mypy.overrides]]
 module = [
     "chatgpt_web.chat_io",
-    "chatgpt_web.completion",
+    "chatgpt_web.completion.*",
     "chatgpt_web.page_pool",
+    "chatgpt_web.session.store",
     "chatgpt_web.session_store",
 ]
 disable_error_code = ["attr-defined"]

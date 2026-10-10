@@ -173,6 +173,14 @@ RETRY_BACKOFF_S = env_float("RETRY_BACKOFF_S", 1.0)
 # 设 0 表示不自动重建（页面死了直接报错）。
 PAGE_REBUILD_MAX = env_int("PAGE_REBUILD_MAX", 1)
 
+# ==================== 会话绑定（/link）====================
+# `/link <URL>` 允许把某个会话桶固定到用户给出的网页会话地址（ChatGPT 网页版
+# 有时会自行开启新会话，桥这一侧就表现为句柄消失 / 上下文不在原会话）。
+# 这里限定可绑定的站点：逗号或 "||" 分隔，子域自动允许（列了 chatgpt.com 就等于
+# 也允许 www.chatgpt.com）；写 "*" 表示不限制（自建镜像站用）。
+# 防的是「把桥指向一个任意域名」——绑定后 prompt 会真的发到那个站点上。
+LINK_ALLOWED_HOSTS = env_str("LINK_ALLOWED_HOSTS", "chatgpt.com,chat.openai.com")
+
 
 # ==================== 会话生命周期 ====================
 # 启动时忽略已保存的会话，直接开一个新会话。搭配“播种”使用才安全（首轮会重放历史）。
@@ -483,6 +491,7 @@ class SessionConfig:
     session_max_turns: int
     session_max_tokens: int
     new_session_on_start: bool
+    link_allowed_hosts: str
 
 
 @dataclass(frozen=True)
@@ -609,6 +618,7 @@ def build_config_bundle() -> ConfigBundle:
             session_max_turns=cfg.SESSION_MAX_TURNS,
             session_max_tokens=cfg.SESSION_MAX_TOKENS,
             new_session_on_start=cfg.NEW_SESSION_ON_START,
+            link_allowed_hosts=cfg.LINK_ALLOWED_HOSTS,
         ),
         completion=CompletionConfig(
             chat_keepalive_s=cfg.CHAT_KEEPALIVE_S,

@@ -191,8 +191,42 @@ codex --profile chatgpt
 | POST | `/v1/responses` | Responses API（受 `ENABLE_RESPONSES_API` 控制） |
 | GET | `/healthz` | 健康检查与 cluster 状态 |
 | POST | `/session/reset` | 重置指定会话桶 |
+| POST | `/session/link` | 把会话桶绑定到指定的网页会话链接（`/link` 指令的 HTTP 版） |
+| POST | `/session/unlink` | 解除会话绑定（下一轮开新会话 + 播种） |
 | GET | `/debug/dom` | DOM 调试（受 `CHATGPT_DEBUG` 控制，不回显正文） |
 | GET | `/` | 服务信息 |
+
+## 会话绑定（`/link`）：把某一桶保持在指定网页会话上
+
+默认设计是「每桶新开对话 + 播种重放历史」，不依赖回填会话地址。但 ChatGPT 网页版
+**有时会自行开启一条新的网页会话**（桥这一侧就是「句柄消失 / 上下文不在原来的会话里」），
+这时你可能希望指定「就发到这条会话」。在客户端里把下面这一行当普通消息发给桥即可
+（chat / responses 两条路径都支持）：
+
+```text
+/link https://chatgpt.com/c/6ac9c061-5074-83ec-82f0-2f46a8c334ca
+/link https://chatgpt.com/c/6ac9c061-5074-83ec-82f0-2f46a8c334ca --seed
+/unlink
+```
+
+- `/link <URL>`：把**当前会话桶**绑定到该会话。默认认为这条会话里**已有此前上下文**，
+  之后只发增量；句柄失效重建、页面漂移（网页版自己跳走）、轮转、服务重启都会回到该会话。
+- `/link <URL> --seed`：绑定，但下一次发送把**完整历史播种**进这条会话
+  （它里面其实没有此前记录时用；代价是历史会在网页端重复一遍）。
+- `/link`（无参数）：查看当前绑定；`/unlink`：解除绑定，恢复「新开会话 + 播种」的默认行为。
+
+要点：
+
+- **命令不经过网页版**：整条消息就是那一行命令时由桥直接应答（返回一条说明性回复），
+  不发给模型，因此**句柄失效、页面漂移、浏览器都没起来时它照样有效**。
+- **只认「整条消息就是一行命令」**：混在正文里、多行文本、或出现在历史消息里的命令都
+  当成普通提问交给模型，不会把用户正常说的话吃掉。
+- **绑定落盘**（`SESSION_FILE` 里的 `linked_url`），重启后仍生效；当前绑定可从
+  `GET /healthz` 的 `buckets.<key>.linked_url` 看到。
+- 链接必须是 `https://<允许的站点>/c/<会话ID>`（`/share/...` 分享链接不能继续对话）；
+  允许的站点由 `LINK_ALLOWED_HOSTS` 控制，默认仅官方域名。
+- 不想用指令时可用 HTTP：`POST /session/link?url=<URL>&session=<bucket>&seed=false`、
+  `POST /session/unlink?session=<bucket>`（设置了 `RESET_TOKEN` 时同样要带 `X-Reset-Token`）。
 
 ## 配置
 
@@ -230,6 +264,7 @@ codex --profile chatgpt
 | `BUCKET_IDLE_TTL_S` | `900` | 空闲回收 |
 | `PARALLEL_BUCKETS` | `false` | 各桶并行页面 |
 | `BUCKET_LOCK_TIMEOUT_S` | `120` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
+| `LINK_ALLOWED_HOSTS` | `chatgpt.com,chat.openai.com` | `/link` 允许绑定的站点（逗号或 `||` 分隔，子域自动允许；`*` = 不限制） |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
 | `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
 | `TOOL_NUDGE_UNTIL_FIRST_CALL` | `true` | 工具纠偏只在本轮还没调用过任何工具时生效；`false` = 完全不纠偏（桥绝不自行追发 prompt） |
@@ -313,6 +348,7 @@ chatgpt_web/
   markdown_io.py          Markdown 提取与工具调用解析器
   driver.py               Playwright 浏览器驱动、会话生命周期
   chat_io.py              DOM 交互、输入框等待、页面内事件提交与代码块提取
+  linking.py              会话绑定（/link、/unlink）：链接校验与桥内命令
   session_store.py        会话状态落盘与持久化管理
   page_pool.py            Playwright Page 实例池管理
   completion.py           Chat Completions 逻辑处理与重试驱动
@@ -340,6 +376,8 @@ user_data/                浏览器 profile 与状态（gitignore）
 - **载体选围栏，不选纯文本行**：网页版把纯文本 `TOOL_CALL: {...}` 行当 markdown 渲染——值内引号前的反斜杠被吃掉（JSON 失效、整条调用被丢弃）、连续缩进空格被折叠成 1 个（命令被静默改坏）；代码块内部不做这层处理，实测同一条命令在围栏里**逐字节一致**（真机 A/B 对比见 [doc/update.md](doc/update.md) §2.14）。
 - **桥不自行追发 prompt**：工具纠偏只在本轮任务「一次工具都还没调用过」时生效（`TOOL_NUDGE_UNTIL_FIRST_CALL`）。历史里一旦出现工具结果 / 工具调用，无指令的纯文本回复就作为最终答案返回，由客户端判定任务结束——避免「ChatGPT 已收尾、桥又追发一条 prompt、模型被迫再吐新指令」这种收不了尾的情形。
 - 会话隔离与资源回收：通过 X-ChatGPT-Session、user、User-Agent 建立会话桶，并配合 LRU 与页面池控制浏览器资源。
+- **保持连接 vs 新开会话**：默认「轮转 + 播种」不依赖会话地址，但用户用 `/link` 显式绑定后，
+  这一桶就固定发到那条会话（页面漂移 / 句柄重建 / 轮转 / 重启都回到它），命令本身不经过网页版。
 - 配置与 DOM 解耦：选择器、轮询阈值、会话数量、任务快照和 Responses API 开关集中在 .env，网页版改版时优先调整配置。
 
 ## 测试
