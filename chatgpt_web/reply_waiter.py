@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from . import config
 from .completion.generator import EndState, build_end_limits, evaluate_poll
@@ -13,6 +13,7 @@ from .errors import (
     ChatGPTTimeoutError,
     page_alive,
     page_lost_reason,
+    page_usable_reason,
 )
 from .logging_setup import set_log_context
 from .metrics import metrics
@@ -24,6 +25,11 @@ _EMPTY_NODE_REPORT_AFTER=3
 
 class ReplyWaiterMixin:
     """Own the browser generation polling loop while keeping driver APIs intact."""
+
+    #: 宿主（``ChatGPTWebDriver``）提供的 DOM adapter。显式声明宿主契约（与
+    #: ``page_pool.PagePoolMixin.page`` 同一手法）：mixin 单独检查时看不到宿主属性，
+    #: 不声明就会报 attr-defined。只声明本模块真正依赖的那一个。
+    dom: Any
 
     def _input_missing_message(self) -> str:
         """「找不到输入框」的错误文案：带上现场信息（不回显正文）。
@@ -93,6 +99,12 @@ class ReplyWaiterMixin:
             #    只有「页面活着但选择器全不中」才走到下面这条文案（P0-J）。
             chat_input = await self._find_input(page)
             if not chat_input:
+                # 页面活着但选择器全不中（改版 / 未登录）→ 配置问题，不可重试；
+                # 但「渲染进程崩溃 / 挂起」也会表现为每条选择器都超时，而它**可自愈**：
+                # 先判页面是否还响应 JS，不响应的必须先重建页面重发（P0-J）。
+                reason = await page_usable_reason(page)
+                if reason:
+                    raise ChatGPTPageLostError(f"定位对话输入框失败：{reason}")
                 raise RuntimeError(self._input_missing_message())
 
             # 记录发送前最后一条回复的文本，用来判断“新回复是否已经出现”。
@@ -120,9 +132,15 @@ class ReplyWaiterMixin:
             # 旧句柄失效导致的 fill 超时（新会话首轮尤其常见）。
             filled = await self._fill_prompt(page, prompt)
             if filled is None:
+                # 能走到这里说明页面**还活着且能执行 JS**（页面已失效的会在
+                # _fill_prompt 里抛 ChatGPTPageLostError → 阶梯新开页面重发）；
+                # 重开页面救不了这种情况，如实报错并带上现场（URL / readyState /
+                # 弹层 / 登录墙 / 选择器命中数），而不是只让用户去查登录状态。
+                probe = await self.dom.input_probe(page)
                 raise RuntimeError(
-                    "填充输入框失败（多次重试后仍为空或 fill 超时）。"
-                    "请检查登录状态与 INPUT_SELECTORS 配置。"
+                    "填充输入框失败（多次重试后读回仍为空或 fill 超时）。"
+                    "页面仍在运行，请检查登录状态、composer 是否被弹层遮挡，"
+                    f"以及 INPUT_SELECTORS 配置（现场：{probe}）。"
                 )
             chat_input = filled
             await self._submit_prompt(page, chat_input)

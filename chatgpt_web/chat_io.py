@@ -68,13 +68,16 @@ class ChatIOMixin(
         3. 最高一级：**重开新对话 + 用播种 prompt 重放历史**。
 
         页面完全没有新回复（超时）最常见的原因是会话已到顶 / 已失效；
-        由于我们无法可靠回填会话 URL，与其重开同一个会话，不如直接新开 + 播种。
-
-        **页面失效（P0-J）单独一条支线**：标签被用户关掉 / 渲染进程崩溃时，
+        由于我们无法可靠回填会话 URL，与其重开同一个会话，不如直接新开 + 播种。        **页面失效（P0-J）单独一条支线**：标签被用户关掉 / 渲染进程崩溃或挂起时，
         driver 抛 :class:`~chatgpt_web.errors.ChatGPTPageLostError`。这类故障**不占**
-        重试阶梯额度，也不走「轮转 / 换新会话」分支——重建一条新页面后直接重发
+        重试阶梯额度，也不走「轮转 / 换新会话」分支——新开一条页面后直接重发
         （新页面本身就是空白会话，``has_history=False`` 会让本轮用播种 prompt 重放
         历史，上下文不丢）。否则会把刚恢复的会话又轮转掉，白白丢上下文。
+
+        **终止条件**：句柄失效的重建额度是 ``PAGE_REBUILD_MAX``（默认 1，专设、不跟
+        ``MAX_UPSTREAM_RETRIES`` 联动）。额度用尽后**立即**按上游不可用结束，而不是
+        退化成普通重试——页面已经没了，重发只会对着同一具尸体报同一个错，而每次
+        重建都在真实地新开标签页（浏览器整体不可用时就是建页风暴）。
 
         另外，「有请求在飞」从本方法第一行就登记（可重入计数）：
         ``_ensure_page`` → ``_session_lock`` 之间页面还没有锁保护，空闲回收 /
@@ -106,8 +109,11 @@ class ChatIOMixin(
         bucket = key or DEFAULT_SESSION_KEY
         seeded = seeded_prompt or prompt
         max_attempts = max(1, config.MAX_UPSTREAM_RETRIES)
-        # 页面失效的自愈额度：重建页面**不占**重试阶梯次数（见下面的页面失效分支）
-        page_rebuilds_left = max(1, config.MAX_UPSTREAM_RETRIES)
+        # 页面句柄失效的自愈额度：**独立**于重试阶梯（见下面的页面失效分支）。
+        # 与 ``CHATGPT_RETRIES`` 解耦的理由：重建页面换的是「可用的浏览器句柄」，
+        # 不是重试上游；跟着重试次数放大会在浏览器整体不可用时反复建页。
+        # 默认 1 = 句柄丢失只新开一次页面，额度用尽即结束本次请求。
+        page_rebuilds_left = max(0, config.PAGE_REBUILD_MAX)
         last_error: Optional[RuntimeError] = None
         task_state = TaskState()
 
@@ -161,30 +167,44 @@ class ChatIOMixin(
                     active_prompt, on_delta, key=bucket
                 )
             except ChatGPTPageLostError as exc:
-                # 页面没了（标签被关 / 渲染进程崩溃）——与「改版 / 未登录」完全不同：
-                # 重建一条页面后直接重发，**不进**下面的轮转 / 换新会话分支。
+                # 页面没了（标签被关 / 渲染进程崩溃 / 挂起）——与「改版 / 未登录」
+                # 完全不同：新开一条页面后直接重发，**不进**下面的轮转 / 换新会话分支。
                 last_error = exc
                 self._state(bucket).last_error = str(exc)
-                if page_rebuilds_left > 0:
-                    page_rebuilds_left -= 1
-                    # 任务状态机只允许「生成中 → 会话恢复 → 重新构建 prompt」这条链，
-                    # 下一轮开头的 transition(PROMPT_BUILT/MODEL_GENERATING) 会接着走
-                    task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
+                if page_rebuilds_left <= 0:
+                    # 终止条件（``PAGE_REBUILD_MAX``）：句柄失效只给一次新开页面的
+                    # 机会，额度用尽就结束本次请求。**不能**在这里退化成普通重试：
+                    # 页面已经没了，在阶梯里退避重发只会对着同一具尸体报同一个错，
+                    # 而每一次重建都在真实地新开标签页（浏览器整体不可用时就是建页风暴）。
                     logger.warning(
-                        f"[恢复] 会话页面已失效（{exc}），重建页面后重发"
-                        f"（剩余重建额度 {page_rebuilds_left} 次，不占重试阶梯）。"
+                        f"[恢复] 会话页面已失效（{exc}），且本请求的页面重建额度"
+                        f"已用尽（PAGE_REBUILD_MAX={config.PAGE_REBUILD_MAX}），直接按"
+                        "「上游不可用」结束；下一次请求会在 _ensure_page 里惰性重建。"
                     )
+                    raise
+                page_rebuilds_left -= 1
+                # 任务状态机只允许「生成中 → 会话恢复 → 重新构建 prompt」这条链，
+                # 下一轮开头的 transition(PROMPT_BUILT/MODEL_GENERATING) 会接着走
+                task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
+                logger.warning(
+                    f"[恢复] 会话页面已失效（{exc}），新开页面后重发"
+                    f"（剩余重建额度 {page_rebuilds_left} 次，不占重试阶梯）。"
+                )
+                try:
                     # force=True：崩溃的页面可能仍报 is_closed()==False，
                     # 恢复路径不能依赖判活，必须无条件重建
                     await self._ensure_page(bucket, force=True)
-                    # 新页面 = 新的网页会话，状态里的轮转请求已无意义
-                    self._state(bucket).pending_rotation = False
-                    rebuild_pending = True
-                    continue  # 不消耗 attempt
-                if attempt < max_attempts:
-                    task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
-                attempt += 1
-                continue
+                except Exception as rebuild_exc:  # noqa: BLE001
+                    # 连新页面都建不出来（context 已关 / profile 被占 / 浏览器已退出）：
+                    # 上游整体不可用，再进循环只会反复建页 → 立刻结束，并把两个原因都留下。
+                    logger.error(f"[恢复] 新开页面失败（{rebuild_exc!r}），放弃恢复：{exc}")
+                    raise ChatGPTPageLostError(
+                        f"{exc}（新开页面也失败：{rebuild_exc!r}）"
+                    ) from rebuild_exc
+                # 新页面 = 新的网页会话，状态里的轮转请求已无意义
+                self._state(bucket).pending_rotation = False
+                rebuild_pending = True
+                continue  # 不消耗 attempt
             except ChatGPTContextLimitError as exc:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
                 last_error = exc

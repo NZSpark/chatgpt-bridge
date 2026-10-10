@@ -35,6 +35,8 @@ from chatgpt_web.errors import (  # noqa: E402
     is_page_lost_error,
     is_timeout_error,
     page_alive,
+    page_responds,
+    page_usable_reason,
 )
 
 # ==================== 页面替身 ====================
@@ -149,6 +151,89 @@ class _FakeContext:
         page = self._factory()
         self.created.append(page)
         return page
+
+
+class _StubbornComposer:
+    """能点、能聚焦，但读回永远是空：写进去的内容没落到文档上。"""
+
+    async def click(self, timeout=None) -> None:
+        return None
+
+    async def fill(self, value) -> None:
+        return None
+
+    async def evaluate(self, script: str):
+        return ""
+
+    async def inner_text(self) -> str:
+        return ""
+
+    async def text_content(self) -> str:
+        return ""
+
+
+class _ZombieComposer(_StubbornComposer):
+    """句柄上的求值直接报错（渲染进程已死）：``complete_text`` 静默兜底 → 读回空串。"""
+
+    async def evaluate(self, script: str):
+        raise RuntimeError("Target crashed")
+
+    async def inner_text(self) -> str:
+        raise RuntimeError("Target crashed")
+
+    async def text_content(self) -> str:
+        raise RuntimeError("Target crashed")
+
+
+class _StubbornPage(_HealthyPage):
+    """页面活着、JS 也响应，只是 composer 不吃输入（改版 / 未登录 / 被弹层遮挡）。"""
+
+    async def wait_for_selector(self, selector: str, timeout=None, state=None):
+        return _StubbornComposer()
+
+
+class _FailingKeyboard:
+    """键盘通道失效：press / insert_text 都报错（模拟输入事件进不去页面）。"""
+
+    async def press(self, key: str) -> None:
+        raise RuntimeError("renderer not responding to input")
+
+    async def insert_text(self, text: str) -> None:
+        raise RuntimeError("renderer not responding to input")
+
+
+class _ZombiePage(_HealthyPage):
+    """渲染进程崩溃 / 挂起：``is_closed()`` **仍报 False**，但页面上的 JS 全失败。
+
+    真机形态（2026-10-10）：输入框定位、click、``insert_text`` 全都“成功”，
+    读回来永远是空串，最后报「请检查登录状态」——池子里那具尸体永不重建，
+    该桶从此每次请求都 502。所以判活必须还有一条**慢路径**（真的求一次 JS）。
+    """
+
+    def is_closed(self) -> bool:
+        return False
+
+    async def evaluate(self, script: str):
+        raise RuntimeError("Target crashed")
+
+    async def wait_for_selector(self, selector: str, timeout=None, state=None):
+        return _ZombieComposer()
+
+
+class _StuckSubmitPage(_StubbornPage):
+    """页面活着、JS 也响应，但键盘与发送按钮两条提交路都走不通。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.keyboard = _FailingKeyboard()
+
+
+class _DeadSubmitPage(_ZombiePage):
+    """提交阶段才发现渲染进程已死：键盘报错、JS 求值也报错。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.keyboard = _FailingKeyboard()
 
 
 @contextlib.contextmanager
@@ -380,6 +465,226 @@ class SendChatPageRecoveryTests(_RecoveryTestBase):
                 asyncio.run(driver.send_chat("hi", key=None))
 
         self.assertIn("生成过程中页面失效", str(ctx.exception))
+
+
+# ==================== P0-J（第二种死法）：输入层报页面失效 → 新开页面重发 ====================
+
+
+class PageResponsivenessProbeTests(_RecoveryTestBase):
+    """慢路径判活（``page_responds`` / ``page_usable_reason``）的语义。
+
+    ``page_alive`` 只看 ``is_closed()``；崩溃 / 挂起的渲染进程仍报 False，
+    所以必须再真的求一次 JS 才能把「页面失效」与「配置问题」分开。
+    """
+
+    def test_missing_evaluate_is_treated_as_responsive(self) -> None:
+        """没有 evaluate 的实现（测试替身 / 旧版对象）不得被误判成失效。"""
+
+        class _NoEvaluate:
+            def is_closed(self) -> bool:
+                return False
+
+        self.assertTrue(asyncio.run(page_responds(_NoEvaluate())))
+        self.assertIsNone(asyncio.run(page_usable_reason(_NoEvaluate())))
+
+    def test_raising_evaluate_is_unresponsive(self) -> None:
+        """崩溃的渲染进程：快路径报存活，慢路径必须报不可用。"""
+        page = _ZombiePage()
+        self.assertTrue(page_alive(page), "前提：崩溃页面在快路径上被判为存活")
+        self.assertFalse(asyncio.run(page_responds(page)))
+        self.assertIn("标签已失效", asyncio.run(page_usable_reason(page)))
+
+    def test_hanging_evaluate_times_out_without_blocking_forever(self) -> None:
+        """挂起的渲染进程会让求值永不返回——探测本身必须有界。"""
+
+        class _HungPage(_HealthyPage):
+            async def evaluate(self, script: str):
+                await asyncio.sleep(30)
+                return 1
+
+        started = time.monotonic()
+        self.assertFalse(asyncio.run(page_responds(_HungPage(), timeout_s=0.05)))
+        self.assertLess(time.monotonic() - started, 5.0, "探测不能把请求拖死")
+
+    def test_closed_page_reports_the_fast_path_reason(self) -> None:
+        self.assertIn("标签已失效", asyncio.run(page_usable_reason(_ClosedPage())))
+
+
+class InputLayerPageLossTests(_RecoveryTestBase):
+    """2026-10-10 真机故障：连续多次填充都读回空 → 旧实现报「请检查登录」，永不重建。
+
+    页面句柄其实已经死了（渲染进程崩溃 / 挂起时 ``is_closed()`` 仍报 False）。
+    要求的处置是**新开页面 + 播种重放历史，把这个 prompt 重发一遍**，
+    而不是把故障归因给用户去查登录状态。
+    """
+
+    def test_fill_failure_on_dead_renderer_raises_page_lost(self) -> None:
+        driver = self.make_driver()
+        page = _ZombiePage()
+        driver.page = page
+
+        with _quiet_page_setup(), mock.patch.object(config, "FILL_RETRIES", 1):
+            with self.assertRaises(ChatGPTPageLostError) as ctx:
+                asyncio.run(driver._send_chat_locked("hi", key=None))
+
+        message = str(ctx.exception)
+        self.assertIn("填充输入框失败", message)
+        self.assertIn("标签已失效", message)
+        self.assertNotIn("SECRET PAGE BODY", message, "错误文案不得回显页面正文")
+        self.assertIs(driver.page, page, "重建由重试阶梯负责，_send_chat_locked 只报错")
+
+    def test_live_page_with_inert_composer_is_not_page_loss(self) -> None:
+        """页面活着也响应 JS，只是 composer 不吃输入 —— 不能误判成页面失效。
+
+        误判的代价是白丢上下文（重建 = 新会话 + 重放历史），而且真正的配置问题
+        （改版 / 未登录 / 弹层遮挡）会被永远掩盖。
+        """
+        driver = self.make_driver()
+        page = _StubbornPage()
+        driver.page = page
+
+        with _quiet_page_setup(), mock.patch.object(config, "FILL_RETRIES", 1):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(driver._send_chat_locked("hi", key=None))
+
+        message = str(ctx.exception)
+        self.assertNotIsInstance(ctx.exception, ChatGPTPageLostError)
+        self.assertIn("页面仍在运行", message)
+        self.assertIn("readyState=complete", message, "现场信息必须带上，否则排查又只能靠猜")
+        self.assertNotIn("SECRET PAGE BODY", message, "现场信息不得回显正文")
+        self.assertIs(driver.page, page, "页面还活着就不该重建（重建会丢掉上下文）")
+
+    def test_submit_failure_on_dead_renderer_raises_page_lost(self) -> None:
+        """「多次提交失败」同样要先判句柄死活：死了就交给阶梯新开页面重发。"""
+        driver = self.make_driver()
+        with self.assertRaises(ChatGPTPageLostError) as ctx:
+            asyncio.run(driver._submit_prompt(_DeadSubmitPage(), _StubbornComposer()))
+        self.assertIn("提交 prompt 失败", str(ctx.exception))
+        self.assertIn("标签已失效", str(ctx.exception))
+
+    def test_submit_failure_on_live_page_stays_a_plain_error(self) -> None:
+        """页面还活着也响应 JS → 不重建（重开页面修不好键盘卡死，只会白丢上下文）。"""
+        driver = self.make_driver()
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(driver._submit_prompt(_StuckSubmitPage(), _StubbornComposer()))
+        self.assertNotIsInstance(ctx.exception, ChatGPTPageLostError)
+        self.assertIn("无法提交 prompt", str(ctx.exception))
+
+    def test_ladder_rebuilds_page_and_resends_when_input_layer_reports_loss(self) -> None:
+        """输入层报页面失效 → 阶梯必须新开页面、用播种 prompt 重发（不轮转）。"""
+        driver = self.make_driver()
+        original = _ZombiePage()
+        driver.page = original
+        driver.context = _FakeContext()
+        driver._state(DEFAULT_SESSION_KEY).has_history = True
+        real_locked = driver._send_chat_locked
+        seen = []
+
+        async def first_round_runs_the_real_input_layer(prompt, on_delta=None, key=None):
+            seen.append(prompt)
+            if len(seen) == 1:
+                # 第一轮走**真**输入层：页面句柄已死 → _fill_prompt 抛 ChatGPTPageLostError
+                return await real_locked(prompt, on_delta, key=key)
+            return "recovered", []
+
+        rotations = []
+
+        async def fake_rotation(key=None):
+            rotations.append(key)
+
+        with _quiet_page_setup(), \
+                mock.patch.object(config, "FILL_RETRIES", 1), \
+                mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 2), \
+                mock.patch.object(
+                    driver, "_send_chat_locked",
+                    side_effect=first_round_runs_the_real_input_layer,
+                ), \
+                mock.patch.object(driver, "_start_new_session", side_effect=fake_rotation):
+            reply, blocks = asyncio.run(
+                driver.send_chat("delta-only", seeded_prompt="SEEDED-HISTORY", key=None)
+            )
+
+        self.assertEqual((reply, blocks), ("recovered", []))
+        self.assertEqual(
+            seen, ["delta-only", "SEEDED-HISTORY"],
+            "新页面是空白会话 → 必须用播种 prompt 重放历史",
+        )
+        self.assertEqual(rotations, [], "页面失效不该轮转 / 换新会话")
+        self.assertTrue(original.closed, "失效页面必须被关掉并从池里摘除")
+        self.assertIsNot(driver.page, original)
+        self.assertIs(driver.page, driver.context.created[0])
+        self.assertFalse(driver.bucket_busy(DEFAULT_SESSION_KEY), "请求结束后不得残留忙标记")
+
+
+class PageRebuildBudgetTests(_RecoveryTestBase):
+    """终止条件：句柄失效只允许新开一次页面（``PAGE_REBUILD_MAX``）。
+
+    实机风险：标签被关 / 渲染进程崩溃后，如果重建额度跟着 ``CHATGPT_RETRIES`` 放大，
+    那么浏览器整体不可用（context 已关 / profile 被占 / 每次新页面都立即失败）时，
+    一次请求就会真实地新开好几条标签页，而且不会成功。额度必须专设、默认 1，
+    用尽就结束本次请求（下一次请求会在 ``_ensure_page`` 里惰性重建）。
+    """
+
+    def _driver(self):
+        driver = self.make_driver()
+        driver.page = _HealthyPage()
+        driver.context = _FakeContext()
+        sends = []
+
+        async def always_lost(prompt, on_delta=None, key=None):
+            sends.append(prompt)
+            raise ChatGPTPageLostError("标签已失效（页面已关闭，URL=https://chatgpt.com/）")
+
+        return driver, sends, always_lost
+
+    def test_page_loss_opens_at_most_one_page_even_with_many_retries(self) -> None:
+        driver, sends, always_lost = self._driver()
+
+        with _quiet_page_setup(), \
+                mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 5), \
+                mock.patch.object(config, "PAGE_REBUILD_MAX", 1), \
+                mock.patch.object(driver, "_send_chat_locked", side_effect=always_lost):
+            with self.assertRaises(ChatGPTPageLostError):
+                asyncio.run(driver.send_chat("hi", key=None))
+
+        self.assertEqual(len(driver.context.created), 1, "句柄失效只允许新开一条页面")
+        self.assertEqual(len(sends), 2, "首轮 + 重建后重发一轮，额度用尽即结束")
+
+    def test_zero_budget_disables_rebuilding_entirely(self) -> None:
+        """``PAGE_REBUILD_MAX=0``：页面死了直接报错，不自动新开。"""
+        driver, sends, always_lost = self._driver()
+
+        with _quiet_page_setup(), \
+                mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 3), \
+                mock.patch.object(config, "PAGE_REBUILD_MAX", 0), \
+                mock.patch.object(driver, "_send_chat_locked", side_effect=always_lost):
+            with self.assertRaises(ChatGPTPageLostError):
+                asyncio.run(driver.send_chat("hi", key=None))
+
+        self.assertEqual(driver.context.created, [], "额度为 0 时不得新建页面")
+        self.assertEqual(len(sends), 1, "也不能退化成对着死页面反复重发")
+
+    def test_rebuild_failure_ends_request_and_keeps_both_reasons(self) -> None:
+        """连新页面都建不出来 → 立即结束（不再循环建页），且两个原因都留在错误里。"""
+        driver, sends, always_lost = self._driver()
+
+        def boom():
+            raise RuntimeError("browser has been closed")
+
+        driver.context = _FakeContext(factory=boom)
+
+        with _quiet_page_setup(), \
+                mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 5), \
+                mock.patch.object(config, "PAGE_REBUILD_MAX", 3), \
+                mock.patch.object(driver, "_send_chat_locked", side_effect=always_lost):
+            with self.assertRaises(ChatGPTPageLostError) as ctx:
+                asyncio.run(driver.send_chat("hi", key=None))
+
+        message = str(ctx.exception)
+        self.assertIn("标签已失效", message, "页面失效的原因不能被建页错误吞掉")
+        self.assertIn("新开页面也失败", message)
+        self.assertIn("browser has been closed", message)
+        self.assertEqual(len(sends), 1, "建页都失败了就不该再重发")
 
 
 # ==================== P0-L：请求在飞的桶不能被顺手回收 ====================

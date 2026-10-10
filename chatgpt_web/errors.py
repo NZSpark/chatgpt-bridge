@@ -5,7 +5,9 @@
 """
 
 
+import asyncio
 import inspect
+from typing import Optional
 
 
 class BridgeError(RuntimeError):
@@ -159,6 +161,41 @@ def page_alive(page) -> bool:
     return not closed
 
 
+#: 判活的**慢路径**：一次最廉价的 JS 求值。崩溃 / 挂起的渲染进程连它都回不来，
+#: 而 ``is_closed()`` 往往仍报 False（真机上表现为「输入框能定位、能点击，但读回来
+#: 永远是空串」）。
+_PAGE_PROBE_JS = "() => 1"
+#: 探测等待上限（秒）：挂起的渲染进程会让求值**永不返回**，探测本身不能把请求拖死。
+PAGE_PROBE_TIMEOUT_S = 5.0
+
+
+async def page_responds(page, timeout_s: float = PAGE_PROBE_TIMEOUT_S) -> bool:
+    """页面是否**还能执行 JS**（慢路径判活，用于区分「页面失效」与「配置问题」）。
+
+    为什么需要它：:func:`page_alive` 只看 ``is_closed()``，而渲染进程崩溃 / 挂起时
+    它仍报 False（快路径帮不上忙）。这类故障在真机上表现为「输入框定位成功、click
+    成功、``insert_text`` 也成功，但校验读回来永远是空串」——旧实现据此提示用户
+    「请检查登录状态与 INPUT_SELECTORS」，而页面池里那具尸体**永不重建**，
+    该会话桶从此每次请求都 502（P0-J 的第二种死法）。
+
+    没有 ``evaluate`` 的实现（测试替身 / 旧版对象）按**可响应**处理，与
+    :func:`page_alive` 对缺失 ``is_closed`` 的处理一致：探测失败会触发页面重建，
+    而无谓的重建会把刚恢复的上下文又丢掉。
+    """
+    if page is None:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        probe = evaluate(_PAGE_PROBE_JS)
+        if inspect.isawaitable(probe):
+            await asyncio.wait_for(probe, timeout=max(0.1, float(timeout_s)))
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def page_lost_reason(page) -> str:
     """给日志/错误文案用的可读原因（不回显页面正文）。
 
@@ -174,6 +211,21 @@ def page_lost_reason(page) -> str:
     if not page_alive(page):
         return f"标签已失效（页面已关闭，URL={url}）"
     return f"标签已失效（页面不可用，URL={url}，疑似渲染进程崩溃或页面已被回收）"
+
+
+async def page_usable_reason(page, timeout_s: float = PAGE_PROBE_TIMEOUT_S) -> Optional[str]:
+    """页面当前是否可用：不可用时返回可读原因（可直接拼进错误文案），可用时 None。
+
+    判定顺序是**快路径 + 慢路径**：:func:`page_alive`（标签被用户关掉）→
+    :func:`page_responds`（渲染进程崩溃 / 挂起，``is_closed()`` 仍报 False）。
+    两者都过才算可用——只看快路径就会把「可自愈的页面失效」误判成「改版 / 未登录」，
+    于是那个桶从此永久失败（P0-J），而那正是 2026-10-10 真机故障的形态。
+    """
+    if not page_alive(page):
+        return page_lost_reason(page)
+    if not await page_responds(page, timeout_s=timeout_s):
+        return page_lost_reason(page) + "（页面已无响应：JS 求值报错或超时）"
+    return None
 
 
 # 未指定任务标识时使用的会话桶（保持与历史行为一致：全局共用一条会话）

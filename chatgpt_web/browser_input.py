@@ -4,7 +4,12 @@ import asyncio
 import logging
 
 from . import config
-from .errors import ChatGPTPageLostError, page_alive, page_lost_reason
+from .errors import (
+    ChatGPTPageLostError,
+    page_alive,
+    page_lost_reason,
+    page_usable_reason,
+)
 
 logger=logging.getLogger(__name__)
 
@@ -70,6 +75,15 @@ class BrowserInputMixin:
         新建对话 / 节点重挂载后，之前拿到的句柄可能已失效，``fill`` 会一直
         等到超时（ElementHandle.fill: Timeout 30000ms exceeded）。这里每次
         重试都**重新定位**输入框，并对填完的内容做非空校验。
+
+        多次重试后仍读回空时必须**分辨原因**（2026-10-10 真机故障）：
+
+        * 页面已经失效（标签被关 / 渲染进程崩溃 / 挂起，``is_closed()`` 可能仍报
+          False）→ 抛 :class:`ChatGPTPageLostError`，让重试阶梯**新开页面 +
+          播种重放历史**后重发。旧实现一律抛普通 ``RuntimeError``，阶梯不接，
+          于是「请检查登录状态」成了永久结局，而调用方再也不会重试。
+        * 页面还在、JS 也响应，只是 composer 不吃输入（改版 / 未登录 / 被弹层或
+          额度提示遮挡）→ 返回 None：重开页面修不好，交给上层如实报错。
         """
         retries = max(1, config.FILL_RETRIES)
         timeout = max(1000, config.FILL_TIMEOUT_MS)
@@ -101,6 +115,14 @@ class BrowserInputMixin:
                 f"（读到 {text!r}），重试。"
             )
             await asyncio.sleep(0.5)
+        # 次数用光：先判页面是否已经失效——崩溃 / 挂起的渲染进程读回来就是空串
+        # （写进 composer 的字节没有落到活的文档上），这类故障可自愈。
+        reason = await page_usable_reason(page)
+        if reason:
+            logger.warning(
+                f"[输入] 连续 {retries} 次填充后读回均为空，判定页面已失效：{reason}"
+            )
+            raise ChatGPTPageLostError(f"填充输入框失败：{reason}")
         return None
 
     @staticmethod
@@ -201,10 +223,12 @@ class BrowserInputMixin:
         首选真实键盘 Enter：合成 KeyboardEvent 对 ProseMirror 不可靠，
         prompt 含换行时合成 Enter 会被当成软换行而非提交（见 _keyboard_enter）。
 
-        三条路径全部失败时要先分辨原因：页面已经没了（标签被关 / 渲染进程崩溃）
-        属于可自愈故障，抛 :class:`ChatGPTPageLostError` 让重试阶梯重建页面；
+        三条路径全部失败时要先分辨原因：页面已经没了（标签被关 / 渲染进程崩溃 /
+        挂起）属于可自愈故障，抛 :class:`ChatGPTPageLostError` 让重试阶梯重建页面；
         页面活着却没提交出去才是真正的“发送失败”（P0-J）。
         """
+        # 热路径只做廉价判活（不额外求一次 JS）：这一轮绝大多数调用都会成功，
+        # 不能为分类可能性在每次发送上多付一次往返；真死了的页面下面照样会暴露。
         if not page_alive(page):
             raise ChatGPTPageLostError(f"提交 prompt 失败：{page_lost_reason(page)}")
         if await self._keyboard_enter(page):
@@ -212,8 +236,9 @@ class BrowserInputMixin:
         if await self._dispatch_enter(chat_input):
             return
         if not await self._click_send_button(page):
-            if not page_alive(page):
-                raise ChatGPTPageLostError(f"提交 prompt 失败：{page_lost_reason(page)}")
+            reason = await page_usable_reason(page)
+            if reason:
+                raise ChatGPTPageLostError(f"提交 prompt 失败：{reason}")
             raise RuntimeError(
                 "无法提交 prompt：键盘 Enter、输入框 Enter 事件均无效，"
                 "且未找到发送按钮。"

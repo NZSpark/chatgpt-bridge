@@ -216,6 +216,7 @@ codex --profile chatgpt
 | `LEN_STABLE_POLLS` | `4` | 仅长度不变时的保守阈值 |
 | `CHATGPT_RETRIES` | `2` | 上游超时重试次数 |
 | `RETRY_BACKOFF_S` | `1.0` | 退避基数（×n） |
+| `PAGE_REBUILD_MAX` | `1` | 单次请求内「页面句柄失效 → 新开页面重发」次数上限（与重试次数解耦） |
 
 **会话生命周期**
 

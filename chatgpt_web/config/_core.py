@@ -164,6 +164,14 @@ STALL_POLLS = env_int("STALL_POLLS", 20)
 # 上游超时的最大尝试次数与退避基数（秒）
 MAX_UPSTREAM_RETRIES = env_int("CHATGPT_RETRIES", 2)
 RETRY_BACKOFF_S = env_float("RETRY_BACKOFF_S", 1.0)
+# 单次请求内「页面句柄失效 → 新开页面重发」的次数上限（终止条件）。
+#
+# **刻意与 CHATGPT_RETRIES 解耦**：重建页面换的是「可用的浏览器句柄」，不是重试
+# 上游；跟着重试次数放大会在浏览器整体不可用（context 已关 / profile 被占）时
+# 反复建页。默认 1 = 句柄丢失只新开一次会话/页面，重发一次仍失败就按「上游不可用」
+# 结束本次请求，不再对着同一具尸体反复重发；下一次请求会在 `_ensure_page` 里惰性重建。
+# 设 0 表示不自动重建（页面死了直接报错）。
+PAGE_REBUILD_MAX = env_int("PAGE_REBUILD_MAX", 1)
 
 
 # ==================== 会话生命周期 ====================
@@ -489,6 +497,7 @@ class CompletionConfig:
     stall_polls: int
     max_upstream_retries: int
     retry_backoff_s: float
+    page_rebuild_max: int
     cap_check_every: int
     seed_max_chars: int
     seed_system_max_chars: int
@@ -612,6 +621,7 @@ def build_config_bundle() -> ConfigBundle:
             stall_polls=cfg.STALL_POLLS,
             max_upstream_retries=cfg.MAX_UPSTREAM_RETRIES,
             retry_backoff_s=cfg.RETRY_BACKOFF_S,
+            page_rebuild_max=cfg.PAGE_REBUILD_MAX,
             cap_check_every=cfg.CAP_CHECK_EVERY,
             seed_max_chars=cfg.SEED_MAX_CHARS,
             seed_system_max_chars=cfg.SEED_SYSTEM_MAX_CHARS,
