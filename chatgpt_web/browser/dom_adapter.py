@@ -321,7 +321,53 @@ class ChatGPTDOMAdapter(DiagnosticsMixin):
         return "\n".join(lines[start:end])
 
     async def find_think_mode(self, page, want) -> Optional[Any]:
-        """Find the Think-mode button using selectors, then text fallback."""
+        """Find the Think-mode button using selectors, then text fallback.
+
+        兼容 facade：语义等于「确保思考模式**选中**」（见 :meth:`set_think_mode`），
+        但返回值保持旧契约——成功返回控件句柄，失败（或找不到控件）返回 ``None``，
+        调用方普遍只做真值判断，不能把 ``False`` 当成“找到了”。
+        """
+        async for button in self._think_candidates(page, want):
+            if await self._apply_think_state(button, want, on=True):
+                return button
+        return None
+
+    async def read_think_mode(self, page, want) -> Optional[bool]:
+        """Read the Think-mode control's **actual** state（None = 找不到控件）。
+
+        只查询、不点击：供聊天命令（``/bridge settings think status``）与诊断使用，
+        不能因为一次查询就改变网页端的模式。
+        """
+        button = await self._think_button(page, want)
+        if button is None:
+            return None
+        return await self._think_pressed(button)
+
+    async def set_think_mode(self, page, want, on: bool = True) -> bool:
+        """把 Think-mode 控件切到期望状态，返回是否**已验证**成功。
+
+        ``on=True``（默认）即旧 ``find_think_mode`` 的语义：确保选中。``on=False``
+        用于显式关闭——只有控件确实回到未选中态才算成功；站点不允许关闭、
+        或读不到 ``aria-pressed``（无法确认点击后果）时一律返回 ``False``，
+        调用方据此如实报告，不得谎报“已关闭”。
+        """
+        async for button in self._think_candidates(page, want):
+            if await self._apply_think_state(button, want, on):
+                return True
+        return False
+
+    async def _think_button(self, page, want) -> Optional[Any]:
+        """定位第一个可用的 Think-mode 控件（只查询、不点击）。"""
+        async for button in self._think_candidates(page, want):
+            return button
+        return None
+
+    async def _think_candidates(self, page, want):
+        """按「配置选择器 → 文本扫描兜底」的顺序逐个产出候选控件。
+
+        惰性产出：配置选择器命中就不触发 JS 兜底扫描（省一次 evaluate，也让
+        旧回归用例（断言 ``evaluated == 0``）继续成立）。
+        """
         for selector in config.THINK_MODE_SELECTOR.split("||"):
             selector = selector.strip()
             if not selector:
@@ -331,44 +377,63 @@ class ChatGPTDOMAdapter(DiagnosticsMixin):
             except Exception:
                 continue
             for button in buttons:
-                if await self._press_think_button(button, want):
-                    return button
+                if await self._is_think_button(button, want):
+                    yield button
         try:
             handle = await page.evaluate_handle(self.THINK_FALLBACK_JS, want)
             button = handle.as_element()
         except Exception:
             button = None
-        if button is not None and await self._press_think_button(button, want):
-            return button
-        return None
+        if button is not None and await self._is_think_button(button, want):
+            yield button
 
-    async def _press_think_button(self, button, want) -> bool:
+    async def _is_think_button(self, button, want) -> bool:
+        """候选控件是不是 Think 按钮：按文本关键词判定（``want`` 空则不筛文本）。"""
         try:
             text = ((await button.inner_text()) or "").strip().lower()
         except Exception:
             text = ""
-        if want and not any(item in text for item in want):
-            return False
+        return not want or any(item in text for item in want)
+
+    async def _think_pressed(self, button) -> Optional[bool]:
+        """读 ``aria-pressed``（``None`` = 读不到，不能当成“未选中”）。"""
         try:
             pressed = (await button.get_attribute("aria-pressed")) or ""
         except Exception:
             pressed = ""
         if pressed.lower() == "true":
             return True
+        if pressed.lower() == "false":
+            return False
+        return None
+
+    async def _apply_think_state(self, button, want, on: bool) -> bool:
+        """把某个候选控件切到期望状态并**读回验证**。"""
+        pressed = await self._think_pressed(button)
+        if pressed is on:
+            return True
+        if pressed is None and not on:
+            # 读不到状态时乱点可能反而**打开**思考模式，所以宁可不点：
+            # 调用方会看到 False，并如实报告“未能切换”。
+            return False
+        try:
+            text = ((await button.inner_text()) or "").strip().lower()
+        except Exception:
+            text = ""
         try:
             try:
                 await button.click(timeout=3000)
             except Exception:
                 await button.evaluate("(el) => el.click()")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[会话] 选中思考模式失败（%r）：%r", text, exc)
+            logger.warning("[会话] 切换思考模式失败（%r）：%r", text, exc)
             return False
         await asyncio.sleep(0.3)
-        try:
-            now = (await button.get_attribute("aria-pressed")) or ""
-        except Exception:
-            now = ""
-        return now.lower() == "true"
+        return (await self._think_pressed(button)) is on
+
+    async def _press_think_button(self, button, want) -> bool:
+        """兼容 facade：确保单个候选选中（供旧调用/测试使用）。"""
+        return await self._apply_think_state(button, want, on=True)
 
     @staticmethod
     async def rank_new_chat_candidate(handle) -> int:

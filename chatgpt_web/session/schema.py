@@ -21,6 +21,9 @@ _SESSION_FIELDS = frozenset({
     "cap_failures",
     "updated_at",
     "linked_url",
+    "pending_reseed",
+    "think_mode",
+    "save_files",
 })
 
 
@@ -72,6 +75,15 @@ class SessionState:
     # 绑定的桶不再落到空白新对话：页面漂移 / 句柄失效重建 / 轮转 / 启动恢复都会回到
     # 这条会话，所以一次句柄丢失不会把上下文丢在别处。
     linked_url: Optional[str] = None
+    # ``/bridge session reseed`` 排队的一次性「下一轮重新播种」（见 chat_io）。
+    # 必须落盘：只在当前处理函数里放个临时变量会在重启 / 并发 / 重试后丢失。
+    pending_reseed: bool = False
+    # ``/bridge settings think``：该桶的思考模式偏好（None = 跟随 config.THINK_MODE_DEFAULT）。
+    # 按桶保存而不是改进程全局配置，避免一条聊天命令悄悄改变所有客户端的行为。
+    think_mode: Optional[bool] = None
+    # ``/bridge settings save-files``：该桶的代码块落盘偏好（None = 跟随 config.SAVE_FILES）。
+    # 请求体里的 save_files 仍然优先级最高（显式声明 > 本桶偏好 > 全局配置）。
+    save_files: Optional[bool] = None
 
     def to_payload(self) -> Dict[str, Any]:
         return asdict(self)
@@ -81,7 +93,7 @@ class SessionState:
         state = cls()
         if not isinstance(payload, dict):
             return state
-        for name in ("has_history", "cap_hit", "pending_rotation"):
+        for name in ("has_history", "cap_hit", "pending_rotation", "pending_reseed"):
             if name in payload:
                 setattr(state, name, bool(payload.get(name)))
         for name in ("turns", "est_tokens", "updated_at", "cap_failures"):
@@ -93,4 +105,8 @@ class SessionState:
         state.last_error = last_error if isinstance(last_error, str) else None
         linked = payload.get("linked_url")
         state.linked_url = linked.strip() if isinstance(linked, str) and linked.strip() else None
+        # 三态偏好：缺失 / null = 未设置（跟随全局配置），必须与 False 区分开
+        for name in ("think_mode", "save_files"):
+            if name in payload:
+                setattr(state, name, None if payload.get(name) is None else bool(payload[name]))
         return state

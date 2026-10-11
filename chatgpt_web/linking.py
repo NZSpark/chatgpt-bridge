@@ -307,10 +307,14 @@ def _unlink_reply(bucket: str, had: bool) -> str:
 
 
 async def handle_command(messages, driver, session_key: Optional[str] = None) -> Optional[str]:
-    """识别并执行桥内命令，返回桥自己给出的应答；不是命令时返回 ``None``。
+    """识别并执行 ``/link`` / ``/unlink``，返回桥自己给出的应答；不是命令时返回 ``None``。
 
     调用方（``server`` / ``api`` 适配层）拿到应答后直接回给客户端，**不会**把这条
     消息发给网页版：命令要在句柄失效、乃至页面漂移时都可用。
+
+    ``/bridge`` 命名空间（``/bridge session link|unlink`` 等）由
+    :mod:`chatgpt_web.bridge_commands` 提供，那里是**所有**聊天命令的统一入口；
+    本函数只负责这两条兼容别名，执行体与它共用 :func:`execute_command`。
     """
     text = latest_user_text(messages)
     if text is None:
@@ -318,7 +322,17 @@ async def handle_command(messages, driver, session_key: Optional[str] = None) ->
     command = parse_command(text)
     if command is None:
         return None
+    return await execute_command(command, driver, session_key)
 
+
+async def execute_command(
+    command: LinkCommand, driver, session_key: Optional[str] = None
+) -> str:
+    """执行一条已识别的 :class:`LinkCommand`，返回可直接发给客户端的应答。
+
+    失败返回可读原因（不把内部堆栈、Cookie、环境变量值发给客户端），
+    因此调用方无需再包一层错误处理。
+    """
     bucket = session_key or DEFAULT_SESSION_KEY
     try:
         if command.action == "status":

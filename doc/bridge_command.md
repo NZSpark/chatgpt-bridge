@@ -4,6 +4,23 @@
 >
 > 本文是功能建议与设计约定，不代表所列命令已经实现。当前已实现的聊天命令以 `chatgpt_web/linking.py` 为准；HTTP 管理接口以 `chatgpt_web/server.py` 为准。
 
+> **实现状态（2026-10-11）**：第 3 节列出的命令（§3.1–§3.9，含 P2 的 `session link|unlink` 命名空间、
+> `session reseed`、`settings think`、`settings save-files`）已全部实现，识别与执行在
+> `chatgpt_web/bridge_commands.py`（`/bridge` 命名空间，所有聊天命令的统一入口）；`/link`、`/unlink`
+> 作为兼容别名保留在 `chatgpt_web/linking.py`，两套语法共用同一套校验、绑定与文案。因此 §6 的分期
+> 与 §8 的「第一版只做三个只读命令」保留为设计取舍的历史记录，不再是待办。各命令的解析、作用域与
+> 权限约束见对应小节，实现与本文的差异只有两处：
+>
+> 1. `settings <name>` 除 `status|on|off` 外还接受 `default`（回到“跟随全局配置”），否则命令执行后
+>    没有回退途径；
+> 2. 浏览器尚未初始化时，命令仍然应答（`/v1/chat/completions`、`/v1/responses` 的可用性检查对
+>    命令放行，普通请求照旧 503），只读命令因此可作为排障入口。
+>
+> 权限取舍（§5.4）：聊天入口不接 `RESET_TOKEN`，因为请求头在这一层拿不到；`session reset` /
+> `reseed` 直接执行但回执写清“只影响当前桶、不是删除客户端历史、下一轮会播种”，并且命令没有
+> 「指定别的桶」的参数。第 4 节列出的命令（`/reset`、`/clear`、`/retry`、`/cancel`、跨桶列举、
+> 配置输出、任意 shell / 写文件 / 切换登录态）仍然不实现。
+
 ## 1. 设计原则
 
 Bridge 命令与普通对话的关键区别，是命令应由本地桥接层直接处理，并返回一条普通的 assistant 文本响应，而不是将这条消息发送到 ChatGPT 网页端。这个机制对 `/link` 很有价值：当浏览器页面失效、导航到错误会话或尚未初始化时，用户仍能修改绑定状态。

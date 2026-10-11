@@ -1,12 +1,12 @@
 # ChatGPTBridge 项目分析与改进建议
 
-> 更新日期：**2026-10-10**（本轮增补：§2.16–§2.18，`/link` 会话绑定与其 composer 定位的真机收尾）
+> 更新日期：**2026-10-11**（本轮增补：§2.19，`/bridge` 聊天命令：帮助 / 状态 / 模型 / 会话桶 / 设置项）
 > 本版在静态分析之上，新增**真实 E2E 运行结果**（§1）与**由结果推导的建议**（§2）；原静态分析压缩为 §3。
 > 首次分析基线：`main @ 700bb67`，单测 `pytest -q` → 219 passed / 24 skipped（24 个 skip 即 e2e 用例）。
-> 当前基线（2026-10-10，含 §2.16–§2.18 的全部改动）：`pytest -q` →
-> **612 passed / 17 skipped / 81 subtests passed**（45.5s，0 failed）；`mypy chatgpt_web` 38 errors、
-> `ruff check chatgpt_web tests` 仓库级 14 条 —— 两者都不高于首次分析时的状态（`ruff` 的 14 条在改动前的
-> `HEAD` 上同样存在，本次未新增）。
+> 当前基线（2026-10-11，含 §2.16–§2.19 的全部改动）：`pytest -q` →
+> **657 passed / 17 skipped**（50.0s，0 failed）；`mypy chatgpt_web` 38 errors、
+> `ruff check .` 仓库级 14 条 —— 两者都与改动前的 `HEAD`（`git worktree` 另检出一份干净副本实测）**逐条一致**，
+> 本次未新增任何 mypy / ruff 问题。
 
 ---
 
@@ -765,6 +765,73 @@ ID 替换，新导航必被弹回首页），因此现在会在**绑定时**直�
 
 **为什么第 4 条留了额度上限**：退化态的触发过程未复现（洁净副本同一条会话正常），所以 composer 故障
 只给一次「新开页面后重发」，不做无上限重试（每一次重建都在真实地新开标签页）。
+
+### 2.19（新功能）Bridge 聊天命令：`/bridge help|status|models|session|settings`
+
+**背景**：`/link` 之后，桥的其它能力都只有 HTTP 入口或根本没有入口：浏览器就绪状态、当前桶的会话
+摘要、对外公布的模型名、手动重置 / 重新播种、思考模式与代码块落盘偏好。客户端（Pi / Codex）在对话里
+无法自查「桥还能用吗」「这一轮到底发到哪条会话」「上次为什么到顶」，排障必须切到 curl。
+`doc/bridge_command.md` 给出了完整清单与分期建议（P0 只读 → P2 设置项），本轮按该文档实现到 P2。
+
+**行为**（新增 `chatgpt_web/bridge_commands.py`，是**所有**聊天命令的统一入口）：
+
+* 命令集：`help [session|settings]`、`status`、`models`、`session [status]`、
+  `session reset|reseed|link <URL> [--seed]|unlink`、`settings think|save-files [status|on|off|default]`；
+  `/link`、`/unlink` 作为兼容别名保留（`/bridge session link|unlink` 与它们共用同一套校验、绑定与文案）。
+* **精确匹配**：只认「整条消息就是那一行命令」（单行、非空），历史消息里的旧命令不重放；
+  `/bridge` 之外的任何 `/` 开头文本照旧交给模型；保留命名空间内语法已匹配但参数不合法的写法返回用法
+  与原因（`[Bridge] 命令未执行：…`），不静默丢弃，也不猜着执行。
+* **命令不走网页版**：由桥本地应答。`/v1/chat/completions` 与 `/v1/responses` 的「浏览器未就绪 → 503」
+  检查现在对命令**放行**（普通请求行为逐字不变），所以浏览器初始化失败时只读命令也能给出降级状态
+  与下一步建议（`GET /readiness`）——那正是最需要它们的时候。
+* **作用域只限当前桶**：命令没有「指定别的桶」的参数，桶仍由 `X-ChatGPT-Session` / `user` / UA 决定；
+  回执写明影响范围。`session reset` 回执三句话：只影响这个桶、下一轮开新网页会话并播种完整历史、
+  **不是删除客户端对话历史**（不宣传成“清空记录”）。
+* **重新播种是一次性且落盘的**：`SessionState.pending_reseed` + `chat_io._send_chat_with_ladder` 据此强制
+  用播种版 prompt，**发送成功之后**才消费并落盘（失败 / 重启 / 重试既不丢也不重复应用）；回执说明它是
+  “再把上下文发一遍”，网页会话里会出现重复内容。
+* **设置项按桶持久化，不改全局 config**：`think` / `save-files` 是三态偏好（`on` / `off` /
+  `default` = 跟随 `THINK_MODE_DEFAULT` / `SAVE_FILES`），只有该桶受影响。think 的 `status` 把「偏好」与
+  「网页实际状态」分开报告；显式切换会立即在当前页面执行并**读回验证**，切不动（找不到控件、读不到
+  `aria-pressed`、站点不允许关闭）时如实报告失败，**绝不谎报**；关闭时不会盲点控件（可能反而打开）。
+  save-files 的优先级是「请求的 `save_files` 字段 > 本桶偏好 > `SAVE_FILES`」，回执写清落盘目录、
+  “每次新建文件、不覆盖”与关闭途径。
+* **不泄露**：回复只含状态摘要，错误只保留首行（`_one_line`），不打印 `.env` 值、令牌、Cookie
+  或其它桶的绑定；`/bridge models` 与 `GET /v1/models` 共用新增的 `models.advertised_models()`，
+  避免两套清单各自漂移。
+* 顺手修掉两处兼容性隐患：`find_think_mode` 失败时必须返回 `None`（调用方普遍只做真值判断，
+  返回 `False` 会被当成“找到了”）；新增只读探测 `read_think_mode`（只查询、不点击）与显式关闭
+  `set_think_mode(on=False)`（必须读回验证，读不到 `aria-pressed` 时不盲点控件）。
+
+**验证**：新增 `tests/test_bridge_commands.py`（44 例）：帮助与注册表一致性（含“帮助里列的命令必须真能
+解析”）、非法参数 / 未知选项 / 多行与代码块中的命令字样、只认最后一条 user 消息、`status` 降级与
+不泄露他桶、models 与 `/v1/models` 同源、`session reset` 只动当前桶且复用 `driver.reset_session`、
+reseed 跨重启与“成功即消费”的一次性语义、settings 的按桶持久化与“切不动就报失败”、save-files 决策
+优先级与假 driver 回退、chat / responses 两条路径在 `driver.page is None` 时仍能应答命令、
+HTTP 路由对命令放行而对普通文本仍 503（chat 流式 / 非流式 + responses 流式 / 非流式）、
+回复不出现令牌 / Cookie / `.env`。
+全套回归：`pytest -q` → **657 passed / 17 skipped / 0 failed**；`mypy` 38 errors 与 `ruff` 14 条与
+改动前逐条一致（用干净 `git worktree` 实测对比）。
+
+**修改文件**（新增 2、修改 15）：新增 `chatgpt_web/bridge_commands.py`、`tests/test_bridge_commands.py`；
+`chatgpt_web/linking.py`（抽出 `execute_command` 供两套语法复用）、`chatgpt_web/session/schema.py` +
+`chatgpt_web/session/store.py`（`pending_reseed` 与两条偏好 + 访问器）、`chatgpt_web/chat_io.py`（reseed
+的一次性消费）、`chatgpt_web/browser/dom_adapter.py`（`read_think_mode` / `set_think_mode`）、
+`chatgpt_web/completion/lifecycle.py`（按桶偏好与只读探测）、`chatgpt_web/page_pool.py` +
+`chatgpt_web/reply_waiter.py`（调用点传桶 + `bucket_page` / `bucket_page_url` 只读访问器）、
+`chatgpt_web/api/chat_adapter.py`（统一命令入口 + `save_files_enabled`）、
+`chatgpt_web/api/responses_adapter.py`、`chatgpt_web/server.py`（路由对命令放行、`/v1/models` 改用同一来源）、
+`chatgpt_web/models.py`、`README.md`、`doc/bridge_command.md`、本文。
+
+**未覆盖 / 待办**：
+
+* **真机验收**：需独占 `user_data` 的登录会话（同 §2.16 的 /link 验收门槛）；本轮只有单测与路由契约。
+* **思考模式“关闭”的真机行为未知**：站点是否允许把 composer 上的 pill 由 `aria-pressed=true` 点回
+  `false` 未在真机验证；实现按“读回验证、切不动就报失败”处理（替身覆盖了两种情况）。
+* **save-files 偏好只影响非流式 chat 路径**：流式与 responses 路径本来就不落盘，命令不改变这一点。
+* **未实现第 4 节的命令**（`/reset`、`/clear`、`/retry`、`/cancel`、跨桶列举、配置输出、任意
+  shell / 写文件 / 切换登录态）：设计理由仍成立，聊天入口也不接 `RESET_TOKEN`（请求头在这一层拿不到）；
+  有副作用的命令靠“只限当前桶 + 明确回执”降低误操作风险。
 
 ---
 

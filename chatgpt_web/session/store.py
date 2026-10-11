@@ -267,6 +267,10 @@ class SessionStoreMixin:
             "cap_hit": state.cap_hit,
             "pending_rotation": state.pending_rotation,
             "linked_url": state.linked_url,
+            # 聊天命令（/bridge session、/bridge settings）排队的 / 持久化的状态
+            "pending_reseed": state.pending_reseed,
+            "think_mode": state.think_mode,
+            "save_files": state.save_files,
             "last_error": state.last_error,
             # 连续“到顶”失败次数：>=2 时播种内容会被自动压缩（防死循环）
             "cap_failures": getattr(state, "cap_failures", 0),
@@ -343,3 +347,41 @@ class SessionStoreMixin:
         state.has_history = False
         self._save_session_state(key=bucket)
         _log().info(f"[会话] 已请求重置 key={bucket} 的会话，下一轮将开启新会话并播种上下文。")
+
+    # ---------- 聊天命令的会话状态（/bridge session、/bridge settings）----------
+    def reseed_session(self, key: Optional[str] = None) -> None:
+        """排队「下一轮把完整历史重新播种一遍」（``/bridge session reseed``）。
+
+        标记写在会话状态里并**立即落盘**：一次性语义必须能跨进程重启、并发请求与
+        重试仍然成立；真正的消费在 ``chat_io._send_chat_with_ladder``（成功发送后清除）。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        self._state(bucket).pending_reseed = True
+        self._save_session_state(key=bucket)
+        _log().info("[命令] key=%s 已排队下一轮重新播种完整历史。", bucket)
+
+    def think_mode_preference(self, key: Optional[str] = None) -> Optional[bool]:
+        """该桶的思考模式偏好（``None`` = 未设置，跟随 ``config.THINK_MODE_DEFAULT``）。"""
+        return self._state(key).think_mode
+
+    def set_think_mode_preference(self, value: Optional[bool], key: Optional[str] = None) -> None:
+        """写入该桶的思考模式偏好（``None`` = 恢复“跟随全局配置”）。
+
+        只改本桶状态、**不碰全局 config**：否则一条来自单个客户端的聊天命令会改变
+        其它所有客户端的行头。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        self._state(bucket).think_mode = None if value is None else bool(value)
+        self._save_session_state(key=bucket)
+        _log().info("[命令] key=%s 的思考模式偏好已改为 %s。", bucket, value)
+
+    def save_files_preference(self, key: Optional[str] = None) -> Optional[bool]:
+        """该桶的代码块落盘偏好（``None`` = 未设置，跟随 ``config.SAVE_FILES``）。"""
+        return self._state(key).save_files
+
+    def set_save_files_preference(self, value: Optional[bool], key: Optional[str] = None) -> None:
+        """写入该桶的代码块落盘偏好（``None`` = 恢复“跟随全局配置”）。"""
+        bucket = key or DEFAULT_SESSION_KEY
+        self._state(bucket).save_files = None if value is None else bool(value)
+        self._save_session_state(key=bucket)
+        _log().info("[命令] key=%s 的代码块落盘偏好已改为 %s。", bucket, value)

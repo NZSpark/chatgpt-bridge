@@ -116,6 +116,29 @@ class PagePoolMixin(BucketActivityMixin):
             }
         return out
 
+    def bucket_page(self, key: Optional[str] = None):
+        """该桶当前持有的页面对象（没有则为 ``None``）。
+
+        只读：不建页、不导航。上层（例如 ``/bridge`` 命令与诊断）用它判断
+        「这个桶的页面是否已打开」，而不必去碰 ``_page_for`` 这类内部钩子。
+        """
+        return self._page_for(key)
+
+    def bucket_page_url(self, key: Optional[str] = None) -> Optional[str]:
+        """该桶页面当前的 URL（没有页面 / 读不到则为 ``None``）。
+
+        只读、不导航：仅用于状态摘要（``/bridge status``、``/bridge session``）。
+        页面已死时读 URL 可能抛错，这里一律降级为 ``None``。
+        """
+        page = self._page_for(key)
+        if page is None:
+            return None
+        try:
+            url = page.url
+        except Exception:  # noqa: BLE001
+            return None
+        return str(url) if url else None
+
     def _lock_for(self, key: Optional[str] = None) -> asyncio.Lock:
         """取某个会话桶的锁。
 
@@ -333,7 +356,7 @@ class PagePoolMixin(BucketActivityMixin):
         await self._open_new_chat(page)
         await self._wait_ready(page)
         # 新会话默认选中「思考模式」；发送前 _send_chat_locked 还会再确认一次
-        await self._select_think_mode(page)
+        await self._select_think_mode(page, bucket)
         self._state(bucket).has_history = False
         return page
 
@@ -368,7 +391,7 @@ class PagePoolMixin(BucketActivityMixin):
                 bucket, target, landed or "（读不到 URL）", f"（{reason}）" if reason else "",
             )
         # 目标会话同样要选中「思考模式」，否则回复质量与别的桶不一致
-        await self._select_think_mode(page)
+        await self._select_think_mode(page, bucket)
         self._touch_page(bucket)
         logger.info(
             "[绑定] key=%s 已打开绑定的网页会话 %s%s。",

@@ -14,7 +14,7 @@ from typing import Any, List, Optional, Union
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, linking, tasks
+from . import bridge_commands, config, linking, models, tasks
 from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTWebDriver,
@@ -22,7 +22,6 @@ from .driver import (
 from .logging_setup import new_request_id, set_log_context, set_request_id
 from .metrics import metrics
 from .models import (
-    SUPPORTED_MODELS,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ModelCard,
@@ -395,11 +394,12 @@ async def root():
 
 @app.get("/v1/models", response_model=ModelListResponse)
 async def list_models():
-    """Pi (models.json) 会用该端点做模型发现。"""
-    candidates = {m["id"]: m for m in SUPPORTED_MODELS}
-    candidates.setdefault("chatgpt-chat", {"id": "chatgpt-chat"})
+    """Pi (models.json) 会用该端点做模型发现。
+
+    清单来自 :func:`chatgpt_web.models.advertised_models`（``/bridge models`` 同源）。
+    """
     return ModelListResponse(
-        data=[ModelCard(id=m["id"]) for m in candidates.values()]
+        data=[ModelCard(id=m["id"]) for m in models.advertised_models()]
     )
 
 
@@ -538,7 +538,9 @@ async def chat_completions(
     if not request.messages:
         return _error_response(400, "messages 不能为空", "invalid_request_error")
 
-    if driver.page is None:
+    # 桥内命令（``/bridge ...``、``/link``）不经过网页版，因此**浏览器没起来也要答**：
+    # 页面失效、初始化失败时它们正是用户唯一的排障入口。普通提问仍按下面的检查 503。
+    if driver.page is None and not bridge_commands.is_command(request.messages):
         return _error_response(
             503,
             "浏览器尚未就绪，请确认已完成登录、且没有另一个实例占用 user_data。"

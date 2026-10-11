@@ -84,6 +84,10 @@ class ChatIOMixin(
         （例外：用户用 ``/link`` 明确绑定了会话 URL 的桶会回到那条会话，见
         :mod:`chatgpt_web.linking`）。
 
+        **重新播种标记**（``/bridge session reseed``）：标记是从会话状态里读的
+        （``pending_reseed``，已落盘），带标记的本轮强制用“播种”prompt；**发送成功**
+        才消费并落盘。因此失败 / 重启 / 重试都不会丢掉这个动作，也不会重复应用。
+
         **页面不可用单独一条支线**（不占重试阶梯额度，也不走「轮转 / 换新会话」分支）：
 
         * :class:`~chatgpt_web.errors.ChatGPTPageLostError`：标签被用户关掉 /
@@ -173,13 +177,19 @@ class ChatIOMixin(
                 logger.warning("[恢复] 重试无效，改为开启新对话并重放历史……")
                 await self._start_new_session(bucket)
 
-            # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文
-            active_prompt = seeded if not self._state(bucket).has_history else prompt
+            # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文。
+            # ``/bridge session reseed`` 排队的一次性标记同样强制走播种版：它正是为
+            # 「网页会话里还有历史、但与客户端传来的历史已经失配」准备的。
+            state = self._state(bucket)
+            # getattr：浅替身 / 旧状态对象可能没有这个新字段（同 cap_failures 的处理）
+            force_seed = bool(getattr(state, "pending_reseed", False))
+            is_seed = force_seed or not state.has_history
+            active_prompt = seeded if is_seed else prompt
             # 防死循环：若这个会话桶连续多次“到顶”，说明播种内容仍超过网页版
             # 能承受的上下文。此时把播种 prompt 进一步压缩（保留头部说明 + 尾部
             # 最近内容），否则会陷入「到顶→失败→下轮仍播种→再到顶」的死循环。
             active_prompt = self._shrink_seed_if_repeated_cap(
-                bucket, active_prompt, is_seed=not self._state(bucket).has_history
+                bucket, active_prompt, is_seed=is_seed
             )
             # 记录真正要发出的那份 prompt，供上层估算 usage（按桶隔离，避免并发串台）
             self._last_prompts[bucket] = active_prompt
@@ -265,6 +275,13 @@ class ChatIOMixin(
                 attempt += 1
                 continue
             else:
+                if force_seed:
+                    # 一次性语义：播种版已经真正发出去（调用成功）→ 消费这个标记并
+                    # 立即落盘，避免进程重启后又重放一遍。同桶并发由会话锁保证：
+                    # 不会有两个请求同时消费同一个标记。
+                    self._state(bucket).pending_reseed = False
+                    await self._remember_session(bucket)
+                    logger.info("[命令] 已按排队标记完成一次重新播种，标记已消费。")
                 # 回复达标（或调用方没给判定）——直接返回
                 if validate_reply is None or validate_reply(reply_text):
                     task_state.complete()

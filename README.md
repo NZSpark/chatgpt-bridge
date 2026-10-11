@@ -283,6 +283,42 @@ codex --profile chatgpt
 - 不想用指令时可用 HTTP：`POST /session/link?url=<URL>&session=<bucket>&seed=false`、
   `POST /session/unlink?session=<bucket>`（设置了 `RESET_TOKEN` 时同样要带 `X-Reset-Token`）。
 
+## Bridge 命令（`/bridge ...`）：在对话里查状态、管当前会话桶
+
+设计说明见 [doc/bridge_command.md](doc/bridge_command.md)。与 `/link` 一样，命令由桥**本地应答**、
+不发给网页版；因此浏览器没起来、页面句柄已失效时它们照样可用（这也是排障时把它们放在输入框里的理由）。
+
+```text
+/bridge help [session|settings]       # 命令列表 / 分主题帮助（只读）
+/bridge status                        # 桥接 + 当前桶的状态摘要（只读）
+/bridge models                        # 本桥公布的模型名，与 GET /v1/models 同源（只读）
+/bridge session [status]              # 当前桶的会话状态摘要（只读）
+/bridge session reset                 # 下一轮开新网页会话 + 播种完整历史（改状态）
+/bridge session reseed                # 下一轮把完整历史再播种一遍（改状态，一次性）
+/bridge session link <URL> [--seed]   # 绑定当前桶到指定网页会话（改状态）
+/bridge session unlink                # 解除当前桶的绑定（改状态）
+/bridge settings think on|off|status  # 思考模式偏好，按桶持久化（改状态）
+/bridge settings save-files on|off|status  # 代码块落盘偏好，按桶持久化（改状态）
+```
+
+要点：
+
+- **只作用于当前会话桶**：命令没有「指定别的桶」的参数，桶仍由 `X-ChatGPT-Session` / `user` /
+  User-Agent 决定；一条命令不会影响其它客户端或其它 Agent 的会话。
+- **只读命令不导航网页、不触发生成**；`/bridge status` 在浏览器未初始化时也会报告降级状态并给出
+  下一步（`GET /readiness`），普通请求在该状态下仍照旧返回 503。
+- **`/bridge session reset` 不是清空聊天记录**：它只是让这一桶下一轮**新开一条网页会话**并把客户端
+  传来的历史播种进去（等价 `POST /session/reset`，不删客户端的对话历史、不清除账户数据）。
+- **`/bridge session reseed` 是「再发一遍历史」**：用于「网页会话里还有历史但与客户端已失配」。
+  标记落盘（`SESSION_FILE`），下一轮**成功发送**后才消费，因此重启 / 重试不会丢、也不会重复应用；
+  代价是那条网页会话里会出现重复内容。
+- **`/bridge settings` 是「按桶偏好」而不是改全局配置**：`think` 决定该桶网页端是否选中思考模式
+  （`default` = 跟随 `THINK_MODE_DEFAULT`），`save-files` 决定该桶的回复代码块是否落盘
+  （`default` = 跟随 `SAVE_FILES`，优先级：请求的 `save_files` 字段 > 本桶偏好 > 配置）。
+  切换失败时回复会**如实报告**（例如页面上找不到控件、站点不允许关闭），不会谎报已切换。
+- **兼容别名不变**：`/link`、`/unlink` 继续可用；`/bridge session link|unlink` 与它们共用同一套
+  校验、绑定与文案。
+
 ## 配置
 
 所有可调参数集中在项目根目录的 `.env`（已 gitignore）。已存在的真实环境变量优先于 `.env`。
@@ -409,6 +445,7 @@ chatgpt_web/
   browser_input.py          输入框候选定位、填充和清理
   chat_io.py                页面交互、回复等待及代码块提取
   linking.py                /link、/unlink 会话绑定逻辑
+  bridge_commands.py        /bridge 命令解析、执行、帮助与状态摘要
   page_pool.py              页面资源池与恢复
   streaming.py              Chat Completions SSE 编码
   responses.py              Responses API 兼容层
@@ -435,6 +472,10 @@ user_data/                  持久化浏览器 profile 与会话状态（默认�
 - 会话隔离与资源回收：通过 X-ChatGPT-Session、user、User-Agent 建立会话桶，并配合 LRU 与页面池控制浏览器资源。
 - **保持连接 vs 新开会话**：默认「轮转 + 播种」不依赖会话地址，但用户用 `/link` 显式绑定后，
   这一桶就固定发到那条会话（页面漂移 / 句柄重建 / 轮转 / 重启都回到它），命令本身不经过网页版。
+- **桥内命令是本地能力，不走网页版**：`/link`、`/unlink` 与 `/bridge ...` 在 HTTP 边缘被识别并
+  直接应答（[chatgpt_web/bridge_commands.py](chatgpt_web/bridge_commands.py) 是所有命令的统一入口），
+  因此浏览器不可用时仍能查询状态、改绑定或排队重新播种；会改状态的命令只作用于当前桶，
+  且回执里写清影响范围（例如 reset 不是删除客户端历史）。
 - 配置与 DOM 解耦：选择器、轮询阈值、会话数量、任务快照和 Responses API 开关集中在 .env，网页版改版时优先调整配置。
 - **composer 定位按候选枚举**：改版后 composer 已无 `#prompt-textarea` id（实测 0 命中），是 `form`
   内的 ProseMirror；页面 DOM 退化时同一页还会出现多个这样的编辑器（实测 3 个）。驱动枚举**全部**

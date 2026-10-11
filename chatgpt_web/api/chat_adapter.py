@@ -13,9 +13,9 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from .. import config
+from ..bridge_commands import handle_command
 from ..driver import ChatGPTBusyError, ChatGPTContextLimitError, ChatGPTTimeoutError
 from ..events import AssistantTextDelta, ToolCall, completion_events
-from ..linking import handle_command
 from ..models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -83,9 +83,9 @@ async def stream_chat_completion(
     # 先发 role 头
     yield encode({"role": "assistant"})
 
-    # 桥内命令（``/link`` 等）：整条消息就是那一行命令时由桥直接应答，**不发给网页版**。
-    # 放在这里而不是上游：句柄失效 / 页面漂移时这条命令正好是用户唯一的救命手段，
-    # 不能依赖浏览器可用。
+    # 桥内命令（``/bridge ...``、``/link``）：整条消息就是那一行命令时由桥直接应答，
+    # **不发给网页版**。放在这里而不是上游：句柄失效 / 页面漂移时这条命令正好是用户
+    # 唯一的救命手段，不能依赖浏览器可用（路由层也据此跳过浏览器可用性检查）。
     command_reply = await handle_command(request.messages, driver, session_key)
     if command_reply is not None:
         for piece in chunk_text(command_reply):
@@ -293,6 +293,28 @@ class ChatAdapterError(Exception):
         self.err_type = err_type
 
 
+def save_files_enabled(driver, session_key: Optional[str], request: ChatCompletionRequest) -> bool:
+    """本轮是否把代码块落盘。
+
+    优先级：请求体里**显式**的 ``save_files`` > 该桶偏好（``/bridge settings
+    save-files``，落盘）> ``config.SAVE_FILES``（默认 false）。
+    默认仍然关闭：落盘是本地扩展能力，标准 OpenAI 客户端并不知情。
+    """
+    if request.save_files is not None:
+        return bool(request.save_files)
+    getter = getattr(driver, "save_files_preference", None)
+    if callable(getter):
+        try:
+            preference = getter(session_key)
+        except Exception:  # noqa: BLE001
+            preference = None
+        # 只采信真正的三态值：假 driver / 替身返回的其它对象一律当作“未设置”，
+        # 否则一次意外的真值就会在用户机器上静默写出文件。
+        if isinstance(preference, bool):
+            return preference
+    return bool(config.SAVE_FILES)
+
+
 async def run_chat_completion(
     request: ChatCompletionRequest,
     driver,
@@ -437,8 +459,7 @@ async def run_chat_completion(
 
     final_text = completed_text(events, reply_content)
     saved_files = []
-    # None = 客户端未指定，回落到 config.SAVE_FILES（默认 false）；显式传入才覆盖
-    save_files = config.SAVE_FILES if request.save_files is None else request.save_files
+    save_files = save_files_enabled(driver, session_key, request)
     if save_files:
         saved_files = await asyncio.to_thread(
             driver.save_extracted_files,
@@ -464,7 +485,7 @@ async def run_chat_completion(
 async def bridge_command_response(
     request: ChatCompletionRequest, driver, session_key: Optional[str]
 ) -> Optional[ChatCompletionResponse]:
-    """执行桥内命令（``/link`` 等）并把它包装成一条 assistant 回复；不是命令则 None。
+    """执行桥内命令（``/bridge ...``、``/link``）包装成一条 assistant 回复；不是命令则 None。
 
     命令由桥自己应答、**不经过网页版**：句柄失效 / 页面漂移时它必须还能用。
     usage 按「没有上游 prompt」计（prompt_tokens=0），避免把桥的应答算成网页版用量。

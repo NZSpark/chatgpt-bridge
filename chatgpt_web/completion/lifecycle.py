@@ -115,8 +115,8 @@ class CompletionMixin:
         await self.page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._open_new_chat(self.page)
         await self._wait_ready(self.page)
-        # 新会话默认选中「思考模式」，否则网页版回复过于简单
-        await self._select_think_mode(self.page)
+        # 新会话默认选中「思考模式」，否则网页版回复过于简单（默认桶的偏好）
+        await self._select_think_mode(self.page, DEFAULT_SESSION_KEY)
         # 页面刚从空白对话开始，必须播种完整上下文
         self.session_has_history = False
         self.session_turns = 0
@@ -157,18 +157,61 @@ class CompletionMixin:
                 + "登录态会存入 user_data/。\n"
             )
 
-    async def _select_think_mode(self, page) -> bool:
-        """兼容 facade：Think Mode 定位/点击统一由 DOM adapter 负责。"""
-        if not config.THINK_MODE_DEFAULT:
+    def _wanted_think_mode(self, key: Optional[str] = None) -> Optional[bool]:
+        """该桶期望的思考模式；``None`` = 桥不管理它。
+
+        优先级：本桶偏好（``/bridge settings think on|off``，落盘）> 全局配置
+        ``THINK_MODE_DEFAULT``。全局配置为 false **且**该桶没单独设置时返回 ``None``
+        （等于旧行为：什么都不做），这样“显式关掉”只可能来自命令，而不是默认值。
+        """
+        preference = self.think_mode_preference(key)
+        if preference is not None:
+            return preference
+        return True if config.THINK_MODE_DEFAULT else None
+
+    @staticmethod
+    def _think_texts() -> List[str]:
+        return [t.strip().lower() for t in config.THINK_MODE_TEXTS.split("||") if t.strip()]
+
+    async def _select_think_mode(self, page, key: Optional[str] = None) -> bool:
+        """确保网页端的思考模式符合该桶偏好（定位/切换由 DOM adapter 负责）。"""
+        want = self._wanted_think_mode(key)
+        if want is None:
             return False
-        want = [t.strip().lower() for t in config.THINK_MODE_TEXTS.split("||") if t.strip()]
+        want_texts = self._think_texts()
         for attempt in range(3):
-            if await self.dom.find_think_mode(page, want):
+            if await self.dom.set_think_mode(page, want_texts, on=want):
                 return True
             await asyncio.sleep(0.4 * (attempt + 1))
         if config.DEBUG:
-            logger.warning("[会话] 未找到思考模式按钮，按默认模式继续。")
+            logger.warning("[会话] 未能把思考模式切到期望状态（要=%s），按网页当前状态继续。", want)
         return False
+
+    async def think_mode_state(self, key: Optional[str] = None) -> Optional[bool]:
+        """该桶页面上思考模式的**实际**状态（None = 没有页面 / 找不到控件）。
+
+        只读探测：不点击、不导航、不建页，因此可以安全地在聊天命令里调用。
+        """
+        page = self._page_for(key)
+        if page is None:
+            return None
+        return await self.dom.read_think_mode(page, self._think_texts())
+
+    async def apply_think_mode(self, key: Optional[str] = None) -> Optional[bool]:
+        """按该桶偏好**立即**切换当前页面上的思考模式，并读回实际状态。
+
+        返回 ``None`` = 没有页面 / 找不到控件 / 切换未被验证（调用方必须如实报告，
+        不能当成成功）；否则返回切换后读回的**实际**状态。
+        """
+        page = self._page_for(key)
+        if page is None:
+            return None
+        want = self.think_mode_preference(key)
+        if want is None:
+            return await self.think_mode_state(key)
+        if not await self.dom.set_think_mode(page, self._think_texts(), on=want):
+            return None
+        return await self.think_mode_state(key)
 
     async def _try_select_think_once(self, page, want) -> bool:
         """向旧测试/调用方保留一次 Think-mode 选择的兼容入口。"""
@@ -217,8 +260,8 @@ class CompletionMixin:
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._open_new_chat(page)
         await self._wait_ready(page)
-        # 新会话默认选中「思考模式」，否则网页版回复过于简单
-        await self._select_think_mode(page)
+        # 新会话默认选中「思考模式」，否则网页版回复过于简单（按该桶的偏好）
+        await self._select_think_mode(page, key)
         state = self._state(key)
         state.has_history = False
         state.turns = 0

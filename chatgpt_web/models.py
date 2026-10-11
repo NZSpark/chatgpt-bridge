@@ -106,3 +106,14 @@ SUPPORTED_MODELS = [
     {"id": "chatgpt-chat", "context_window": 65536},
     {"id": "chatgpt-reasoner", "context_window": 65536},
 ]
+
+
+def advertised_models() -> List[Dict[str, Any]]:
+    """本桥对外公布的模型清单。
+
+    ``GET /v1/models`` 与聊天命令 ``/bridge models`` 共用这一份数据，避免两边
+    各写一套清单后悄悄漂移（帮助文本里硬编码的模型名最容易过期）。
+    """
+    candidates = {m["id"]: m for m in SUPPORTED_MODELS}
+    candidates.setdefault("chatgpt-chat", {"id": "chatgpt-chat"})
+    return list(candidates.values())
