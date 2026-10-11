@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chatgpt_web import completion, config  # noqa: E402
 from chatgpt_web.driver import DEFAULT_SESSION_KEY, ChatGPTWebDriver  # noqa: E402
 from chatgpt_web.errors import (  # noqa: E402
+    ChatGPTComposerError,
     ChatGPTPageLostError,
     is_page_lost_error,
     is_timeout_error,
@@ -613,6 +614,58 @@ class InputLayerPageLossTests(_RecoveryTestBase):
         self.assertTrue(original.closed, "失效页面必须被关掉并从池里摘除")
         self.assertIsNot(driver.page, original)
         self.assertIs(driver.page, driver.context.created[0])
+        self.assertFalse(driver.bucket_busy(DEFAULT_SESSION_KEY), "请求结束后不得残留忙标记")
+
+
+class ComposerRefusalRecoveryTests(_RecoveryTestBase):
+    """composer 不接受输入（页面活着）→ 与页面失效共用同一套恢复：新开页面后重发一次。
+
+    真机（2026-10-10，第二例）：页面 DOM 退化时同一页出现多个 ProseMirror 编辑器，
+    填进去读回一直是空；干净加载的同一条会话只有一个 composer，**重开页面确实能修好**。
+    因此阶梯把它当可恢复故障（共用 ``PAGE_REBUILD_MAX`` 额度）；但它与「页面失效」
+    必须能分开（日志/错误文案见 ``chat_io._recovery_reason``），否则真机上又会把
+    「站点改版 / 未登录」误诊成可自愈故障。
+    """
+
+    def test_rebuilds_once_then_resends_when_composer_refuses_input(self) -> None:
+        driver = self.make_driver()
+        original = _HealthyPage()
+        driver.page = original
+        driver.context = _FakeContext()
+        driver._state(DEFAULT_SESSION_KEY).has_history = True
+        sends = []
+
+        async def always_refusing(prompt, on_delta=None, key=None):
+            sends.append(prompt)
+            raise ChatGPTComposerError(
+                "填充输入框失败（多次重试后读回仍为空或 fill 超时）。"
+                "页面仍在运行……（现场：readyState=complete）"
+            )
+
+        rotations = []
+
+        async def fake_rotation(key=None):
+            rotations.append(key)
+
+        with _quiet_page_setup(), \
+                mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 5), \
+                mock.patch.object(config, "PAGE_REBUILD_MAX", 1), \
+                mock.patch.object(driver, "_send_chat_locked", side_effect=always_refusing), \
+                mock.patch.object(driver, "_start_new_session", side_effect=fake_rotation):
+            with self.assertRaises(ChatGPTComposerError) as ctx:
+                asyncio.run(
+                    driver.send_chat("delta-only", seeded_prompt="SEEDED-HISTORY", key=None)
+                )
+
+        self.assertIn("填充输入框失败", str(ctx.exception))
+        self.assertEqual(
+            sends, ["delta-only", "SEEDED-HISTORY"],
+            "重建后必须用播种 prompt 重放历史",
+        )
+        self.assertEqual(len(driver.context.created), 1, "composer 故障只允许新开一条页面")
+        self.assertEqual(rotations, [], "composer 故障不该轮转 / 换新会话")
+        self.assertTrue(original.closed, "退化页面必须被关掉并从池里摘除")
+        self.assertIsNot(driver.page, original)
         self.assertFalse(driver.bucket_busy(DEFAULT_SESSION_KEY), "请求结束后不得残留忙标记")
 
 

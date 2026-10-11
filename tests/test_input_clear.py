@@ -13,9 +13,12 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from chatgpt_web import config  # noqa: E402
+from chatgpt_web.browser.dom_adapter import ChatGPTDOMAdapter  # noqa: E402
 from chatgpt_web.chat_io import ChatIOMixin  # noqa: E402
 
 
@@ -97,6 +100,140 @@ class InputClearTests(unittest.TestCase):
         asyncio.run(ChatIOMixin._clear_input(page, composer))
 
         self.assertEqual(composer.text, "")
+
+
+class _Composer:
+    """候选 composer 替身：``actionable=False`` 模拟「点不动」的僵尸编辑器。"""
+
+    def __init__(self, page, *, actionable: bool = True, accepts: bool = True) -> None:
+        self.page = page
+        self.actionable = actionable
+        self.accepts = accepts
+        self.text = ""
+
+    async def click(self, timeout=None, **kwargs):
+        if not self.actionable:
+            raise RuntimeError("element is not visible")
+        self.page.focused = self
+        return None
+
+    async def fill(self, value, **kwargs):
+        if self.accepts:
+            self.text = value
+        return None
+
+    async def evaluate(self, script):
+        if "focus" in script:
+            self.page.focused = self
+            return None
+        return self.text if self.accepts else ""
+
+
+class _ComposerPage:
+    """假页面：keyboard 插字落到「最后一个被聚焦的 composer」上（贴近真实路径）。"""
+
+    def __init__(self) -> None:
+        self.focused = None
+        self.keyboard = _ComposerKeyboard(self)
+
+
+class _ComposerKeyboard:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def press(self, key):
+        if key == "Backspace" and self.page.focused is not None:
+            self.page.focused.text = ""
+        return None
+
+    async def insert_text(self, text):
+        target = self.page.focused
+        if target is not None and target.accepts:
+            target.text = (target.text or "") + text
+        return None
+
+
+class _StubDom:
+    """最小 DOM 替身：只提供 ``_fill_prompt`` 需要的两个入口。"""
+
+    def __init__(self, candidates) -> None:
+        self.candidates = list(candidates)
+
+    async def input_candidates(self, page):
+        return list(self.candidates)
+
+    async def complete_text(self, node):
+        return node.text if node.accepts else ""
+
+
+class _CandidateHandle:
+    """``input_candidates`` 的元素句柄替身（去重标记 / 可见性）。"""
+
+    def __init__(self, mark, *, visible=True) -> None:
+        self.mark = mark
+        self.visible = visible
+
+    async def evaluate(self, script):
+        return self.mark if "bridgeInputCandidate" in script else ""
+
+    async def is_visible(self):
+        return self.visible
+
+
+class _HandlePage:
+    """按选择器返回句柄的页面替身（走 ``query_selector_all`` 路径）。"""
+
+    def __init__(self, by_selector) -> None:
+        self.by_selector = by_selector
+
+    async def wait_for_selector(self, selector, timeout=None, state=None):
+        handles = self.by_selector.get(selector) or []
+        return handles[0] if handles else None
+
+    async def query_selector_all(self, selector):
+        return list(self.by_selector.get(selector) or [])
+
+
+class ComposerCandidateTests(unittest.TestCase):
+    """真机（2026-10-10，第二例）：页面 DOM 退化时同页会出现多个 ProseMirror 编辑器，
+    「第一个 attached」往往点不动、读回为空 —— 必须枚举全部候选、可见优先、逐个试填。"""
+
+    def test_input_candidates_dedupes_and_prefers_visible(self):
+        visible = _CandidateHandle("visible")
+        hidden = _CandidateHandle("hidden", visible=False)
+        selectors = ['form div.ProseMirror[contenteditable="true"]', "textarea"]
+        page = _HandlePage({selectors[0]: [hidden, visible], selectors[1]: [visible]})
+
+        with mock.patch.object(config, "INPUT_SELECTORS", selectors):
+            candidates = asyncio.run(ChatGPTDOMAdapter().input_candidates(page))
+
+        self.assertEqual(
+            [handle.mark for handle in candidates],
+            ["visible", "hidden"],
+            "同一元素只保留一次，且可见的排在前面",
+        )
+
+    def test_fill_prompt_moves_to_the_next_candidate_when_text_is_empty(self):
+        page = _ComposerPage()
+        dead = _Composer(page, actionable=False, accepts=False)
+        live = _Composer(page)
+        mixin = ChatIOMixin()
+        mixin.dom = _StubDom([dead, live])
+
+        handle = asyncio.run(mixin._fill_prompt(page, "新的 prompt"))
+
+        self.assertIs(handle, live, "第一个候选读回为空时必须换下一个候选")
+        self.assertEqual(live.text, "新的 prompt")
+        self.assertEqual(dead.text, "", "僵尸候选不该拿到内容")
+
+    def test_fill_prompt_returns_none_when_no_candidate_accepts_text(self):
+        page = _ComposerPage()
+        dead = _Composer(page, actionable=False, accepts=False)
+        mixin = ChatIOMixin()
+        mixin.dom = _StubDom([dead])
+
+        with mock.patch.object(config, "FILL_RETRIES", 1):
+            self.assertIsNone(asyncio.run(mixin._fill_prompt(page, "hi")))
 
 
 if __name__ == "__main__":

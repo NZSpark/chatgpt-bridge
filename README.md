@@ -224,7 +224,15 @@ codex --profile chatgpt
 - **绑定落盘**（`SESSION_FILE` 里的 `linked_url`），重启后仍生效；当前绑定可从
   `GET /healthz` 的 `buckets.<key>.linked_url` 看到。
 - 链接必须是 `https://<允许的站点>/c/<会话ID>`（`/share/...` 分享链接不能继续对话）；
-  允许的站点由 `LINK_ALLOWED_HOSTS` 控制，默认仅官方域名。
+  允许的站点由 `LINK_ALLOWED_HOSTS` 控制，默认仅官方域名。**会话 ID 按站点自己的形态收**：
+  只要是一个合法 URL 路径段就行（可含 `%XX` 转义；`%3A` 与 `:` 视为同一条会话）。
+- **客户端临时地址会被拒**：`.../c/local-chatgpt%3A<uuid>`（更早的版本是 `/c/WEB:<uuid>`）
+  是网页版在新会话拿到正式 ID **之前**的地址栏写法，约 1 秒后就被替换成 `/c/<uuid>`；拿它去
+  导航站点会重定向回首页，绑定只会让之后每一轮都发进一条陌生新会话。遇到这种地址请先在会话里
+  发出第一条消息、等地址栏变成 `/c/<uuid>` 再复制（错误文案里也会这么说）。
+- **绑定后第一次导航会校验落点**：站点若不认这条地址（不存在 / 已失效 → 重定向回首页），
+  日志里会出现 `[绑定] … 导航后页面停在别处`，`/metrics` 的 `session_link_miss_total` 也会
+  增长——看到就说明这个地址不能用，换一条或加 `--seed` 都不解决问题。
 - 不想用指令时可用 HTTP：`POST /session/link?url=<URL>&session=<bucket>&seed=false`、
   `POST /session/unlink?session=<bucket>`（设置了 `RESET_TOKEN` 时同样要带 `X-Reset-Token`）。
 
@@ -379,6 +387,10 @@ user_data/                浏览器 profile 与状态（gitignore）
 - **保持连接 vs 新开会话**：默认「轮转 + 播种」不依赖会话地址，但用户用 `/link` 显式绑定后，
   这一桶就固定发到那条会话（页面漂移 / 句柄重建 / 轮转 / 重启都回到它），命令本身不经过网页版。
 - 配置与 DOM 解耦：选择器、轮询阈值、会话数量、任务快照和 Responses API 开关集中在 .env，网页版改版时优先调整配置。
+- **composer 定位按候选枚举**：改版后 composer 已无 `#prompt-textarea` id（实测 0 命中），是 `form`
+  内的 ProseMirror；页面 DOM 退化时同一页还会出现多个这样的编辑器（实测 3 个）。驱动枚举**全部**
+  候选、可见的优先，逐个试填并校验读回，读到非空才算成功——「第一个 attached 就返回」会把 prompt
+  填进一个点不动的僵尸节点（真机现象与处置见 [doc/update.md](doc/update.md) §2.18）。
 
 ## 测试
 

@@ -15,6 +15,7 @@ from .browser_input import BrowserInputMixin
 from .errors import (
     DEFAULT_SESSION_KEY,
     ChatGPTBusyError,
+    ChatGPTComposerError,
     ChatGPTContextLimitError,
     ChatGPTPageLostError,
     ChatGPTTimeoutError,
@@ -34,6 +35,17 @@ logger = logging.getLogger(__name__)
 # 必须 >1：助手节点总是晚于提交一帧出现（正常首轮也会 nodes=0 + generating），
 # 只有**持续**零节点才说明选择器失效（网页版改版）。
 _EMPTY_NODE_REPORT_AFTER = 3
+
+
+def _recovery_reason(exc: RuntimeError) -> str:
+    """页面层恢复日志里的原因短语。
+
+    两类故障（页面失效 / composer 不接受输入）共用「新开页面后重发」这一个动作，
+    但日志与错误文案必须能分开——否则真机上又要把「站点改版」当成「标签被关」。
+    """
+    if isinstance(exc, ChatGPTComposerError):
+        return "composer 不接受输入（页面仍在运行）"
+    return "会话页面已失效"
 
 
 class ChatIOMixin(
@@ -72,11 +84,18 @@ class ChatIOMixin(
         （例外：用户用 ``/link`` 明确绑定了会话 URL 的桶会回到那条会话，见
         :mod:`chatgpt_web.linking`）。
 
-        **页面失效（P0-J）单独一条支线**：标签被用户关掉 / 渲染进程崩溃或挂起时，
-        driver 抛 :class:`~chatgpt_web.errors.ChatGPTPageLostError`。这类故障**不占**
-        重试阶梯额度，也不走「轮转 / 换新会话」分支——新开一条页面后直接重发
-        （新页面本身就是空白会话，``has_history=False`` 会让本轮用播种 prompt 重放
-        历史，上下文不丢）。否则会把刚恢复的会话又轮转掉，白白丢上下文。
+        **页面不可用单独一条支线**（不占重试阶梯额度，也不走「轮转 / 换新会话」分支）：
+
+        * :class:`~chatgpt_web.errors.ChatGPTPageLostError`：标签被用户关掉 /
+          渲染进程崩溃或挂起；
+        * :class:`~chatgpt_web.errors.ChatGPTComposerError`：页面活着也响应 JS，但
+          composer 不接受输入（同一页出现多个 ProseMirror 编辑器 / 弹层遮挡 /
+          登录墙）——真机实测**重开页面能修好**这种 DOM 退化（干净加载的同一条会话
+          只有一个 composer），因此与页面失效共用同一个恢复动作。
+
+        两者的处置都是「新开一条页面后直接重发」（新页面本身就是空白会话，
+        ``has_history=False`` 会让本轮用播种 prompt 重放历史，上下文不丢）。
+        否则会把刚恢复的会话又轮转掉，白白丢上下文。
 
         **终止条件**：句柄失效的重建额度是 ``PAGE_REBUILD_MAX``（默认 1，专设、不跟
         ``MAX_UPSTREAM_RETRIES`` 联动）。额度用尽后**立即**按上游不可用结束，而不是
@@ -174,18 +193,20 @@ class ChatIOMixin(
                 reply_text, blocks = await self._send_chat_locked(
                     active_prompt, on_delta, key=bucket
                 )
-            except ChatGPTPageLostError as exc:
-                # 页面没了（标签被关 / 渲染进程崩溃 / 挂起）——与「改版 / 未登录」
-                # 完全不同：新开一条页面后直接重发，**不进**下面的轮转 / 换新会话分支。
+            except (ChatGPTPageLostError, ChatGPTComposerError) as exc:
+                # 页面不可继续使用：句柄没了（标签被关 / 渲染进程崩溃 / 挂起），或页面
+                # 活着但 composer 不接受输入（DOM 退化 / 弹层遮挡 / 登录墙）。两者都与
+                # 不可自愈的「改版 / 未登录」不同：新开一条页面后直接重发，
+                # **不进**下面的轮转 / 换新会话分支。
                 last_error = exc
                 self._state(bucket).last_error = str(exc)
                 if page_rebuilds_left <= 0:
-                    # 终止条件（``PAGE_REBUILD_MAX``）：句柄失效只给一次新开页面的
-                    # 机会，额度用尽就结束本次请求。**不能**在这里退化成普通重试：
-                    # 页面已经没了，在阶梯里退避重发只会对着同一具尸体报同一个错，
+                    # 终止条件（``PAGE_REBUILD_MAX``）：只给一次新开页面的机会，额度
+                    # 用尽就结束本次请求。**不能**在这里退化成普通重试：页面已经不可用，
+                    # 在阶梯里退避重发只会对着同一具尸体报同一个错，
                     # 而每一次重建都在真实地新开标签页（浏览器整体不可用时就是建页风暴）。
                     logger.warning(
-                        f"[恢复] 会话页面已失效（{exc}），且本请求的页面重建额度"
+                        f"[恢复] {_recovery_reason(exc)}（{exc}），且本请求的页面重建额度"
                         f"已用尽（PAGE_REBUILD_MAX={config.PAGE_REBUILD_MAX}），直接按"
                         "「上游不可用」结束；下一次请求会在 _ensure_page 里惰性重建。"
                     )
@@ -195,7 +216,7 @@ class ChatIOMixin(
                 # 下一轮开头的 transition(PROMPT_BUILT/MODEL_GENERATING) 会接着走
                 task_state.transition(TaskStateName.SESSION_RECOVERY, error=str(exc))
                 logger.warning(
-                    f"[恢复] 会话页面已失效（{exc}），新开页面后重发"
+                    f"[恢复] {_recovery_reason(exc)}（{exc}），新开页面后重发"
                     f"（剩余重建额度 {page_rebuilds_left} 次，不占重试阶梯）。"
                 )
                 try:
@@ -206,7 +227,7 @@ class ChatIOMixin(
                     # 连新页面都建不出来（context 已关 / profile 被占 / 浏览器已退出）：
                     # 上游整体不可用，再进循环只会反复建页 → 立刻结束，并把两个原因都留下。
                     logger.error(f"[恢复] 新开页面失败（{rebuild_exc!r}），放弃恢复：{exc}")
-                    raise ChatGPTPageLostError(
+                    raise type(exc)(
                         f"{exc}（新开页面也失败：{rebuild_exc!r}）"
                     ) from rebuild_exc
                 # 新页面 = 新的网页会话，状态里的轮转请求已无意义

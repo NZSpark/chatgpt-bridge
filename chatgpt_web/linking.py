@@ -19,13 +19,18 @@
 
 命令在 **HTTP 边缘**被识别（``server`` 的 chat 路由与 ``api`` 适配层）：整条消息就是
 那一行命令时由桥直接应答、不发给网页版——句柄都丢了的时候这条命令必须还能用。
+
+接受的会话地址只看「主机在 ``LINK_ALLOWED_HOSTS`` 里 + 路径里有一段 ``/c/<会话ID>``」，
+ID 形态按站点自己的来（见 ``_CONVERSATION_ID_RE``：一个合法 URL 路径段，百分比转义照收），
+但**客户端临时 ID**（``local-chatgpt:`` / ``WEB:`` 名字空间）一律拒绝：见
+``_CLIENT_PLACEHOLDER_PREFIXES``——那种地址站点还没有正式 ID，导航过去只会被弹回首页。
 """
 
 import logging
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Set
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from . import config
 from .errors import DEFAULT_SESSION_KEY
@@ -45,8 +50,28 @@ _USAGE = (
     f"  {UNLINK_COMMAND}                                       # 解除绑定，恢复新开会话 + 播种"
 )
 
-#: 会话 ID 的形态（ChatGPT 目前是 UUID；放宽到字母数字与 ``-``/``_``）。
-_CONVERSATION_ID_RE = r"[A-Za-z0-9_-]{8,64}"
+#: 会话 ID 的形态：**一个 URL 路径段**（RFC 3986 的 pchar，含百分号转义）。
+#:
+#: 不写死 UUID / 字母数字：ID 是站点自己定的不透明字符串。ChatGPT 网页版目前是 UUID，
+#: 但客户端与第三方前端会给出别的形态——真机遇到的
+#: ``local-chatgpt%3A<uuid>``（名字空间 ID，冒号被 ``encodeURIComponent`` 转义成
+#: ``%3A``）按旧实现 ``[A-Za-z0-9_-]`` 的校验会被直接拒掉，用户手里那条地址反而用不了。
+#: 真正的守门人是「主机在允许列表里 + 路径里恰好一个 ``/c/`` 段」；ID 形态只用来挡
+#: 明显不是会话地址的东西：空、含空格 / 控制字符、非法百分号转义、过短
+#: （``/c/new`` 这种「空白新对话」地址要拒掉）或过长。
+_CONVERSATION_ID_RE = r"(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+"
+#: ID 的长度边界（按**原样**计，不做解码）。
+_CONVERSATION_ID_MIN_CHARS = 8
+_CONVERSATION_ID_MAX_CHARS = 256
+#: 客户端**临时**会话 ID 的名字空间前缀（比较前先解码，大小写不敏感）。
+#:
+#: 真机（2026-10-10，两次）：ChatGPT 客户端在新会话拿到服务端 ID 之前，会把地址栏写成
+#: ``/c/local-chatgpt%3A<uuid>``（更早的版本是 ``/c/WEB:<uuid>``），约 1 秒后替换成正式
+#: ``/c/<uuid>``。拿这种地址去**新导航**（/link 的落地校验、句柄重建、重启恢复）站点一律
+#: 重定向回首页——绑定只会让之后每一轮都发进一条陌生新会话（真机日志：导航后页面停在
+#: ``https://chatgpt.com/``，随后那条消息创建了一条新对话）。因此在这里直接拒掉，
+#: 并在错误文案里给出正确取法。
+_CLIENT_PLACEHOLDER_PREFIXES = ("local-chatgpt:", "web:")
 #: 会话链接路径里的固定段：``/c/<id>``，或带自定义 GPT 的 ``/g/<gpt>/c/<id>``。
 _CONVERSATION_SEGMENT = "c"
 
@@ -100,11 +125,30 @@ def conversation_id(url: str) -> Optional[str]:
     return None
 
 
+def _acceptable_conversation_id(conv_id: str) -> bool:
+    """会话 ID 是否是一个可接受的 URL 路径段（形态与长度；见 ``_CONVERSATION_ID_RE``）。"""
+    return (
+        _CONVERSATION_ID_MIN_CHARS <= len(conv_id) <= _CONVERSATION_ID_MAX_CHARS
+        and re.fullmatch(_CONVERSATION_ID_RE, conv_id) is not None
+    )
+
+
+def _comparison_key(conv_id: str) -> str:
+    """比对用的会话 ID：把百分号转义还原成原义（``%3A`` 与 ``:`` 视为同一段）。
+
+    只解码、**不做大小写归一**：ID 是不透明字符串，站点真的区分大小写时，把两条不同
+    会话判成同一条的代价（这一轮发进错误的会话）比多导航一次的代价大得多。
+    """
+    return unquote(conv_id)
+
+
 def canonical_conversation_url(raw: str, hosts: Optional[Set[str]] = None) -> str:
     """把用户给的链接规范化成可绑定的会话地址；不合法时抛 ``ValueError``（文案可直接展示）。
 
     只接受「https + 允许的站点 + ``/c/<会话ID>``」。分享链接（``/share/...``）
-    不是可继续对话的会话，同样拒绝。
+    不是可继续对话的会话，同样拒绝；会话 ID 按站点自己的形态收（见
+    ``_CONVERSATION_ID_RE``），**原样保留**（``%3A`` 不解码成 ``:``：两种写法在路径段里
+    等价，交给站点自己解码，避免我们拼出一个它不认的地址）。
     """
     text = (raw or "").strip().strip("<>\"'")
     if not text:
@@ -135,8 +179,21 @@ def canonical_conversation_url(raw: str, hosts: Optional[Set[str]] = None) -> st
             f"链接里没有会话 ID：{raw}"
             "（应形如 https://chatgpt.com/c/<会话ID>；/share/ 分享链接不能用来继续对话）。"
         )
-    if not re.fullmatch(_CONVERSATION_ID_RE, conv_id):
-        raise ValueError(f"会话 ID 形态异常：{conv_id}（应形如 https://chatgpt.com/c/<会话ID>）。")
+    if not _acceptable_conversation_id(conv_id):
+        raise ValueError(
+            f"会话 ID 形态异常：{conv_id}"
+            f"（会话 ID 应是 /c/ 之后的一段地址，{_CONVERSATION_ID_MIN_CHARS}–"
+            f"{_CONVERSATION_ID_MAX_CHARS} 个合法 URL 字符，可含 %XX 转义；"
+            "形如 https://chatgpt.com/c/6ac9c061-5074-83ec-82f0-2f46a8c334ca）。"
+        )
+    decoded = _comparison_key(conv_id)
+    for prefix in _CLIENT_PLACEHOLDER_PREFIXES:
+        if decoded.lower().startswith(prefix):
+            raise ValueError(
+                f"这是浏览器端的**临时**会话地址（{decoded[: len(prefix) + 8]}…）：站点还没给"
+                "它正式 ID，导航过去只会被重定向回首页。请在会话里先发出第一条消息、"
+                "等地址栏变成 /c/<uuid>（UUID 形态、不带冒号）后再复制那条地址。"
+            )
     return f"https://{parts.netloc.lower()}/c/{conv_id}"
 
 
@@ -144,13 +201,15 @@ def same_conversation(left: str, right: str) -> bool:
     """两个地址是否指向同一条会话。
 
     ``page.url`` 上常带查询串（``?model=...``）或尾斜杠，因此优先比对会话 ID；
+    ID 比对前会还原百分号转义，所以用户给的 ``%3A`` 与站点地址栏里的 ``:``
+    不会被当成两条会话（否则每轮发送都会白导航一次）。
     任一侧取不到 ID 时才退回「去掉查询 / 尾斜杠」的整串比较；两侧都读不到时
     一律返回 ``False``（判不准就重新导航，代价只是一次跳转）。
     """
     left_id = conversation_id(left or "")
     right_id = conversation_id(right or "")
     if left_id and right_id:
-        return left_id == right_id
+        return _comparison_key(left_id) == _comparison_key(right_id)
 
     def _normalized(url: str) -> str:
         parts = urlsplit((url or "").strip())

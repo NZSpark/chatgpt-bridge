@@ -1,8 +1,12 @@
 # ChatGPTBridge 项目分析与改进建议
 
-> 更新日期：2026-10-06
+> 更新日期：**2026-10-10**（本轮增补：§2.16–§2.18，`/link` 会话绑定与其 composer 定位的真机收尾）
 > 本版在静态分析之上，新增**真实 E2E 运行结果**（§1）与**由结果推导的建议**（§2）；原静态分析压缩为 §3。
-> 基线：`main @ 700bb67`，单测 `pytest -q` → 219 passed / 24 skipped（24 个 skip 即 e2e 用例）。
+> 首次分析基线：`main @ 700bb67`，单测 `pytest -q` → 219 passed / 24 skipped（24 个 skip 即 e2e 用例）。
+> 当前基线（2026-10-10，含 §2.16–§2.18 的全部改动）：`pytest -q` →
+> **612 passed / 17 skipped / 81 subtests passed**（45.5s，0 failed）；`mypy chatgpt_web` 38 errors、
+> `ruff check chatgpt_web tests` 仓库级 14 条 —— 两者都不高于首次分析时的状态（`ruff` 的 14 条在改动前的
+> `HEAD` 上同样存在，本次未新增）。
 
 ---
 
@@ -631,7 +635,7 @@ HTTP 侧另有 `POST /session/link` / `/session/unlink`（与 `/session/reset` �
 链接必须是 `https://<允许站点>/c/<会话ID>`（`/share/...` 不能继续对话），允许站点由新增的
 `LINK_ALLOWED_HOSTS`（默认官方域名，`*` = 不限制）控制。
 
-**验证**：新增 `tests/test_session_linking.py`（32 例）：链接规范化 / 白名单 / `same_conversation`、
+**验证**：新增 `tests/test_session_linking.py`（35 例）：链接规范化 / 白名单 / `same_conversation`、
 命令识别（混在正文里不算命令、历史消息不重放）、命令执行（绑定、`--seed` 语义、状态、`/unlink`）、
 **绑定落盘后换进程仍生效**、页面目标（重建 / 漂移回拉 / 已在目标则不导航 / 轮转回到绑定会话 /
 启动恢复 / 未绑定桶行为不变）、HTTP 端点（含 400 / 403）、两条协议路径的命令短路（`send_chat` 被
@@ -641,6 +645,126 @@ HTTP 侧另有 `POST /session/link` / `/session/unlink`（与 `/session/reset` �
 
 **未覆盖**：真机验收（需独占 `user_data` 的登录会话）；绑定后再 `/link` 另一条时**不**校验旧会话
 是否已不可用；`--seed` 与网页端已有历史的重复注入代价由用户自行判断（回复里已提示）。
+
+### 2.17（修复）`/link` 的会话 ID 校验过严：客户端给的 `local-chatgpt%3A<uuid>` 被拒
+
+**背景（用户实测）**：在客户端发
+`/link https://chatgpt.com/c/local-chatgpt%3Ae03cbb49-722a-4591-8f36-c491762833be`，桥回
+`没能绑定会话：会话 ID 形态异常：local-chatgpt%3A…`。旧实现把会话 ID 按「UUID / 字母数字」
+校验（`[A-Za-z0-9_-]{8,64}`），而这个 ID 是**客户端给的名字空间形态**
+（`local-chatgpt:` + UUID，冒号被 `encodeURIComponent` 转义成 `%3A`）——用户手里那条地址
+反而被自己的桥挡在门外。
+
+**行为**：会话 ID 改按「**一个合法 URL 路径段**」收（RFC 3986 的 pchar + `%XX` 转义，
+长度 8–256），地址**原样保留**、不做解码重建（`%3A` 与 `:` 在路径段里等价，交给站点自己
+解码）。守门人不变：主机在 `LINK_ALLOWED_HOSTS` 内 + 路径里有一段 `/c/<段>`；继续拒空、
+空格、非法 `%` 转义、过长，以及过短的段（`/c/new`、`/c/short` 这类要么是「空白新对话」、
+要么根本不是会话 ID，正是这个功能要防的）。另外 `same_conversation` 比对 ID 前先还原百分号
+转义——否则用户给的 `%3A` 与地址栏里的 `:` 会被当成两条会话，每轮发送都白导航一次。
+
+**新增可观测性**：`_enter_linked_session` 在 `goto` 之后加**落地校验**。站点若不认这条地址
+（不存在 / 已失效 → 重定向回首页或新对话），静默失效是原来最坏的结果：绑定看似成功，
+之后每轮都发进一条陌生会话。现在会打
+`[绑定] key=… 导航后页面停在别处（期望 …，实际 …）`，并累加新计数器
+`session_link_miss_total`（可在 `/metrics` 看）。**不抛错**：这一轮仍按绑定语义走（只发增量），
+因为「绑定 = 那条会话已有上下文」的判据在 `link_session`，导航不该推翻它（见 §2.16 的
+`test_rebuild_after_handle_loss_lands_on_the_linked_conversation`）。
+
+**验证**：`tests/test_session_linking.py` 新增 5 例（当时共 40 例；§2.18 起 **41 例**）：接受 `%3A` 名字空间 ID 且
+原样保留、拒掉非法 `%` 转义 / 空格 / 超长 / 过短、`same_conversation` 忽略百分号转义、
+导航落到别处时告警且 `session_link_miss_total` +1、正常落到目标不计 miss。用户给出的
+原始地址现在能原样通过 `canonical_conversation_url`（用真串跑过）。
+
+**未覆盖**：真实浏览器里该地址是否真的存在（§2.16 的真机验收项）——落点校验只能告诉你
+「没落上去」，不能替你确认那条会话本身是否有效。
+
+**后续（**§2.18 收紧**）**：真机证明 `local-chatgpt%3A<uuid>` 是**客户端临时 ID**（1 秒后就被正式
+ID 替换，新导航必被弹回首页），因此现在会在**绑定时**直接拒绝并给出正确取法；本条里 "要能过" 的
+部分（`%XX` 转义原样保留、比对时解码）仍然有效。
+
+### 2.18（修复）会话绑定的真机收尾：拒掉客户端临时 ID + composer 候选退化
+
+**背景（用户实测，两次）**：
+
+1. `/link https://chatgpt.com/c/local-chatgpt%3A6e6d3797-…` 回「已绑定」，但下一轮发送时 `page_pool`
+   打出 `[绑定] key=default 导航后页面停在别处（期望 …，实际 https://chatgpt.com/）`；只隔 1 秒，
+   该轮消息实际创建了一条**全新会话**（`user_data/Default/History`：20:28:47
+   `/c/local-chatgpt%3Ae6bdf940-…`（标题=播种提示词）→ 20:28:48 `/c/6ac9e92f-…`）。
+2. 换成正式地址 `https://chatgpt.com/c/6ac9ea08-…`（`turns=21`）再 `/link`：绑定、页面都正常
+   （`/diagnostics` 的 `url`/`title` 都对），但发送卡在输入层：
+   `[输入] fill 第 1/3 次、第 2/3 次后内容为空（读到 ''）`；三次用光后 `request_error_total` 0→2，
+   `turns` 仍停在 21——消息**根本没发到网页版**。
+
+**根因（真机取证）**：
+
+* `local-chatgpt:<uuid>` / `WEB:<uuid>` 是**客户端临时 ID**：客户端在新会话拿到服务端 ID 之前把
+  地址栏写成它，约 1 秒后替换成正式 `/c/<uuid>`；从别处（含同一 profile）新导航过去一律被重定向
+  回首页。
+* composer 已**没有 id**（`#prompt-textarea` 实测 0 命中），是 `form` 内的 ProseMirror
+  （`role=textbox`，`aria-label="Ask ChatGPT"`；有头浏览器实测可正常点击 / 输入）；而用户机器上当时
+  的页面 DOM 已退化：`/diagnostics` 里同页有 **3 个** `div.ProseMirror[contenteditable="true"]`
+  与 1 个 `textarea`，干净加载的同一条会话只有 1 个、0 个。旧实现「第一个 attached 就返回」拿到的
+  正是点不动的那个：每次尝试 ≈12.4s = 等已失效的 `#prompt-textarea` 2s + `FILL_TIMEOUT_MS`（10s）
+  的 click 超时 + 清空 / 读回；JS focus 兜底把 prompt 插进没有焦点的节点 → 读回为空。
+  （用 profile 副本干净加载同一条会话复测：1 个 composer、`click` 0.0s、`insert_text` 读回正常。）
+
+**行为（四处）**：
+
+1. `/link` **绑定时就拒掉**临时 ID（`linking._CLIENT_PLACEHOLDER_PREFIXES`，解码后前缀比较、大小写
+   不敏感），错误文案说明取法（先发一条消息、等地址栏变成 `/c/<uuid>` 再复制）。
+2. `dom_adapter.input_candidates()`：枚举 `INPUT_SELECTORS` 的**全部**候选（同一元素用 JS expando
+   去重），**可见的排在前面**（只排序、不过滤：真 composer 在部分状态下会被 Playwright 判为
+   not visible，过滤掉会让功能彻底失效）。`find_input()` 改为「取第一个候选」，契约不变
+   （页面死 → `ChatGPTPageLostError`；页面活但全不中 → `None` + `last_input_probe`）。
+3. `browser_input._fill_prompt()` 对候选**逐个试填并校验读回**，读到非空才算成功；每次重试重新枚举
+   （React 重挂载会换句柄，退化页面里多出来的编辑器也会随视图收回）。
+4. 新增 `errors.ChatGPTComposerError`（页面活着、JS 也响应，但 composer 不接受输入）：重试阶梯把它
+   与 `ChatGPTPageLostError` 并列当**可恢复**故障——共用 `PAGE_REBUILD_MAX` 额度，新开页面后重发；
+   日志用 `chat_io._recovery_reason()` 把两者分开，避免把「站点改版 / 未登录」误诊成可自愈。
+   （旧注释「重开页面修不好 composer 不吃输入」被真机复测推翻：干净加载只有 1 个 composer，
+   重载确实能修好这种退化。）
+
+**同时校准**：`INPUT_SELECTORS` 默认值、`.env`、`.env.example` 改为
+`form div.ProseMirror[contenteditable="true"]` 优先；`#prompt-textarea` 保留在后面兜底（旧站点）。
+`BrowserInputMixin` 补 `dom: Any` 宿主契约声明（与 `PagePoolMixin.page` / `ReplyWaiterMixin.dom`
+同一手法），消掉既有 attr-defined 报错。
+
+**验证（单测 + 静态）**：`tests/test_input_clear.py` +3 例（候选去重 + 可见优先；第一个候选读回为空时
+换下一个；全不吃输入时返回 `None`）；`tests/test_page_recovery.py` +1 例（`ChatGPTComposerError` →
+只新开一条页面、用播种 prompt 重发、不轮转）；`tests/test_session_linking.py` 改为断言临时 ID 被拒
+（`%3A` 与字面冒号两种写法 + `WEB:`）并保留「只拒临时名字空间、其余形态照收」，该文件现共 **41 例**。
+全量回归（2026-10-10，`-p no:randomly` 与默认两种跑法结果一致）：
+`pytest -q` → **612 passed / 17 skipped / 81 subtests passed**（45.5s，0 failed / 0 error）；
+`ruff check` 在本次改动的 **12 个 Python 文件**（9 个源文件 + 3 个测试文件）上 `All checks passed!`；`mypy chatgpt_web` →
+38 errors（< 改动前基线 39）。**无失败检查、无跳过的断言语义改动**。
+
+**真机复测（改后；profile 副本 + headless，未发送任何消息）**：拿正在服役的登录 profile **副本**新开页面，
+跑真实代码路径 —— `dom.input_candidates(page)` 只给出 **1 个**候选，且正是首选选择器命中的那个
+（`aria-label="Ask ChatGPT"`、`role=textbox`、位于 `form` 内）→ `_fill_prompt(page, …)` 返回句柄、
+读回标记文本成功 → `_clear_input` 清空草稿后读回 `''`。桥自己的 `user_data` 只被**复制读取**，
+探针从未提交发送；探针脚本与 profile 副本都放在 `/tmp`，跑完已删除（`user_data` 无残留、无新的
+会话条目）。
+
+**交付清单**（15 个已跟踪文件被修改、`.env` 本地同步，另新增 `doc/session_linking_port.md`）：
+`chatgpt_web/errors.py`（`ChatGPTComposerError`）、
+`chatgpt_web/chat_io.py`（阶梯并列 + `_recovery_reason`）、`chatgpt_web/reply_waiter.py`（改抛可恢复异常）、
+`chatgpt_web/browser_input.py`（逐候选试填）、`chatgpt_web/browser/dom_adapter.py`（`input_candidates`）、
+`chatgpt_web/config/_core.py` + `.env` + `.env.example`（选择器重排）、`chatgpt_web/linking.py`（临时 ID 拒绝 / 转义比对）、
+`chatgpt_web/page_pool.py` + `chatgpt_web/metrics.py`（落地校验 + `session_link_miss_total`）、
+`README.md`、`doc/session_linking_port.md`（新增移植指南，已含临时 ID 与候选枚举两条真机坑）、
+`tests/test_input_clear.py` / `tests/test_page_recovery.py` / `tests/test_session_linking.py`、
+`doc/update.md`（本文，§2.16–§2.18）。
+
+**未覆盖 / 待办**：
+
+* **多编辑器退化态未在改后真机重现**：干净加载只有 1 个候选，那台机器上「为什么退化出 3 个
+  `ProseMirror`」仍只有现象取证、触发过程未复现 —— 该分支靠单测覆盖（首候选读回为空 → 落到下一候选），
+  缺一次真机级证据（可考虑把退化 DOM 固化成 Playwright 夹具）。
+* **修复尚未生效**：监听 `:8002` 的桥进程（PID 41783）于 20:53:20 启动，而这批文件 21:11 才改完 ——
+  现役进程仍跑旧选择器与旧阶梯，需**重启桥**才生效（重启丢掉的是页面池，会话绑定与轮转状态已落盘）。
+
+**为什么第 4 条留了额度上限**：退化态的触发过程未复现（洁净副本同一条会话正常），所以 composer 故障
+只给一次「新开页面后重发」，不做无上限重试（每一次重建都在真实地新开标签页）。
 
 ---
 
@@ -760,6 +884,8 @@ pgrep -fl 'uvicorn chatgpt_api_server'
 
 ## 附录 B：本次未完成的工作
 
+- （2026-10-10 增补）§2.16–§2.18 的真机收尾仍留两项：**退化态未复现**（多编辑器触发过程未知，只靠单测覆盖）
+  与**现役桥进程未重启**（修复在重启后才生效）。详见 §2.18「未覆盖 / 待办」。
 - §2.2 的**分桶隔离确认实验**已由用户判定关闭（无须验证、非设计需求；T0.1/T1.2 = WONTFIX），探测草稿 `/tmp/iso_test.py` 仅作留档，不修改 D2 用例、不计入门禁。
 - 本次 E2E 为**单次运行**，`C1/C2` 存在模型非确定性的可能；建议连续跑 2–3 次再定性。
 - 本文件为分析文档，未修改任何源码或测试；`pytest -q` 的 219 passed / 24 skipped 为既有基线。

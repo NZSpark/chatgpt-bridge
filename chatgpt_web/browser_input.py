@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Any
 
 from . import config
 from .errors import (
@@ -16,6 +17,12 @@ logger=logging.getLogger(__name__)
 
 class BrowserInputMixin:
     """Input-side browser operations kept separate from reply polling."""
+
+    #: 宿主（``ChatIOMixin`` 组合）提供的 DOM adapter。
+    #: 显式声明宿主契约（与 ``page_pool.PagePoolMixin.page`` /
+    #: ``reply_waiter.ReplyWaiterMixin.dom`` 同一手法）：mixin 单独检查时看不到宿主属性，
+    #: 不声明就会报 attr-defined。
+    dom: Any
 
     _ENTER_JS = """
     (el) => {
@@ -83,37 +90,58 @@ class BrowserInputMixin:
           播种重放历史**后重发。旧实现一律抛普通 ``RuntimeError``，阶梯不接，
           于是「请检查登录状态」成了永久结局，而调用方再也不会重试。
         * 页面还在、JS 也响应，只是 composer 不吃输入（改版 / 未登录 / 被弹层或
-          额度提示遮挡）→ 返回 None：重开页面修不好，交给上层如实报错。
+          额度提示遮挡）→ 返回 None：交给上层按可恢复故障报错（上层会再给一次
+          「重开页面后重发」的机会，见 ``reply_waiter`` / ``chat_io`` 的阶梯）。
+
+        **候选逐个试填**（2026-10-10 第二例真机故障）：页面 DOM 退化时同一页会出现多个
+        ProseMirror 编辑器（干净加载只有 1 个），第一个 attached 的往往点不动、
+        ``innerText`` 读回为空。这里对 :meth:`~chatgpt_web.browser.dom_adapter.ChatGPTDOMAdapter.input_candidates`
+        给出的**全部候选**逐个试填并校验读回，读到非空才算成功——不再「定位一个填一个」。
+        （旧注释里「重开页面修不好 composer 不吃输入」的结论已被真机复测推翻：
+        干净加载的同一条会话只有一个 composer，重开页面确实能修好这种退化。）
         """
         retries = max(1, config.FILL_RETRIES)
         timeout = max(1000, config.FILL_TIMEOUT_MS)
         for attempt in range(retries):
-            chat_input = await self._find_input(page)
-            if not chat_input:
+            # 每次重试都**重新枚举**候选：React 重挂载后旧句柄会失效，候选集合本身
+            # 也可能变（退化页面里多出来的编辑器会随视图收回而消失）。
+            candidates = await self.dom.input_candidates(page)
+            if not candidates:
                 logger.warning(f"[输入] 第 {attempt + 1}/{retries} 次重试：未定位到输入框。")
                 await asyncio.sleep(0.5)
                 continue
-            try:
-                await self._call_fill(page, chat_input, prompt, timeout)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[输入] 第 {attempt + 1}/{retries} 次输入失败：{exc!r}")
-                await asyncio.sleep(0.5)
-                continue
-            # contenteditable 的 fill 可能“成功”但内容为空，必须校验。
-            # 真实 composer 读到空时，额外用 input_value/value 兜底探测。
-            try:
-                text = await self._complete_text(chat_input)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[输入] 第 {attempt + 1}/{retries} 次读取文本异常：{exc!r}")
-                text = ""
-            if text and text.strip():
-                if config.DEBUG:
-                    logger.debug(f"[输入] fill 成功，读到 {len(text)} 字符。")
-                return chat_input
-            logger.warning(
-                f"[输入] fill 第 {attempt + 1}/{retries} 次后内容为空"
-                f"（读到 {text!r}），重试。"
-            )
+            for index, chat_input in enumerate(candidates, start=1):
+                try:
+                    await self._call_fill(page, chat_input, prompt, timeout)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[输入] 第 {attempt + 1}/{retries} 次、候选 {index}/{len(candidates)}"
+                        f" 输入失败：{exc!r}"
+                    )
+                    continue
+                # contenteditable 的 fill 可能“成功”但内容为空，必须校验。
+                # 真实 composer 读到空时，额外用 input_value/value 兜底探测。
+                try:
+                    text = await self._complete_text(chat_input)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[输入] 第 {attempt + 1}/{retries} 次、候选 {index}/{len(candidates)}"
+                        f" 读取文本异常：{exc!r}"
+                    )
+                    text = ""
+                if text and text.strip():
+                    if config.DEBUG:
+                        logger.debug(
+                            f"[输入] fill 成功（候选 {index}/{len(candidates)}），"
+                            f"读到 {len(text)} 字符。"
+                        )
+                    return chat_input
+                # 读到空 = 这一份候选是个僵尸编辑器（点不动 / 内容没落到活文档上）。
+                # 换**下一个候选**，而不是对着同一个元素重试。
+                logger.warning(
+                    f"[输入] 第 {attempt + 1}/{retries} 次、候选 {index}/{len(candidates)}"
+                    f" 填后内容为空（读到 {text!r}）。"
+                )
             await asyncio.sleep(0.5)
         # 次数用光：先判页面是否已经失效——崩溃 / 挂起的渲染进程读回来就是空串
         # （写进 composer 的字节没有落到活的文档上），这类故障可自愈。

@@ -50,29 +50,53 @@ class ChatGPTDOMAdapter(DiagnosticsMixin):
     ANIMATED_JS = selectors.ANIMATED_JS
     GENERATING_JS = selectors.GENERATING_JS
     STOP_CANDIDATES_JS = selectors.STOP_CANDIDATES_JS
-    CAP_CHECK_JS_TEMPLATE = selectors.CAP_CHECK_JS_TEMPLATE
+    CAP_CHECK_JS_TEMPLATE = selectors.CAP_CHECK_JS_TEMPLATE    #: 候选去重标记：JS expando（不是 DOM 属性，不触发 MutationObserver，也不需要清理）。
+    _INPUT_CANDIDATE_MARK_JS = """
+    (el) => {
+      if (!el.__bridgeInputCandidate) {
+        window.__bridgeInputCandidateSeq = (window.__bridgeInputCandidateSeq || 0) + 1;
+        el.__bridgeInputCandidate = 'c' + window.__bridgeInputCandidateSeq;
+      }
+      return el.__bridgeInputCandidate;
+    }
+    """
 
-    async def find_input(self, page):
-        """Find the composer using attached-state fallback selectors.
+    async def input_candidates(self, page) -> List[Any]:
+        """composer 的**全部**候选：可见的排在前面，同一元素只出现一次。
 
-        **只有超时才算「没命中」**（P0-J）：页面已关闭 / 渲染进程崩溃时
-        ``wait_for_selector`` 会**立刻**抛 ``TargetClosedError``，旧实现把它也
-        归进「尝试过的选择器」列表，于是上层提示用户去检查登录，页面池里却留着
-        一具尸体——该桶从此永久失败。这里改成抛
-        :class:`~chatgpt_web.errors.ChatGPTPageLostError`，让重试阶梯重建页面。
+        真机故障（2026-10-10，第二例）：页面 DOM 退化时同一页会出现多个 ProseMirror
+        编辑器（干净加载只有 1 个），而**第一个 attached 的往往不是真正可输入的
+        composer**——点不动、读回为空。旧实现「第一个命中就返回」把它当成输入框，
+        prompt 填进一个僵尸节点，重试三次全失败后报「请检查登录状态」。
 
-        页面活着但选择器全不中（改版 / 未登录 / 弹层遮挡）仍返回 ``None``，
-        并把现场信息（URL / readyState / 命中数 / 弹层 / 登录墙）留在
-        ``last_input_probe`` 里，供上层错误文案与日志使用（不回显正文）。
+        这里只负责**枚举**，由调用方逐个试填并校验读回
+        （``browser_input._fill_prompt``）。可见性只用于**排序**、不做过滤：真 composer
+        在部分状态下会被 Playwright 判为 not visible（见 config.INPUT_SELECTORS 注释），
+        过滤掉它反而会让功能彻底失效。
+
+        契约：页面已关闭 / 渲染进程崩溃 → ``ChatGPTPageLostError``；页面活着但一条都没
+        命中 → ``[]``（现场留给 :meth:`find_input` 的 ``last_input_probe``）。
         """
         if not page_alive(page):
             raise ChatGPTPageLostError(f"定位对话输入框失败：{page_lost_reason(page)}")
-        errors = []
+        candidates: List[Any] = []
+        marks: set = set()
+        errors: List[str] = []
         for selector in config.INPUT_SELECTORS:
+            selector = (selector or "").strip()
+            if not selector:
+                continue
+            waited = None
+            handles: List[Any] = []
             try:
-                element = await page.wait_for_selector(
-                    selector, timeout=2000, state="attached"
-                )
+                if not candidates:
+                    # 只有在还没拿到任何候选时才等待：否则一旦某条选择器在新站点上
+                    # 永久失效（如 #prompt-textarea），每次填充都会为它白等一次超时。
+                    waited = await page.wait_for_selector(
+                        selector, timeout=2000, state="attached"
+                    )
+                if hasattr(page, "query_selector_all"):
+                    handles = await page.query_selector_all(selector)
             except Exception as exc:  # noqa: BLE001
                 if is_page_lost_error(exc) or not page_alive(page):
                     raise ChatGPTPageLostError(
@@ -80,16 +104,56 @@ class ChatGPTDOMAdapter(DiagnosticsMixin):
                     ) from exc
                 errors.append(f"{selector}: {exc}")
                 continue
-            if element:
-                if config.DEBUG:
-                    logger.debug("[输入] 命中选择器：%s", selector)
-                self.last_input_probe = ""
-                return element
-            errors.append(f"{selector}: 未命中")
+            if not handles and waited is not None:
+                # 只实现了 wait_for_selector 的页面对象（测试替身 / 旧版宿主）：
+                # 把那次命中的句柄当成唯一候选，别把「能定位到」变成「定位不到」。
+                handles = [waited]
+            for handle in handles or []:
+                mark = None
+                try:
+                    mark = await handle.evaluate(self._INPUT_CANDIDATE_MARK_JS)
+                except Exception:  # noqa: BLE001
+                    mark = None
+                if mark is not None:
+                    if mark in marks:
+                        continue
+                    marks.add(mark)
+                candidates.append(handle)
+        if not candidates:
+            for line in errors:
+                logger.info("        - %s", line)
+            return []
+        visible: List[Any] = []
+        fallback: List[Any] = []
+        for handle in candidates:
+            try:
+                is_visible = await handle.is_visible()
+            except Exception:  # noqa: BLE001
+                is_visible = False
+            (visible if is_visible else fallback).append(handle)
+        return visible + fallback
+
+    async def find_input(self, page):
+        """定位 composer 的**首选**候选（完整候选见 :meth:`input_candidates`）。
+
+        **只有超时才算「没命中」**（P0-J）：页面已关闭 / 渲染进程崩溃时
+        ``wait_for_selector`` 会**立刻**抛 ``TargetClosedError``，旧实现把它也
+        归进「尝试过的选择器」列表，于是上层提示用户去检查登录，页面池里却留着
+        一具尸体——该桶从此永久失败。这里改成抛
+        :class:`~chatgpt_web.errors.ChatGPTPageLostError`，让重试阶梯重建页面。
+
+        页面活着但选择器全不中（改版 / 未登录 / 弹层遮挡）仍返回 ``None``，并把现场信息
+        （URL / readyState / 命中数 / 弹层 / 登录墙）留在
+        ``last_input_probe`` 里，供上层错误文案与日志使用（不回显正文）。
+        """
+        candidates = await self.input_candidates(page)
+        if candidates:
+            if config.DEBUG:
+                logger.debug("[输入] 命中输入框候选 %d 个，取第一个。", len(candidates))
+            self.last_input_probe = ""
+            return candidates[0]
         self.last_input_probe = await self.input_probe(page)
         logger.warning("[输入] 未找到输入框（页面仍在运行）。%s", self.last_input_probe)
-        for line in errors:
-            logger.info("        - %s", line)
         return None
 
     def input_probe_hint(self) -> str:

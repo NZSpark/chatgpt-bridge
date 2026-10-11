@@ -9,6 +9,7 @@ from . import config
 from .completion.generator import EndState, build_end_limits, evaluate_poll
 from .errors import (
     DEFAULT_SESSION_KEY,
+    ChatGPTComposerError,
     ChatGPTPageLostError,
     ChatGPTTimeoutError,
     page_alive,
@@ -133,14 +134,19 @@ class ReplyWaiterMixin:
             filled = await self._fill_prompt(page, prompt)
             if filled is None:
                 # 能走到这里说明页面**还活着且能执行 JS**（页面已失效的会在
-                # _fill_prompt 里抛 ChatGPTPageLostError → 阶梯新开页面重发）；
-                # 重开页面救不了这种情况，如实报错并带上现场（URL / readyState /
-                # 弹层 / 登录墙 / 选择器命中数），而不是只让用户去查登录状态。
+                # _fill_prompt 里抛 ChatGPTPageLostError → 阶梯新开页面重发），
+                # 但「活着」不等于 composer 可用：真机上页面 DOM 退化（同一页出现多个
+                # ProseMirror 编辑器 / 弹层遮挡）时，填进去读回一直是空。这种退化
+                # **重开页面确实能修好**（干净加载的同一条会话只有一个 composer），
+                # 所以按可恢复故障抛给阶梯重发一次；仍失败才如实报错，并把现场
+                # （URL / readyState / 弹层 / 登录墙 / 命中数）带上。
                 probe = await self.dom.input_probe(page)
-                raise RuntimeError(
+                raise ChatGPTComposerError(
                     "填充输入框失败（多次重试后读回仍为空或 fill 超时）。"
                     "页面仍在运行，请检查登录状态、composer 是否被弹层遮挡，"
                     f"以及 INPUT_SELECTORS 配置（现场：{probe}）。"
+                    "阶梯会按「重开页面后重发」再试一次（PAGE_REBUILD_MAX）；"
+                    "若仍看到这条错误，多半是站点改版或登录态问题。"
                 )
             chat_input = filled
             await self._submit_prompt(page, chat_input)

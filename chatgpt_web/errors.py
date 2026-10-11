@@ -104,6 +104,21 @@ class ChatGPTPageLostError(BrowserError):
     """
 
 
+class ChatGPTComposerError(BrowserError):
+    """页面活着、JS 也响应，但 composer **不接受输入**（填进去读回一直是空）。
+
+    真机（2026-10-10，第二例）：页面 DOM 退化时同一页会出现多个 ProseMirror 编辑器
+    （干净加载只有 1 个），第一个 attached 的那个点不动、读回为空；同一时刻
+    ``#prompt-textarea`` 已失效（实测 0 命中）。
+
+    与 :class:`ChatGPTPageLostError` 的区别只在**排查口径**（页面死没死），恢复动作相同：
+    实测**重开页面能修好**这种退化（干净加载的同一条会话只有一个 composer），
+    因此重试阶梯同样给它一次「新开页面后重发」的机会（共用 ``PAGE_REBUILD_MAX``）。
+    但两类故障**不能**合并：把「页面还活着但站点改版 / 未登录」误诊成页面失效，
+    会永远掩盖真正的配置问题。
+    """
+
+
 #: 页面失效类异常在 Playwright 里的措辞（不依赖 playwright 包，见 page_alive 注释）。
 _PAGE_LOST_TOKENS = (
     "target page, context or browser has been closed",

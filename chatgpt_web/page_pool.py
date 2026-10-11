@@ -349,10 +349,24 @@ class PagePoolMixin(BucketActivityMixin):
         为什么需要它：ChatGPT 网页版有时会自行开启一条新的网页会话（页面就此漂移），
         句柄失效重建时也会落到空白新对话。两种情形都靠这条路径回到用户指定的会话，
         所以一次句柄丢失不会把上下文丢在别处。
+
+        **落地校验**：导航完再比一次 ``page.url``。站点会把不存在 / 已失效的会话地址
+        重定向回首页或新对话（用户手里的 ID 站点不认时就是这样），这时绑定会静默失效，
+        后面每一轮都发进一条陌生会话。这里不抛错（这一轮仍按绑定语义走："绑定 = 已有
+        上下文 → 只发增量" 的判据在 ``link_session``，导航不能推翻它），但会告警 +
+        累加 ``session_link_miss_total``，让「绑定了一条不存在的会话」立刻可见。
         """
         metrics.inc("session_link_navigation_total")
         await page.goto(target, wait_until="domcontentloaded")
         await self._wait_ready(page)
+        landed = page_url(page)
+        if not same_conversation(landed, target):
+            metrics.inc("session_link_miss_total")
+            logger.warning(
+                "[绑定] key=%s 导航后页面停在别处（期望 %s，实际 %s）：该会话地址可能不存在"
+                "或被站点重定向，请用 /link 确认（这一轮仍会发往该地址）%s",
+                bucket, target, landed or "（读不到 URL）", f"（{reason}）" if reason else "",
+            )
         # 目标会话同样要选中「思考模式」，否则回复质量与别的桶不一致
         await self._select_think_mode(page)
         self._touch_page(bucket)

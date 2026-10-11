@@ -363,20 +363,27 @@ RESPONSE_SELECTORS = env_str(
     '[data-message-author-role="assistant"], [data-markdown-text-style], '
     '[class*="MarkdownRoot"], message-content, .markdown',
 )
-# 输入框候选选择器（.env 中用 "||" 分隔多个候选）
-# 实测（真实 DOM）：composer 是 ProseMirror 的 ``div#prompt-textarea``
-# （contenteditable=true, role=textbox, aria-label="Chat with ChatGPT"）。
-# 旧的 ``rich-textarea`` 已不存在；且该元素常被判定为 not visible，
-# 因此定位必须用 state="attached"（见 chat_io._find_input）。
+# 输入框候选选择器（.env 中用 "||" 分隔多个候选）。
+# 2026-10-10 重新校准（真实 DOM）：现役 composer **已没有 id**
+# （``#prompt-textarea`` 实测 0 命中），是 ``form`` 内的 ProseMirror
+# （contenteditable=true, role=textbox, aria-label="Ask ChatGPT"）。
+# 因此把「form 内的 ProseMirror」排在第一位；旧版站点的 ``#prompt-textarea``
+# 仍保留在后面兜底（那个 id 在旧站点上依旧有效）。
+# 页面 DOM 退化时同一页会出现多个 ProseMirror（实测 3 个）：候选**全部**由
+# ``dom_adapter.input_candidates`` 枚举、可见的优先，再由
+# ``browser_input._fill_prompt`` 逐个试填并校验读回——这里的顺序只决定「先试谁」。
+# 且该元素常被判定为 not visible，所以定位必须用 state="attached"。
 INPUT_SELECTORS = [
     s.strip()
     for s in env_str(
         "INPUT_SELECTORS",
-        '#prompt-textarea||div.ProseMirror[contenteditable="true"]||'
+        'form div.ProseMirror[contenteditable="true"]||'
         # :not([data-language]) 排除新版代码块里的 CodeMirror 编辑器
         # （div.cm-content 也是 contenteditable + role=textbox，且有 data-language）。
-        # 不排除的话，一旦 composer 选择器落空，_find_input 会把代码块里的
-        # “编辑代码”编辑器当成输入框，把 prompt 写进回复正文。
+        # 不排除的话，候选枚举会把代码块里的“编辑代码”编辑器也当成输入框，
+        # 把 prompt 写进回复正文。
+        'div.ProseMirror[contenteditable="true"][role="textbox"]:not([data-language])||'
+        'div.ProseMirror[contenteditable="true"]||#prompt-textarea||'
         'div[contenteditable="true"][role="textbox"]:not([data-language])||textarea',
     ).split("||")
     if s.strip()

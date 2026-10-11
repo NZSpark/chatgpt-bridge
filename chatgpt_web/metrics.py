@@ -22,6 +22,7 @@ COUNTERS = (
     "session_recovery_total",
     "session_rotation_total",
     "session_link_navigation_total",
+    "session_link_miss_total",
     "browser_selector_miss_total",
     "reply_extraction_failure_total",
     "tool_call_total",

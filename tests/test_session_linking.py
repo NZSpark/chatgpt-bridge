@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chatgpt_web import config, linking, server  # noqa: E402
 from chatgpt_web.driver import DEFAULT_SESSION_KEY, ChatGPTWebDriver  # noqa: E402
 from chatgpt_web.errors import ChatGPTPageLostError  # noqa: E402
+from chatgpt_web.metrics import metrics  # noqa: E402
 from chatgpt_web.models import ChatMessage  # noqa: E402
 from tests.test_page_recovery import (  # noqa: E402
     _ClosedPage,
@@ -61,6 +62,14 @@ class _RecordingPage(_HealthyPage):
     async def goto(self, url: str, wait_until=None) -> None:
         self.gotos.append(url)
         self.url = url
+
+
+class _RedirectingPage(_RecordingPage):
+    """导航后仍停在别处：模拟「会话地址不存在 / 已失效 → 站点重定向回首页」。"""
+
+    async def goto(self, url: str, wait_until=None) -> None:
+        self.gotos.append(url)
+        self.url = "https://chatgpt.com/"
 
 
 class _LinkTestBase(unittest.TestCase):
@@ -132,6 +141,58 @@ class ConversationUrlTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     linking.canonical_conversation_url(raw)
                 self.assertIn(token, str(ctx.exception))
+
+    def test_accepts_ids_that_are_not_plain_alphanumeric(self) -> None:
+        """ID 是站点自己定的不透明字符串，不能按 UUID / 字母数字写死。
+
+        （只拒客户端的**临时**名字空间 ID，见下一个用例；其余形态照收，
+        ``%XX`` 转义原样保留交给站点自己解码。）
+        """
+        raw = "https://chatgpt.com/c/6ac9c061-5074-83ec-82f0-2f46a8c334ca"
+        self.assertEqual(linking.canonical_conversation_url(raw), raw)
+        self.assertEqual(
+            linking.conversation_id(raw),
+            "6ac9c061-5074-83ec-82f0-2f46a8c334ca",
+        )
+
+    def test_rejects_client_placeholder_ids_with_guidance(self) -> None:
+        """客户端**临时** ID（``local-chatgpt:`` / ``WEB:``）必须在绑定时就拒掉。
+
+        真机（2026-10-10，两次）：客户端在新会话拿到服务端 ID 之前，把地址栏写成
+        ``.../c/local-chatgpt%3A<uuid>``（更早的版本是 ``.../c/WEB:<uuid>``），约 1 秒后
+        替换成正式 ``/c/<uuid>``；拿它去导航站点一律重定向回首页，绑定只会让之后每一轮
+        都发进一条陌生新会话。错误文案必须给出正确取法（先发一条消息再复制）。
+        """
+        for raw in (
+            "https://chatgpt.com/c/local-chatgpt%3Ae03cbb49-722a-4591-8f36-c491762833be",
+            "https://chatgpt.com/c/local-chatgpt:e03cbb49-722a-4591-8f36-c491762833be",
+            "https://chatgpt.com/c/WEB:63e21eb1-5d45-4505-855e-453cf441d696",
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError) as ctx:
+                    linking.canonical_conversation_url(raw)
+                message = str(ctx.exception)
+                self.assertIn("临时", message)
+                self.assertIn("第一条消息", message)
+
+    def test_rejects_ids_that_are_not_one_url_segment(self) -> None:
+        for raw, token in (
+            ("https://chatgpt.com/c/has%zze1", "会话 ID"),   # 非法百分号转义
+            ("https://chatgpt.com/c/has space-here", "会话 ID"),  # 空格
+            (f"https://chatgpt.com/c/{'a' * 300}", "会话 ID"),  # 过长
+            ("https://chatgpt.com/c/new", "会话 ID"),         # 「空白新对话」不算会话
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError) as ctx:
+                    linking.canonical_conversation_url(raw)
+                self.assertIn(token, str(ctx.exception))
+
+    def test_same_conversation_ignores_percent_encoding(self) -> None:
+        """用户给的 ``%3A`` 与地址栏里的 ``:`` 是同一条会话（否则每轮白导航一次）。"""
+        encoded = "https://chatgpt.com/c/abc%3Adef-12345678"
+        literal = "https://chatgpt.com/c/abc:def-12345678"
+        self.assertTrue(linking.same_conversation(encoded, literal))
+        self.assertFalse(linking.same_conversation(encoded, CONVERSATION_URL))
 
     def test_same_conversation_ignores_query_and_trailing_slash(self) -> None:
         self.assertTrue(linking.same_conversation(f"{CONVERSATION_URL}?model=auto", CONVERSATION_URL))
@@ -382,6 +443,49 @@ class LinkedPageTargetingTests(_LinkTestBase):
         with _quiet_setup():
             asyncio.run(driver._ensure_page(DEFAULT_SESSION_KEY))
         self.assertEqual(driver.context.created[0].url, CONVERSATION_URL)
+
+
+class LinkedLandingCheckTests(_LinkTestBase):
+    """绑定地址站点不认时（重定向走），不能静默：日志 + ``session_link_miss_total``。"""
+
+    def _enter(self, driver, page) -> None:
+        with _quiet_setup():
+            asyncio.run(
+                driver._enter_linked_session(
+                    DEFAULT_SESSION_KEY, page, CONVERSATION_URL, reason="发送前对齐"
+                )
+            )
+
+    def test_landing_elsewhere_is_warned_and_counted(self) -> None:
+        driver = self.make_driver()
+        driver.context = _FakeContext()
+        before = metrics.snapshot()["counters"]["session_link_miss_total"]
+
+        with self.assertLogs("chatgpt_web.page_pool", level="WARNING") as logs:
+            self._enter(driver, _RedirectingPage(url=CONVERSATION_URL))
+
+        self.assertEqual(
+            metrics.snapshot()["counters"]["session_link_miss_total"], before + 1,
+            "没落到绑定会话必须留下可观测的痕迹",
+        )
+        self.assertTrue(
+            any("停在别处" in line and CONVERSATION_URL in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_landing_on_the_target_stays_quiet(self) -> None:
+        driver = self.make_driver()
+        driver.context = _FakeContext()
+        page = _RecordingPage()
+        before = metrics.snapshot()["counters"]["session_link_miss_total"]
+
+        self._enter(driver, page)
+
+        self.assertEqual(page.url, CONVERSATION_URL)
+        self.assertEqual(
+            metrics.snapshot()["counters"]["session_link_miss_total"], before,
+            "正常落到目标会话不该计为 miss（否则这条告警会被噪声淹没）",
+        )
 
 
 # ==================== HTTP 端点（/link、/unlink 的 HTTP 版）====================
