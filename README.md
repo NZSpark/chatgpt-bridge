@@ -15,56 +15,97 @@
 - **纯本地**：默认只监听 `127.0.0.1`。
 - **有头运行（必须）**：实测 `HEADLESS=1` 会被 Cloudflare 挑战页拦截（页面停在 `Just a moment...`，输入框/按钮都不渲染），因此默认且有义务使用有头模式 `HEADLESS=false`；无显示服务器用 `xvfb-run` 包一层。
 
-## 项目统计
+## 架构概览
 
-> 统计基于 Git 当前 `main` 分支（2026-10-08）及已跟踪文件，随项目持续演进会变化。
+ChatGPTBridge 将 ChatGPT 网页版包装为本地 OpenAI 兼容服务。它不是官方 API 客户端：请求最终通过 Playwright 操作已登录的 Chromium 页面完成，因此浏览器登录状态、网页 DOM 和站点策略都会影响运行结果。
 
-| 指标 | 当前值 |
-| --- | ---: |
-| Git 已跟踪文件 | 120 |
-| Python 源码文件 | 104 |
-| 测试文件 | 45 |
-| Python 总代码行数 | 19,109 |
-| 测试代码行数 | 9,196 |
-| Git 提交数 | 57 |
-| 顶层目录数 | 11 |
-| 贡献者 | 1 |
-| 首个提交时间 | 2026-10-05 13:15:55 (+13:00) |
-| 最近提交时间 | 2026-10-08 16:39:16 (+13:00) |
-| Git 时间跨度 | 3 天 3 小时 23 分 21 秒 |
-| 开发总历时（首末提交） | 75 小时 23 分 21 秒 |
-| 发生提交的日数 | 4 天 |
-| 平均提交频率 | 14.25 次/提交日 |
+主要请求链路：
+
+```text
+OpenAI SDK / Pi / Codex CLI
+            |
+            v
+FastAPI 路由与 OpenAI 请求模型
+            |
+            v
+Chat Completions / Responses 协议适配
+            |
+            v
+会话分桶、并发协调、任务快照与历史播种
+            |
+            v
+Playwright 浏览器驱动 -> ChatGPT 页面 DOM -> 回复提取
+            |
+            v
+OpenAI 响应 / SSE 流式事件 / 工具调用解析
+```
+
+核心模块按职责划分：
+
+| 层 | 主要模块 | 职责 |
+| --- | --- | --- |
+| HTTP 与协议 | `server.py`、`api/`、`models.py`、`protocol_adapters.py` | 路由、请求模型，以及 Chat Completions / Responses 格式转换 |
+| 浏览器集成 | `browser/`、`browser_input.py`、`chat_io.py`、`driver.py` | Playwright 生命周期、DOM 定位、输入提交、回复和代码块提取 |
+| 生成与流式 | `completion/`、`reply_waiter.py`、`reply_extractor.py`、`end_detection.py`、`streaming.py`、`responses.py` | 生成调度、结束判定、回复提取、SSE 输出与 Responses 事件映射 |
+| 会话与状态 | `session/`、`session_store.py`、`page_pool.py`、`linking.py`、`tasks.py`、`task_state.py` | 会话持久化和绑定、页面池、会话隔离、任务快照与历史恢复 |
+| 工具调用 | `tools/`、`toolcalls.py`、`markdown_io.py` | 工具定义注入、载荷解析与校验、结果序列化，以及受策略限制的 Markdown 编辑 |
+| 配置与运维 | `config/`、`metrics.py`、`logging_setup.py`、`errors.py` | 配置加载、运行指标、日志上下文和错误语义 |
+
+所有主要参数集中在项目根目录的 `.env`，模板为 `.env.example`。默认监听回环地址；浏览器 profile、会话状态和可选输出文件保存在本地目录。
 
 ## 环境要求
 
-- Python 3.10+
-- Playwright + Chromium
+- Python **3.14 或更高版本**（`pyproject.toml` 的 `requires-python` 为 `>=3.14`）。
+- Playwright 及其 Chromium 浏览器。
+- 一个可登录 ChatGPT 网页版的账户；首次启动需要在有头浏览器中完成登录。
+
+安装运行依赖并下载 Chromium：
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -e .
 playwright install chromium
+```
+
+开发和测试依赖：
+
+```bash
+python -m pip install -e '.[dev]'
 ```
 
 ## 快速开始
 
+首次部署时，可复制配置模板（已有 `.env` 时不要覆盖自己的配置）：
+
 ```bash
-# 首次登录：有头模式手动登录 ChatGPT，登录态存入 user_data/
+# 仅在尚无 .env 时执行
+test -f .env || cp .env.example .env
+
+# 首次启动使用有头模式，手动登录 ChatGPT，登录态保存在 user_data/
 HEADLESS=0 python chatgpt_api_server.py
-
-# 之后继续用有头模式（.env 已默认 HEADLESS=false）
-python chatgpt_api_server.py
-
-# 无显示服务器：用 xvfb 包一层有头 Chromium（不要设 HEADLESS=1）
-# xvfb-run -a python chatgpt_api_server.py
 ```
 
-服务默认监听 `http://127.0.0.1:8002`。冒烟测试：
+登录成功后，保持有头模式启动服务：
 
 ```bash
-curl http://127.0.0.1:8002/healthz
+python chatgpt_api_server.py
+```
+
+无显示服务器可通过虚拟显示器运行有头 Chromium，例如：
+
+```bash
+xvfb-run -a python chatgpt_api_server.py
+```
+
+不要为了无显示环境直接设置 `HEADLESS=1`：项目的实际测试观察到，无头模式可能被 Cloudflare 挑战页拦截，导致输入框和按钮不可用。
+
+服务默认监听 `http://127.0.0.1:8002`。检查服务和模型发现：
+
+```bash
+curl -i http://127.0.0.1:8002/healthz
 curl http://127.0.0.1:8002/v1/models
 ```
+
+`/healthz` 反映浏览器初始化状态；需要确认是否具备处理请求的条件时，也可查看 `/readiness`。
 
 ### 客户端接入
 
@@ -186,15 +227,21 @@ codex --profile chatgpt
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/models` | 可用模型列表 |
-| POST | `/v1/chat/completions` | Chat Completions，支持 `stream` |
-| POST | `/v1/responses` | Responses API（受 `ENABLE_RESPONSES_API` 控制） |
-| GET | `/healthz` | 健康检查与 cluster 状态 |
-| POST | `/session/reset` | 重置指定会话桶 |
-| POST | `/session/link` | 把会话桶绑定到指定的网页会话链接（`/link` 指令的 HTTP 版） |
-| POST | `/session/unlink` | 解除会话绑定（下一轮开新会话 + 播种） |
-| GET | `/debug/dom` | DOM 调试（受 `CHATGPT_DEBUG` 控制，不回显正文） |
-| GET | `/` | 服务信息 |
+| GET | `/v1/models` | 返回当前桥接层公开的模型列表 |
+| POST | `/v1/chat/completions` | Chat Completions，支持流式与非流式请求 |
+| POST | `/v1/responses` | Responses API；由 `ENABLE_RESPONSES_API` 控制 |
+| GET | `/healthz` | 基础健康状态、浏览器状态、会话桶与资源信息 |
+| GET | `/readiness` | 检查服务是否具备执行网页请求的最低条件；未就绪时返回 503 |
+| GET | `/metrics` | 进程内请求计数、错误与延迟等运行指标快照 |
+| GET | `/diagnostics` | 汇总 readiness、浏览器、会话、指标和选择器诊断信息 |
+| POST | `/session/reset` | 重置指定会话桶；可通过 `RESET_TOKEN` 保护 |
+| POST | `/session/link` | 将会话桶绑定到指定的 ChatGPT 网页会话 URL |
+| POST | `/session/unlink` | 解除会话绑定 |
+| GET | `/debug/dom` | 当前页面 DOM 诊断；需要 `CHATGPT_DEBUG=true` |
+| GET | `/_debug/selectors` | 返回选择器命中情况；需要 `CHATGPT_DEBUG=true` |
+| GET | `/` | 服务信息与可用端点概览 |
+
+调试路由默认关闭。`/diagnostics`、`/healthz` 等端点可能返回会话桶和运行状态等内部信息，不应直接暴露到公网。
 
 ## 会话绑定（`/link`）：把某一桶保持在指定网页会话上
 
@@ -346,34 +393,36 @@ CHATGPT_E2E=1 E2E_HEADED=1 .venv/bin/python -m unittest tests.e2e.test_dom_probe
 
 ## 项目结构
 
-```
-chatgpt_api_server.py      入口：重导出公开名字 + 启动 uvicorn
+```text
+chatgpt_api_server.py       启动入口与兼容导出
+main.py                    简单入口
 chatgpt_web/
-  config.py               配置加载与全部可调参数
-  models.py               OpenAI 兼容 Pydantic 模型
-  prompting.py            messages -> 输入框文本、token 估算
-  toolcalls.py            工具注入与解析
-  markdown_io.py          Markdown 提取与工具调用解析器
-  driver.py               Playwright 浏览器驱动、会话生命周期
-  chat_io.py              DOM 交互、输入框等待、页面内事件提交与代码块提取
-  linking.py              会话绑定（/link、/unlink）：链接校验与桥内命令
-  session_store.py        会话状态落盘与持久化管理
-  page_pool.py            Playwright Page 实例池管理
-  completion.py           Chat Completions 逻辑处理与重试驱动
-  streaming.py            SSE 流式编码
-  responses.py            Responses API 映射
-  tasks.py                会话桶任务快照
-  server.py               FastAPI 应用与路由
-  end_detection.py        回复结束判定的纯函数状态机
-  errors.py               异常类型与默认值常量
-  logging_setup.py        统一日志配置与 request_id
-doc/tasks.md              任务分解与验收标准
-doc/update.md             项目分析与改进建议（含真实 E2E 结果）
-doc/e2e_test_design.md    E2E 对等测试设计（判定矩阵 / 开关 / 前置条件）
-doc/code_block_fence.md   工具调用载体改造技术报告（纯文本 TOOL_CALL 行 → tool_call 围栏）
-output/                   回复与代码块落盘（gitignore）
-user_data/                浏览器 profile 与状态（gitignore）
+  server.py                 FastAPI 应用、路由、readiness 与诊断端点
+  api/                      Chat Completions、Responses、SSE 协议适配
+  browser/                  浏览器驱动、DOM 适配、选择器与诊断
+  completion/               生成调度、生命周期与回复提取
+  config/                   分领域配置与环境变量加载
+  session/                  会话状态 schema、存储、迁移与并发锁
+  tools/                    工具解析、策略、校验、执行与序列化
+  models.py                 OpenAI 兼容请求/响应模型
+  prompting.py              消息转换、提示词构造与上下文播种
+  browser_input.py          输入框候选定位、填充和清理
+  chat_io.py                页面交互、回复等待及代码块提取
+  linking.py                /link、/unlink 会话绑定逻辑
+  page_pool.py              页面资源池与恢复
+  streaming.py              Chat Completions SSE 编码
+  responses.py              Responses API 兼容层
+  tasks.py / task_state.py  任务快照与任务状态
+  metrics.py                进程内指标
+  logging_setup.py           日志与请求上下文
+
+tests/                      单元、契约、回归与可选端到端测试
+doc/                        设计说明、任务清单、排查记录和端到端测试方案
+output/                     可选输出与备份目录（默认不提交）
+user_data/                  持久化浏览器 profile 与会话状态（默认不提交）
 ```
+
+配置已按职责拆分为 `chatgpt_web/config/` 包；会话存储、生成流程、浏览器、API 适配器和工具执行也分别有独立子包。上表突出常用入口，并非完整文件清单。
 
 ## 设计要点
 
@@ -413,6 +462,16 @@ CI（`.github/workflows/ci.yml`）在 push / PR 上运行同样三条检查。�
 - `user_data/` **不要备份 / 同步**（iCloud、Dropbox 等会带走登录态）；DEBUG 日志不含消息正文。
 - **`edit_markdown` 是模型可控的写文件工具**：只接受沙箱（`EDIT_MARKDOWN_ROOT`，默认项目根）内的相对路径，绝对路径与 `..` 一律拒绝；默认 **dry-run**，只有显式设置 `EDIT_MARKDOWN_WRITE=true` 才会真正落盘（写前自动备份到 `EDIT_MARKDOWN_BACKUP_DIR`）。
 
-## 状态
+## 更多文档
 
-配置、模型、prompting、toolcalls、driver、streaming、responses、server 均已实现；单测见 `tests/`（`pytest -q`），真实网页验证见 `doc/e2e_test_design.md`，任务分解与验收标准见 `doc/tasks.md`。
+- `doc/update.md`：项目分析、改动记录和问题排查经验。
+- `doc/e2e_test_design.md`：真实网页端到端测试的开关、前置条件和判定矩阵。
+- `doc/session_linking_port.md`：会话绑定与恢复实现说明。
+- `doc/tasks.md`、`doc/tasks_pi.md`、`doc/tasks_pi_9.md`：任务分解与验收记录。
+- `doc/code_block_fence.md`：工具调用使用 `tool_call` 围栏的设计背景。
+
+## 当前限制
+
+- 这是对 ChatGPT 网页版的浏览器自动化，不是官方 OpenAI API；网页改版、登录失效、网络状态和站点反自动化策略都可能影响可用性。
+- `pytest -q` 默认不会访问真实 ChatGPT 网页；真实端到端测试需要显式设置 `CHATGPT_E2E=1`，部分浏览器探测还要求 `E2E_HEADED=1`。详细条件见 `doc/e2e_test_design.md`。
+- 默认服务不验证客户端 API Key，并依赖本机浏览器登录态。因此默认仅监听 `127.0.0.1`，不要把服务直接暴露到可信边界之外。
