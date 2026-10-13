@@ -19,6 +19,7 @@ from .errors import (
 from .logging_setup import set_log_context
 from .metrics import metrics
 from .prompting import _delta_piece, estimate_tokens
+from .token_speed import LAST_FIELDS, SUM_FIELDS, compute_speed
 
 logger=logging.getLogger("chatgpt_web.chat_io")
 _EMPTY_NODE_REPORT_AFTER=3
@@ -152,6 +153,9 @@ class ReplyWaiterMixin:
             chat_input = filled
             await self._submit_prompt(page, chat_input)
             generation_started_at = time.monotonic()
+            first_text_at: Optional[float] = None
+            finished_at: Optional[float] = None
+            rewritten = False
 
             # 2. 轮询等待回复完成
             await asyncio.sleep(config.POLL_INTERVAL_S)
@@ -219,6 +223,9 @@ class ReplyWaiterMixin:
                     or (len(responses) > before_count)
                     or saw_generating
                 )
+                # 网页没有 token 级事件：记录第一次轮询到非空回复的时刻，作为 TTFT 代理。
+                if first_text_at is None and reply_seen and normalized:
+                    first_text_at = time.monotonic()
 
                 # 1.1 还没有新回复时，周期性检查是否“会话到顶”，
                 #     并主动探测「生成中」：这是唯一能证明本轮已开始、
@@ -276,6 +283,7 @@ class ReplyWaiterMixin:
 
                 if verdict.action == "finish":
                     last_text = current_text
+                    finished_at = time.monotonic()
                     if past_deadline:
                         logger.warning("[超时] %s", verdict.note)
                     elif config.DEBUG and verdict.note:
@@ -323,7 +331,11 @@ class ReplyWaiterMixin:
                     # 2.3 生成过程中吐出增量，供 SSE 使用。
                     #     用「已发送内容」的公共前缀做 diff，即使节点中途重排也不会漏字
                     if on_delta is not None:
-                        piece, streamed = _delta_piece(streamed, current_text)
+                        piece, new_streamed = _delta_piece(streamed, current_text)
+                        if piece is None and current_text != streamed:
+                            # 非前缀：节点被整体替换 / 重排，on_delta 曾回退。
+                            rewritten = True
+                        streamed = new_streamed
                         if piece:
                             await on_delta(piece)
                     last_text = current_text
@@ -351,10 +363,38 @@ class ReplyWaiterMixin:
             metrics.observe("reply_extraction_latency", time.monotonic() - extraction_started_at)
             metrics.observe("browser_generation_latency", time.monotonic() - generation_started_at)
 
+            # 3.1 记录本轮速度估算。扣除的静默时间仅作为保守修正，所有数值仍是
+            # 浏览器轮询链路的观测值，不等同于模型 API 的精确 token usage。
+            speed = compute_speed(
+                prompt,
+                last_text,
+                submitted_at=generation_started_at,
+                first_text_at=first_text_at,
+                finished_at=finished_at if finished_at is not None else time.monotonic(),
+                poll_interval_s=config.POLL_INTERVAL_S,
+                settle_credit_s=(
+                    max(0, int(config.RESUME_QUIET_POLLS)) * max(0.0, config.POLL_INTERVAL_S)
+                ),
+                saw_generating=saw_generating,
+                streamed=on_delta is not None,
+                rewritten=rewritten,
+            )
+
             # 4. 更新会话状态：已建立历史，并累计体积；超预算则下一轮轮转
             state.has_history = True
             state.turns += 1
             state.est_tokens += estimate_tokens(prompt) + estimate_tokens(last_text)
+            if speed is not None:
+                self._last_speeds[bucket] = speed
+                state.speed_samples += 1
+                for field, attr in SUM_FIELDS:
+                    setattr(state, field, getattr(state, field) + getattr(speed, attr))
+                for field, attr in LAST_FIELDS:
+                    value = getattr(speed, attr)
+                    # e2e_* 在非流式路径为 None：清零，避免残留上一轮流式的旧值。
+                    setattr(state, field, 0.0 if value is None else value)
+                # 本轮是否流式由 LAST_FIELDS 的 speed_last_streamed 一并写入；
+                # 流式层收尾时再用 record_streaming_e2e 覆盖为 True。
             state.last_error = None
             # 成功建立历史：清空连续到顶计数，恢复正常预算
             state.cap_failures = 0

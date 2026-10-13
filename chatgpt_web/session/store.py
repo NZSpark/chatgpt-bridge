@@ -89,6 +89,7 @@ class SessionStoreMixin:
         for bucket in candidates[: max(0, len(self._sessions) - limit)]:
             self._sessions.pop(bucket, None)
             self._last_prompts.pop(bucket, None)
+            self._last_speeds.pop(bucket, None)
 
     def _page_for(self, key: Optional[str] = None):
         """取出某个会话桶的页面；默认桶就是 ``self.page``。"""
@@ -100,6 +101,10 @@ class SessionStoreMixin:
     def sent_prompt(self, key: Optional[str] = None) -> Optional[str]:
         """某个会话桶最近一次真正发给网页版的 prompt（可能因轮转由增量改选播种版）。"""
         return self._last_prompts.get(key or DEFAULT_SESSION_KEY)
+
+    def last_speed(self, key: Optional[str] = None):
+        """某个会话桶最近一次成功生成的基础 TokenSpeed（仅内存）。"""
+        return self._last_speeds.get(key or DEFAULT_SESSION_KEY)
 
     # ---- 默认桶的状态：保留为属性，兼容既有调用与测试 ----
     @property
@@ -274,8 +279,54 @@ class SessionStoreMixin:
             "last_error": state.last_error,
             # 连续“到顶”失败次数：>=2 时播种内容会被自动压缩（防死循环）
             "cap_failures": getattr(state, "cap_failures", 0),
+            # /bridge token：当前桶的滚动速度统计与最近一次样本。
+            "speed_samples": state.speed_samples,
+            "speed_prefill_tps_sum": state.speed_prefill_tps_sum,
+            "speed_decode_tps_sum": state.speed_decode_tps_sum,
+            "speed_ttft_s_sum": state.speed_ttft_s_sum,
+            "speed_decode_s_sum": state.speed_decode_s_sum,
+            "speed_prompt_tokens_sum": state.speed_prompt_tokens_sum,
+            "speed_reply_tokens_sum": state.speed_reply_tokens_sum,
+            "speed_last_prompt_tokens": state.speed_last_prompt_tokens,
+            "speed_last_reply_tokens": state.speed_last_reply_tokens,
+            "speed_last_ttft_s": state.speed_last_ttft_s,
+            "speed_last_decode_s": state.speed_last_decode_s,
+            "speed_last_total_s": state.speed_last_total_s,
+            "speed_last_prefill_tps": state.speed_last_prefill_tps,
+            "speed_last_decode_tps": state.speed_last_decode_tps,
+            "speed_last_e2e_ttft_s": state.speed_last_e2e_ttft_s,
+            "speed_last_e2e_decode_tps": state.speed_last_e2e_decode_tps,
+            "speed_last_bridge_overhead": state.speed_last_bridge_overhead,
+            "speed_last_saw_generating": state.speed_last_saw_generating,
+            "speed_last_streamed": state.speed_last_streamed,
+            "speed_last_rewritten": state.speed_last_rewritten,
             "buckets": self.session_keys(),
         }
+
+    def record_streaming_e2e(
+        self,
+        key: Optional[str],
+        *,
+        e2e_ttft_s: Optional[float],
+        e2e_decode_tps: Optional[float],
+        bridge_overhead_ratio: Optional[float],
+    ) -> None:
+        """把流式层测得的端到端指标补写到当前桶「最近一次」样本上。
+
+        非流式路径不调用；流式层在生成器收尾时调用一次。只覆盖 e2e_* 与
+        streamed 标记，不动已由 reply_waiter 写好的观测速度。
+        """
+        state = self._state(key)
+        if e2e_ttft_s is not None:
+            state.speed_last_e2e_ttft_s = max(0.0, float(e2e_ttft_s))
+        if e2e_decode_tps is not None:
+            state.speed_last_e2e_decode_tps = max(0.0, float(e2e_decode_tps))
+        if bridge_overhead_ratio is not None:
+            state.speed_last_bridge_overhead = max(
+                0.0, min(1.0, float(bridge_overhead_ratio))
+            )
+        state.speed_last_streamed = True
+        self._save_session_state(key)
 
     def _session_over_budget(self, key: Optional[str] = None) -> bool:
         """会话体积是否已达到轮转阈值（0 表示禁用该维度）。"""

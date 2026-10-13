@@ -24,6 +24,26 @@ _SESSION_FIELDS = frozenset({
     "pending_reseed",
     "think_mode",
     "save_files",
+    "speed_samples",
+    "speed_prefill_tps_sum",
+    "speed_decode_tps_sum",
+    "speed_ttft_s_sum",
+    "speed_decode_s_sum",
+    "speed_prompt_tokens_sum",
+    "speed_reply_tokens_sum",
+    "speed_last_prompt_tokens",
+    "speed_last_reply_tokens",
+    "speed_last_ttft_s",
+    "speed_last_decode_s",
+    "speed_last_total_s",
+    "speed_last_prefill_tps",
+    "speed_last_decode_tps",
+    "speed_last_e2e_ttft_s",
+    "speed_last_e2e_decode_tps",
+    "speed_last_bridge_overhead",
+    "speed_last_saw_generating",
+    "speed_last_streamed",
+    "speed_last_rewritten",
 })
 
 
@@ -84,6 +104,29 @@ class SessionState:
     # ``/bridge settings save-files``：该桶的代码块落盘偏好（None = 跟随 config.SAVE_FILES）。
     # 请求体里的 save_files 仍然优先级最高（显式声明 > 本桶偏好 > 全局配置）。
     save_files: Optional[bool] = None
+    # /bridge token：会话桶内滚动统计。sum + sample count 可跨重启恢复，
+    # 只保留聚合值和最近一次样本，避免状态文件随请求次数不断膨胀。
+    speed_samples: int = 0
+    speed_prefill_tps_sum: float = 0.0
+    speed_decode_tps_sum: float = 0.0
+    speed_ttft_s_sum: float = 0.0
+    speed_decode_s_sum: float = 0.0
+    speed_prompt_tokens_sum: int = 0
+    speed_reply_tokens_sum: int = 0
+    speed_last_prompt_tokens: int = 0
+    speed_last_reply_tokens: int = 0
+    speed_last_ttft_s: float = 0.0
+    speed_last_decode_s: float = 0.0
+    speed_last_total_s: float = 0.0
+    speed_last_prefill_tps: float = 0.0
+    speed_last_decode_tps: float = 0.0
+    # 端到端（仅流式路径；非流式保持 0.0，命令据此判断要不要显示端到端行）。
+    speed_last_e2e_ttft_s: float = 0.0
+    speed_last_e2e_decode_tps: float = 0.0
+    speed_last_bridge_overhead: float = 0.0
+    speed_last_saw_generating: bool = False
+    speed_last_streamed: bool = False
+    speed_last_rewritten: bool = False
 
     def to_payload(self) -> Dict[str, Any]:
         return asdict(self)
@@ -93,14 +136,34 @@ class SessionState:
         state = cls()
         if not isinstance(payload, dict):
             return state
-        for name in ("has_history", "cap_hit", "pending_rotation", "pending_reseed"):
+        for name in (
+            "has_history", "cap_hit", "pending_rotation", "pending_reseed",
+            "speed_last_saw_generating", "speed_last_streamed",
+            "speed_last_rewritten",
+        ):
             if name in payload:
                 setattr(state, name, bool(payload.get(name)))
-        for name in ("turns", "est_tokens", "updated_at", "cap_failures"):
+        for name in (
+            "turns", "est_tokens", "updated_at", "cap_failures", "speed_samples",
+            "speed_prompt_tokens_sum", "speed_reply_tokens_sum",
+            "speed_last_prompt_tokens", "speed_last_reply_tokens",
+        ):
             try:
-                setattr(state, name, int(payload.get(name) or 0))
+                setattr(state, name, max(0, int(payload.get(name) or 0)))
             except (TypeError, ValueError):
                 setattr(state, name, 0)
+        for name in (
+            "speed_prefill_tps_sum", "speed_decode_tps_sum", "speed_ttft_s_sum",
+            "speed_decode_s_sum", "speed_last_ttft_s", "speed_last_decode_s",
+            "speed_last_total_s", "speed_last_prefill_tps", "speed_last_decode_tps",
+            "speed_last_e2e_ttft_s", "speed_last_e2e_decode_tps",
+            "speed_last_bridge_overhead",
+        ):
+            try:
+                value = float(payload.get(name) or 0.0)
+                setattr(state, name, value if value >= 0 and value < float("inf") else 0.0)
+            except (TypeError, ValueError):
+                setattr(state, name, 0.0)
         last_error = payload.get("last_error")
         state.last_error = last_error if isinstance(last_error, str) else None
         linked = payload.get("linked_url")

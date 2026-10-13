@@ -25,6 +25,7 @@ from ..models import (
     Usage,
 )
 from ..prompting import build_prompt, estimate_tokens, tool_nudge_predicate
+from ..token_speed import augment_e2e
 from ..protocol_adapters import (
     chat_sse_choice_for_event,
     completed_text,
@@ -66,6 +67,33 @@ async def stream_chat_completion(
     created = int(time.time())
     model = request.model
     wants_tools = bool(request.tools) and request.tool_choice != "none"
+    # 端到端观测（仅流式）：t0 = 进入本生成器；首个正文 chunk；[DONE]。
+    # 用 perf_counter 与 token_speed 的单调时钟一致。
+    request_started_at = time.perf_counter()
+    first_sse_at: Optional[float] = None
+    done_at: Optional[float] = None
+
+    def _finish_e2e() -> None:
+        """在生成器收尾时把端到端指标补写到当前桶最近一次样本。"""
+        nonlocal done_at
+        if done_at is None:
+            done_at = time.perf_counter()
+        speed = driver.last_speed(session_key) if hasattr(driver, "last_speed") else None
+        recorder = getattr(driver, "record_streaming_e2e", None)
+        if speed is None or not callable(recorder):
+            return
+        augmented = augment_e2e(
+            speed,
+            request_started_at=request_started_at,
+            first_sse_at=first_sse_at,
+            done_at=done_at,
+        )
+        recorder(
+            session_key,
+            e2e_ttft_s=augmented.e2e_ttft_s,
+            e2e_decode_tps=augmented.e2e_decode_tps,
+            bridge_overhead_ratio=augmented.bridge_overhead_ratio,
+        )
 
     def encode(delta: Optional[Dict[str, Any]], finish: Optional[str] = None,
                choices: Optional[list] = None) -> str:
@@ -220,6 +248,8 @@ async def stream_chat_completion(
 
         if kind == "delta":
             streamed = True
+            if first_sse_at is None and payload:
+                first_sse_at = time.perf_counter()
             choice = chat_sse_choice_for_event(AssistantTextDelta(payload))
             assert choice is not None  # 文本增量一定被适配器投影为 choice（断言只为类型收窄）
             yield encode(choice["delta"], finish=choice["finish_reason"])
@@ -230,6 +260,7 @@ async def stream_chat_completion(
     await task
 
     if error:
+        _finish_e2e()
         yield f"data: {json.dumps({'error': {'message': error, 'type': error_type}}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -250,6 +281,8 @@ async def stream_chat_completion(
     else:
         if not streamed and reply_content:
             for piece in chunk_text(reply_content):
+                if first_sse_at is None and piece:
+                    first_sse_at = time.perf_counter()
                 choice = chat_sse_choice_for_event(AssistantTextDelta(piece))
                 assert choice is not None  # 文本增量一定被适配器投影为 choice
                 yield encode(choice["delta"], finish=choice["finish_reason"])
@@ -277,6 +310,7 @@ async def stream_chat_completion(
         }
         yield f"data: {json.dumps(usage_payload, ensure_ascii=False)}\n\n"
 
+    _finish_e2e()
     yield "data: [DONE]\n\n"
 
 

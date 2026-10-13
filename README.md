@@ -292,6 +292,7 @@ codex --profile chatgpt
 /bridge help [session|settings]       # 命令列表 / 分主题帮助（只读）
 /bridge status                        # 桥接 + 当前桶的状态摘要（只读）
 /bridge models                        # 本桥公布的模型名，与 GET /v1/models 同源（只读）
+/bridge token                         # 当前桶的 token 估算与 prefill/decode 速度（只读）
 /bridge session [status]              # 当前桶的会话状态摘要（只读）
 /bridge session reset                 # 下一轮开新网页会话 + 播种完整历史（改状态）
 /bridge session reseed                # 下一轮把完整历史再播种一遍（改状态，一次性）
@@ -318,6 +319,12 @@ codex --profile chatgpt
   切换失败时回复会**如实报告**（例如页面上找不到控件、站点不允许关闭），不会谎报已切换。
 - **兼容别名不变**：`/link`、`/unlink` 继续可用；`/bridge session link|unlink` 与它们共用同一套
   校验、绑定与文案。
+- **`/bridge token` 是观测估算，不是模型裸速度**：网页端没有 token 级事件，token 数由字符长度
+  估算（≈ 字符数 / 3）；prefill 速度 = 输入 token / 首字延迟（首字延迟含网页合成与半轮询周期，
+  故偏小），decode 速度 = 输出 token / 解码时长（已扣可归因的落定静默窗口）。命令会分别给出
+  「最近一次」与本桶「滚动平均」，并标注口径。流式路径还会显示端到端指标（首个正文 chunk 的
+  TTFT、流式 decode 速度、桥接开销占比）；回复过短或发生重写时会附「仅供参考」提示。只统计
+  成功的生成，只输出计数与时长，不回显正文。
 
 ## 配置
 

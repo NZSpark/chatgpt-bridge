@@ -46,6 +46,40 @@ class FakeDriver:
         return self.reply, []
 
 
+class E2ETimingDriver(FakeDriver):
+    """带 last_speed / record_streaming_e2e 的 fake，用于验证流式端到端补写。"""
+
+    def __init__(self, reply="r" * 300):
+        super().__init__(reply=reply)
+        from chatgpt_web.token_speed import compute_speed
+
+        # 一次成功的「基础」观测：提交 5s 后首字，16s 落定。
+        self._speed = compute_speed(
+            "p" * 30,
+            reply,
+            submitted_at=5.0,
+            first_text_at=8.0,
+            finished_at=16.0,
+            poll_interval_s=0.4,
+            streamed=False,
+        )
+        self.e2e_calls = []
+
+    def last_speed(self, key=None):
+        return self._speed
+
+    def record_streaming_e2e(self, key, *, e2e_ttft_s, e2e_decode_tps,
+                             bridge_overhead_ratio):
+        self.e2e_calls.append(
+            {
+                "key": key,
+                "e2e_ttft_s": e2e_ttft_s,
+                "e2e_decode_tps": e2e_decode_tps,
+                "bridge_overhead_ratio": bridge_overhead_ratio,
+            }
+        )
+
+
 class NudgePredicateWiringTests(unittest.TestCase):
     """工具模式下传给 driver 的纠偏判定必须随「任务是否已开始执行」变化。
 
@@ -210,6 +244,34 @@ class StreamTests(unittest.TestCase):
         ]
         self.assertTrue(tool_chunks)
         self.assertIn("tool_calls", finishes_of(events))
+
+
+class E2ETimingTests(unittest.TestCase):
+    """流式收尾时把端到端指标补写到会话桶「最近一次」样本。"""
+
+    def test_streaming_records_e2e_and_overhead(self):
+        driver = E2ETimingDriver()
+        req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
+        _collect(_stream_chat_completion(req, "p", driver, session_key="bucket-x"))
+
+        self.assertEqual(len(driver.e2e_calls), 1)
+        call = driver.e2e_calls[0]
+        self.assertEqual(call["key"], "bucket-x")
+        # 首个正文 chunk 在流开始时立即产生 → e2e_ttft 应为非负小值。
+        self.assertIsNotNone(call["e2e_ttft_s"])
+        self.assertGreaterEqual(call["e2e_ttft_s"], 0.0)
+        # reply_tokens > 0 → 端到端 decode 速度被算出。
+        self.assertIsNotNone(call["e2e_decode_tps"])
+        self.assertGreaterEqual(call["e2e_decode_tps"], 0.0)
+        self.assertIsNotNone(call["bridge_overhead_ratio"])
+        self.assertGreaterEqual(call["bridge_overhead_ratio"], 0.0)
+        self.assertLessEqual(call["bridge_overhead_ratio"], 1.0)
+
+    def test_driver_without_speed_support_is_tolerated(self):
+        # 旧 fake / 假 driver 没有 last_speed：不能因此让流式崩掉。
+        req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
+        lines = _collect(_stream_chat_completion(req, "p", FakeDriver()))
+        self.assertTrue(any(e == {"__done__": True} for e in _events(lines)))
 
 
 def finishes_of(events):

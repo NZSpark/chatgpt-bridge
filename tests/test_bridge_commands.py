@@ -316,6 +316,89 @@ class ModelsTests(_BridgeTestBase):
         self.assertIn("不强制", reply, "别把 API 模型名说成能强制切换网页端模型")
 
 
+# ==================== token 子命令 ====================
+
+
+class TokenCommandTests(_BridgeTestBase):
+    def test_token_without_samples_is_honest(self) -> None:
+        driver = self.make_driver()
+        reply = asyncio.run(
+            bridge_commands.handle_command(_user("/bridge token"), driver, "b")
+        )
+        self.assertIn("暂无速度样本", reply)
+        self.assertIn("口径", reply, "必须标注这是估算口径，不是模型裸速度")
+
+    def test_token_reports_last_and_average(self) -> None:
+        driver = self.make_driver()
+        state = driver._state("b")
+        state.speed_samples = 2
+        state.speed_prefill_tps_sum = 2000.0
+        state.speed_decode_tps_sum = 100.0
+        state.speed_ttft_s_sum = 6.0
+        state.speed_decode_s_sum = 16.0
+        state.speed_prompt_tokens_sum = 6000
+        state.speed_reply_tokens_sum = 800
+        state.speed_last_prompt_tokens = 3000
+        state.speed_last_reply_tokens = 400
+        state.speed_last_ttft_s = 3.0
+        state.speed_last_decode_s = 8.0
+        state.speed_last_total_s = 11.0
+        state.speed_last_prefill_tps = 1000.0
+        state.speed_last_decode_tps = 50.0
+        state.est_tokens = 12345
+
+        reply = asyncio.run(
+            bridge_commands.handle_command(_user("/bridge token"), driver, "b")
+        )
+        self.assertIn("2 次成功生成", reply)
+        self.assertIn("输入 3,000 / 输出 400", reply)
+        self.assertIn("prefill 1,000 tokens/s", reply)
+        self.assertIn("decode 50 tokens/s", reply)
+        self.assertIn("12,345", reply, "当前会话累计估算 tokens 应显示（带千位分隔）")
+        self.assertIn("口径", reply)
+        # 无端到端样本时不显示端到端行。
+        self.assertNotIn("端到端", reply)
+
+    def test_token_shows_e2e_overhead_and_hints(self) -> None:
+        driver = self.make_driver()
+        state = driver._state("b")
+        state.speed_samples = 1
+        state.speed_last_reply_tokens = 20  # 短样本
+        state.speed_last_e2e_ttft_s = 3.4
+        state.speed_last_e2e_decode_tps = 48.0
+        state.speed_last_bridge_overhead = 0.18
+        state.speed_last_rewritten = True
+
+        reply = asyncio.run(
+            bridge_commands.handle_command(_user("/bridge token"), driver, "b")
+        )
+        self.assertIn("端到端（流式）", reply)
+        self.assertIn("TTFT 3.4s", reply)
+        self.assertIn("decode 48 tokens/s", reply)
+        self.assertIn("18%", reply)
+        self.assertIn("回复过短", reply)
+        self.assertIn("有重写", reply)
+
+    def test_token_rejects_extra_arguments(self) -> None:
+        reply = asyncio.run(
+            bridge_commands.handle_command(
+                _user("/bridge token extra"), self.make_driver()
+            )
+        )
+        self.assertIn("不接受参数", reply)
+
+    def test_token_does_not_leak_other_buckets(self) -> None:
+        driver = self.make_driver()
+        driver._state("bucket-a").speed_samples = 5
+        driver._state("bucket-a").est_tokens = 999999
+
+        reply = asyncio.run(
+            bridge_commands.handle_command(_user("/bridge token"), driver, "bucket-b")
+        )
+        self.assertNotIn("999999", reply, "别的桶的样本不得出现在这个桶的回复里")
+        self.assertIn("暂无速度样本", reply)
+
+
 # ==================== session 子命令 ====================
 
 

@@ -62,6 +62,8 @@ class ChatGPTWebDriver(
         # 由 driver 内部按会话是否有历史决定）。server / streaming 用它估算 usage，
         # 避免用调用方“预估”的那份；必须按桶隔离，否则并发时会互相覆盖。
         self._last_prompts: Dict[str, str] = {}
+        # 每个桶最近一次成功生成的 TokenSpeed（仅内存，供流式层补算端到端）。
+        self._last_speeds: Dict[str, object] = {}
 
         # ---- 会话状态（按任务分桶，见 config.SESSION_KEY_HEADER）----
         # 每个桶持有：一条独立页面 + 独立会话状态。

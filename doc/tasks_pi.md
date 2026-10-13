@@ -362,7 +362,7 @@ confirmation_policy
 
 ---
 
-# 5. P1：配置治理
+# 5. P2：配置治理
 
 ## PI-014 配置分层
 
@@ -390,6 +390,11 @@ DebugConfig
 ## PI-015 统一 RequestLimits
 
 状态：TODO｜优先级：P2｜依赖：PI-014
+
+> 核对（2026-10-13）：尚未建立集中式 `RequestLimits`。当前各限制仍分散在
+> `.env.example` 与各模块中（如 `EDIT_MARKDOWN_MAX_FILE_BYTES`），没有单一
+> `max_request_bytes` / `max_prompt_chars` / `max_tool_result_chars` 等统一对象。
+> 依赖它的 PI-030 因此保持 TODO。
 
 集中管理：
 
@@ -950,7 +955,23 @@ perf: establish browser request baseline
 
 # 15. 汇总任务表
 
-> 状态核对：2026-10-08（对照代码与测试）。正文各任务的状态与此表已对齐。
+> 状态核对：2026-10-13（对照代码与测试）。正文各任务的状态与此表已对齐。
+>
+> 本轮复核结论（2026-10-13）：
+> - 所有标记为 DONE 的任务均能在代码 / 测试中找到对应实现，无需回退。
+> - 仍为 TODO 的任务经再次确认确实未落地：PI-015（无集中 `RequestLimits`）、
+>   PI-021（无 `request_id`/`attempt_id`/`page_id` correlation 字段）、
+>   PI-022（仅有 `tests/e2e/test_dom_probe.py` 探测层，无 E1–E5 黄金 E2E）、
+>   PI-026（未拆分 `browser_input.py`/`reply_extractor.py`/`reply_waiter.py`）、
+>   PI-027（driver 仍为 Mixin 结构）、PI-028（无 `RetryPolicy`）、
+>   PI-029（无 `ChatBackend` Protocol）、PI-030（依赖 PI-015）、
+>   PI-031（无 LOCAL/SHARED mode、无 API key / rate limit）、
+>   PI-032（无性能 baseline 测试）。
+> - PI-006 仍为 BLOCKED：`tests/e2e/test_dom_probe.py` 已覆盖探测层，但真实
+>   DOM 黄金回归受 ChatGPT Cloudflare challenge 与 `user_data` profile 占用阻断。
+> - 全套 `pytest -q` 通过；注意工作区当前存在与本任务清单无关的未提交改动
+>   （`token_speed.py`、session schema/store、reply_waiter、bridge_commands），
+>   不影响上述状态判定。
 
 | ID | 任务 | 优先级 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- |

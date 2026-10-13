@@ -243,6 +243,32 @@ HTTP 的重置、绑定和解除绑定接口可以检查 `RESET_TOKEN`，要求 
 
 **优先级：P2。** 只有用户确实需要在聊天中调整保存行为时再实现。
 
+#### 3.10 token 用量与生成速度
+
+已实现语法：
+
+```text
+/bridge token
+```
+
+网页端没有 token 级事件，只有「整段回复快照」的轮询，因此本命令报告的是**桥接链路下的观测
+估值**，不是模型裸速度：
+
+- token 数用字符长度估算（≈ 字符数 / 3），绝对值不可当作精确计费依据；
+- prefill 速度 = 输入 token / 首字延迟（首字延迟含网页合成 + 半轮询周期，故偏小）；
+- decode 速度 = 输出 token / 解码时长，扣除可明确归因的落定静默窗口；
+- 分别显示「最近一次」与本桶「滚动平均」；只统计成功的生成；
+- 流式路径额外给出端到端指标：首个正文 SSE chunk 的 TTFT、流式 decode 速度、桥接开销占比
+  （端到端时间里不属于模型生成的部分，仅作诊断）；
+- 回复过短（< 50 输出 token）或本轮发生重写时附「仅供参考」提示。
+
+实现落点：`chatgpt_web/token_speed.py`（纯函数 `compute_speed`）、`reply_waiter.py`（埋点与累加）、
+`session/schema.py` + `session/store.py`（滚动统计落盘，只存数值和）、`bridge_commands.py`
+（`/bridge token`）。设计细节见 tokenspeed 设计文档；测试见 `tests/test_token_speed.py` 与
+`tests/test_bridge_commands.py::TokenCommandTests`。
+
+**优先级：P2。** 只读命令，不导航网页、不触发生成，也不回显提示词 / 回复正文。
+
 ## 4. 不建议加入的命令
 
 | 建议暂缓或拒绝的命令 | 原因 | 替代思路 |

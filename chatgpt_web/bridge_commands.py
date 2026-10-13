@@ -43,6 +43,7 @@ _USAGE = (
     f"  {BRIDGE_COMMAND} help [{'|'.join(HELP_TOPICS)}]        查看命令列表 / 分主题帮助\n"
     f"  {BRIDGE_COMMAND} status                       桥接与当前会话桶状态摘要\n"
     f"  {BRIDGE_COMMAND} models                       本桥对外公布的模型名（同 /v1/models）\n"
+    f"  {BRIDGE_COMMAND} token                        当前桶 token 用量估算与生成速度\n"
     f"  {BRIDGE_COMMAND} session [status]             当前桶的会话状态摘要\n"
     f"  {BRIDGE_COMMAND} session reset                下一轮开新网页会话并播种完整历史\n"
     f"  {BRIDGE_COMMAND} session reseed               下一轮把完整历史再播种一遍（一次性）\n"
@@ -87,6 +88,8 @@ REGISTRY: tuple[CommandSpec, ...] = (
                 "桥接、浏览器与当前会话桶的状态摘要", "", True),
     CommandSpec(f"{BRIDGE_COMMAND} models",
                 "本桥对外公布的模型名（与 GET /v1/models 同源）", "", True),
+    CommandSpec(f"{BRIDGE_COMMAND} token",
+                "当前会话桶 token 估算、prefill / decode 速度与滚动平均", "", True),
     CommandSpec(f"{BRIDGE_COMMAND} session [status]",
                 "当前桶的会话状态摘要", "session", True),
     CommandSpec(f"{BRIDGE_COMMAND} session reset",
@@ -147,6 +150,10 @@ def parse_command(text: str) -> Optional[BridgeCommand]:
         if rest:
             return _invalid(f"{BRIDGE_COMMAND} models 不接受参数。")
         return BridgeCommand("models")
+    if head == "token":
+        if rest:
+            return _invalid(f"{BRIDGE_COMMAND} token 不接受参数。")
+        return BridgeCommand("token")
     if head == "session":
         return _parse_session(rest)
     if head == "settings":
@@ -256,6 +263,8 @@ async def _execute(command: BridgeCommand, driver, bucket: str) -> str:
         return _status_reply(driver, bucket)
     if command.action == "models":
         return _models_reply()
+    if command.action == "token":
+        return _token_reply(driver, bucket)
     if command.action == "invalid":
         return f"[Bridge] 命令未执行：{command.reason}"
     if command.action == "session":
@@ -319,6 +328,54 @@ def _status_reply(driver, bucket: str) -> str:
             "  下一步：GET /readiness 查看登录 / composer 状态；或本地重启桥进程。"
             "（浏览器不可用时只读命令仍可用）"
         )
+    return "\n".join(lines)
+
+
+def _token_reply(driver, bucket: str) -> str:
+    """当前桶的 token 与生成速度估算；只读、不触发浏览器生成。"""
+    stats = driver.session_stats(bucket)
+    samples = max(0, int(stats.get("speed_samples") or 0))
+    lines = [
+        f"[Bridge] Token / 速度统计（当前会话桶 {bucket}）：",
+        "  口径：网页版没有精确 usage/token 事件，token 数由字符长度估算；速度是桥接链路观测值，不等同于模型裸速度。",
+    ]
+    if samples == 0:
+        lines.extend([
+            "  暂无速度样本。完成一次成功生成后，再执行此命令查看。",
+            f"  当前会话累计估算 tokens：{int(stats.get('est_tokens') or 0)}",
+        ])
+        return "\n".join(lines)
+
+    get_int = lambda name: max(0, int(stats.get(name) or 0))
+    get_float = lambda name: max(0.0, float(stats.get(name) or 0.0))
+    lines.extend([
+        f"  统计样本：{samples} 次成功生成",
+        f"  最近一次 token：输入 {get_int('speed_last_prompt_tokens'):,} / 输出 {get_int('speed_last_reply_tokens'):,}",
+        f"  最近一次时延：TTFT {get_float('speed_last_ttft_s'):.1f}s；decode {get_float('speed_last_decode_s'):.1f}s；合计 {get_float('speed_last_total_s'):.1f}s",
+        f"  最近一次速度：prefill {get_float('speed_last_prefill_tps'):,.0f} tokens/s；decode {get_float('speed_last_decode_tps'):,.0f} tokens/s",
+    ])
+    # 端到端（仅流式路径有；非流式为 0，不显示，避免误导）。
+    e2e_ttft = get_float("speed_last_e2e_ttft_s")
+    e2e_decode = get_float("speed_last_e2e_decode_tps")
+    overhead = get_float("speed_last_bridge_overhead")
+    if e2e_ttft or e2e_decode:
+        lines.append(
+            f"  端到端（流式）：TTFT {e2e_ttft:.1f}s；decode {e2e_decode:,.0f} tokens/s"
+        )
+        lines.append(f"  桥接开销占比 ≈ {overhead * 100:.0f}%（端到端里非模型生成的部分）")
+    lines.extend([
+        f"  平均 token：输入 {get_int('speed_prompt_tokens_sum') / samples:,.0f} / 输出 {get_int('speed_reply_tokens_sum') / samples:,.0f}",
+        f"  平均时延：TTFT {get_float('speed_ttft_s_sum') / samples:.1f}s；decode {get_float('speed_decode_s_sum') / samples:.1f}s",
+        f"  平均速度：prefill {get_float('speed_prefill_tps_sum') / samples:,.0f} tokens/s；decode {get_float('speed_decode_tps_sum') / samples:,.0f} tokens/s",
+        f"  当前网页会话累计估算 tokens：{int(stats.get('est_tokens') or 0):,}",
+    ])
+    if get_int("speed_last_reply_tokens") < 50:
+        lines.append("  提示：最近一次回复过短，速度分辨率不足，仅供参考。")
+    if stats.get("speed_last_rewritten"):
+        lines.append("  提示：最近一次生成有重写（增量曾回退），速度仅供参考。")
+    lines.append(
+        "  注意：TTFT 是页面首次呈现非空回复的代理值；轮询、网页渲染与结束静默窗口都会影响速度估算。"
+    )
     return "\n".join(lines)
 
 
