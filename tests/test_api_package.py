@@ -95,7 +95,7 @@ class StreamingAdapterTest(unittest.TestCase):
         chunk = streaming_adapter.sse_event("response.output_text.delta", {"delta": "hi"})
         self.assertTrue(chunk.startswith("event: response.output_text.delta\n"))
         self.assertTrue(chunk.endswith("\n\n"))
-        data_line = [l for l in chunk.splitlines() if l.startswith("data: ")][0]
+        data_line = [line for line in chunk.splitlines() if line.startswith("data: ")][0]
         payload = json.loads(data_line[len("data: "):])
         self.assertEqual(payload["type"], "response.output_text.delta")
         self.assertEqual(payload["delta"], "hi")
@@ -121,7 +121,6 @@ class ChatAdapterStreamTest(unittest.TestCase):
 
     def test_stream_via_adapter_matches_facade(self):
         req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
-        driver = _FakeDriver()
 
         async def collect(agen):
             return [item async for item in agen]

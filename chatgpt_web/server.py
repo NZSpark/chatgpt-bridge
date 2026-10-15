@@ -4,7 +4,6 @@
 import asyncio
 import hashlib
 import inspect
-import json
 import logging
 import re
 import time
@@ -15,6 +14,11 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import bridge_commands, config, linking, models, tasks
+from .api.chat_adapter import (
+    ChatAdapterError,
+    register_edit_markdown,
+    run_chat_completion,
+)
 from .driver import (
     DEFAULT_SESSION_KEY,
     ChatGPTWebDriver,
@@ -30,11 +34,6 @@ from .models import (
 from .prompting import build_prompt
 from .responses import ResponsesRequest, handle_responses
 from .streaming import _stream_chat_completion
-from .api.chat_adapter import (
-    ChatAdapterError,
-    register_edit_markdown,
-    run_chat_completion,
-)
 
 logger = logging.getLogger(__name__)
 driver = ChatGPTWebDriver()

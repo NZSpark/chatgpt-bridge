@@ -24,7 +24,8 @@ from chatgpt_web.driver import ChatGPTWebDriver  # noqa: E402
 
 class PackageImportTest(unittest.TestCase):
     def test_submodules_import(self):
-        from chatgpt_web.browser import dom_adapter, diagnostics, selectors as sel  # noqa: F401
+        from chatgpt_web.browser import diagnostics, dom_adapter  # noqa: F401
+        from chatgpt_web.browser import selectors as sel
 
         self.assertIsNotNone(sel.SELECTOR_VERSION)
 

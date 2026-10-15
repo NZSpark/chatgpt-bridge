@@ -3,8 +3,8 @@
 迁移失败 / 不支持版本时抛 :class:`ValueError`，由 store 层捕获并按空状态继续。
 """
 
-import sys
 import logging
+import sys
 from typing import Any, Dict
 
 from .schema import STATE_SCHEMA_VERSION, validate_state_document

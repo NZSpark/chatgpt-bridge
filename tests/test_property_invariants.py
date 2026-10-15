@@ -14,7 +14,11 @@ from chatgpt_web import config
 from chatgpt_web.chat_io import ChatIOMixin
 from chatgpt_web.models import ChatMessage
 from chatgpt_web.prompting import tool_nudge_predicate
-from chatgpt_web.toolcalls import ToolExecutionLedger, normalize_tool_call_requests, parse_tool_call_requests
+from chatgpt_web.toolcalls import (
+    ToolExecutionLedger,
+    normalize_tool_call_requests,
+    parse_tool_call_requests,
+)
 from chatgpt_web.tools.policy import resolve_edit_path
 
 

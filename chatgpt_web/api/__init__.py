@@ -11,7 +11,6 @@ facade，历史 import（``from chatgpt_web.streaming import _stream_chat_comple
 ``from chatgpt_web.responses import run_chat``）不变。
 """
 
-from .streaming_adapter import sse_event
 from .chat_adapter import chunk_text, stream_chat_completion
 from .responses_adapter import (
     ResponsesRequest,
@@ -21,6 +20,7 @@ from .responses_adapter import (
     stream_responses,
     to_chat_request,
 )
+from .streaming_adapter import sse_event
 
 __all__ = [
     "sse_event",

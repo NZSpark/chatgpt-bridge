@@ -6,6 +6,8 @@
 
 from .api.chat_adapter import (  # noqa: F401
     chunk_text as _chunk_text,
+)
+from .api.chat_adapter import (
     stream_chat_completion as _stream_chat_completion,
 )
 

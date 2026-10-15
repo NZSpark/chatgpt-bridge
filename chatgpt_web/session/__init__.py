@@ -12,6 +12,8 @@
 ``patch.object(session_store, ...)`` 不变。
 """
 
+from .lock import STATE_FILE_LOCK
+from .migration import migrate_state_document
 from .schema import (
     STATE_SCHEMA_VERSION,
     SessionState,
@@ -19,8 +21,6 @@ from .schema import (
     session_payload_only,
     validate_state_document,
 )
-from .migration import migrate_state_document
-from .lock import STATE_FILE_LOCK
 from .store import SessionStoreMixin
 
 __all__ = [
