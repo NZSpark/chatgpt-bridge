@@ -4,8 +4,8 @@
 空文档构造、v2 文档校验、以及 payload 字段过滤。
 """
 
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional
 
 #: 当前磁盘状态文档的 schema 版本。
 STATE_SCHEMA_VERSION = 2
@@ -25,6 +25,7 @@ _SESSION_FIELDS = frozenset({
     "think_mode",
     "save_files",
     "speed_samples",
+    "speed_recent_samples",
     "speed_prefill_tps_sum",
     "speed_decode_tps_sum",
     "speed_ttft_s_sum",
@@ -36,11 +37,16 @@ _SESSION_FIELDS = frozenset({
     "speed_last_ttft_s",
     "speed_last_decode_s",
     "speed_last_total_s",
+    "speed_last_ttft_adj_s",
+    "speed_last_decode_adj_s",
+    "speed_last_poll_credit_s",
+    "speed_last_settle_credit_s",
     "speed_last_prefill_tps",
     "speed_last_decode_tps",
     "speed_last_e2e_ttft_s",
     "speed_last_e2e_decode_tps",
     "speed_last_bridge_overhead",
+    "speed_last_e2e_valid",
     "speed_last_saw_generating",
     "speed_last_streamed",
     "speed_last_rewritten",
@@ -107,6 +113,7 @@ class SessionState:
     # /bridge token：会话桶内滚动统计。sum + sample count 可跨重启恢复，
     # 只保留聚合值和最近一次样本，避免状态文件随请求次数不断膨胀。
     speed_samples: int = 0
+    speed_recent_samples: List[Dict[str, float]] = field(default_factory=list)
     speed_prefill_tps_sum: float = 0.0
     speed_decode_tps_sum: float = 0.0
     speed_ttft_s_sum: float = 0.0
@@ -118,12 +125,17 @@ class SessionState:
     speed_last_ttft_s: float = 0.0
     speed_last_decode_s: float = 0.0
     speed_last_total_s: float = 0.0
+    speed_last_ttft_adj_s: float = 0.0
+    speed_last_decode_adj_s: float = 0.0
+    speed_last_poll_credit_s: float = 0.0
+    speed_last_settle_credit_s: float = 0.0
     speed_last_prefill_tps: float = 0.0
     speed_last_decode_tps: float = 0.0
     # 端到端（仅流式路径；非流式保持 0.0，命令据此判断要不要显示端到端行）。
     speed_last_e2e_ttft_s: float = 0.0
     speed_last_e2e_decode_tps: float = 0.0
     speed_last_bridge_overhead: float = 0.0
+    speed_last_e2e_valid: bool = False
     speed_last_saw_generating: bool = False
     speed_last_streamed: bool = False
     speed_last_rewritten: bool = False
@@ -139,7 +151,7 @@ class SessionState:
         for name in (
             "has_history", "cap_hit", "pending_rotation", "pending_reseed",
             "speed_last_saw_generating", "speed_last_streamed",
-            "speed_last_rewritten",
+            "speed_last_rewritten", "speed_last_e2e_valid",
         ):
             if name in payload:
                 setattr(state, name, bool(payload.get(name)))
@@ -155,7 +167,9 @@ class SessionState:
         for name in (
             "speed_prefill_tps_sum", "speed_decode_tps_sum", "speed_ttft_s_sum",
             "speed_decode_s_sum", "speed_last_ttft_s", "speed_last_decode_s",
-            "speed_last_total_s", "speed_last_prefill_tps", "speed_last_decode_tps",
+            "speed_last_total_s", "speed_last_ttft_adj_s", "speed_last_decode_adj_s",
+            "speed_last_poll_credit_s", "speed_last_settle_credit_s",
+            "speed_last_prefill_tps", "speed_last_decode_tps",
             "speed_last_e2e_ttft_s", "speed_last_e2e_decode_tps",
             "speed_last_bridge_overhead",
         ):
@@ -164,6 +178,29 @@ class SessionState:
                 setattr(state, name, value if value >= 0 and value < float("inf") else 0.0)
             except (TypeError, ValueError):
                 setattr(state, name, 0.0)
+        recent = payload.get("speed_recent_samples")
+        if isinstance(recent, list):
+            allowed = {
+                "prefill_tps", "decode_tps", "ttft_s", "decode_s",
+                "ttft_adj_s", "decode_adj_s", "poll_credit_s", "settle_credit_s",
+                "prompt_tokens", "reply_tokens",
+                "e2e_ttft_s", "e2e_decode_tps", "bridge_overhead_ratio", "e2e_valid",
+            }
+            clean = []
+            for sample in recent[-12:]:
+                if not isinstance(sample, dict):
+                    continue
+                row = {}
+                for name in allowed:
+                    try:
+                        value = float(sample.get(name, 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    if value >= 0 and value < float("inf"):
+                        row[name] = value
+                if row:
+                    clean.append(row)
+            state.speed_recent_samples = clean
         last_error = payload.get("last_error")
         state.last_error = last_error if isinstance(last_error, str) else None
         linked = payload.get("linked_url")

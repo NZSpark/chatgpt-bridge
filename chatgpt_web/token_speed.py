@@ -14,12 +14,21 @@
 - 端到端（仅流式）额外记录首个正文 SSE chunk 与 [DONE] 时刻，得到客户端体感速度。
 """
 
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Dict, Optional
 
 from .prompting import estimate_tokens
 
 _EPSILON_S = 1e-3
+
+#: 每个会话桶用于近期趋势展示的固定窗口大小。
+ROLLING_WINDOW_SIZE = 12
+
+#: 流式请求将此 ID 设在当前任务上下文中，供网页生成层关联对应样本。
+CURRENT_SPEED_REQUEST_ID: ContextVar[Optional[str]] = ContextVar(
+    "chatgpt_bridge_speed_request_id", default=None
+)
 
 #: 短回复阈值：低于此输出 token 数时轮询粒度不足以给出可靠速度。
 SHORT_SAMPLE_TOKENS = 50
@@ -65,6 +74,10 @@ LAST_FIELDS = (
     ("speed_last_ttft_s", "ttft_s"),
     ("speed_last_decode_s", "decode_s"),
     ("speed_last_total_s", "total_s"),
+    ("speed_last_ttft_adj_s", "ttft_adj_s"),
+    ("speed_last_decode_adj_s", "decode_adj_s"),
+    ("speed_last_poll_credit_s", "poll_credit_s"),
+    ("speed_last_settle_credit_s", "settle_credit_s"),
     ("speed_last_prefill_tps", "prefill_tps"),
     ("speed_last_decode_tps", "decode_tps"),
     ("speed_last_e2e_ttft_s", "e2e_ttft_s"),
@@ -84,6 +97,16 @@ SUM_FIELDS = (
     ("speed_prompt_tokens_sum", "prompt_tokens"),
     ("speed_reply_tokens_sum", "reply_tokens"),
 )
+
+
+def rolling_sample(speed: TokenSpeed) -> Dict[str, float]:
+    """返回固定窗口需要的纯数值字段；绝不保存 prompt 或回复正文。"""
+    names = (
+        "prefill_tps", "decode_tps", "ttft_s", "decode_s",
+        "ttft_adj_s", "decode_adj_s", "poll_credit_s", "settle_credit_s",
+        "prompt_tokens", "reply_tokens",
+    )
+    return {name: float(getattr(speed, name)) for name in names}
 
 
 def compute_speed(
@@ -227,4 +250,7 @@ __all__ = [
     "LAST_FIELDS",
     "SUM_FIELDS",
     "SHORT_SAMPLE_TOKENS",
+    "ROLLING_WINDOW_SIZE",
+    "CURRENT_SPEED_REQUEST_ID",
+    "rolling_sample",
 ]

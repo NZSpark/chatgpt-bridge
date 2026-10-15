@@ -27,7 +27,6 @@ from .schema import (
     session_payload_only,
 )
 
-
 #: Fallback logger name must match the historical module path.
 logger = logging.getLogger("chatgpt_web.session_store")
 
@@ -90,6 +89,10 @@ class SessionStoreMixin:
             self._sessions.pop(bucket, None)
             self._last_prompts.pop(bucket, None)
             self._last_speeds.pop(bucket, None)
+            self._last_speed_request_ids.pop(bucket, None)
+            for request_id, sample_ref in list(self._speed_samples_by_request_id.items()):
+                if sample_ref[0] == bucket:
+                    self._speed_samples_by_request_id.pop(request_id, None)
 
     def _page_for(self, key: Optional[str] = None):
         """取出某个会话桶的页面；默认桶就是 ``self.page``。"""
@@ -105,6 +108,11 @@ class SessionStoreMixin:
     def last_speed(self, key: Optional[str] = None):
         """某个会话桶最近一次成功生成的基础 TokenSpeed（仅内存）。"""
         return self._last_speeds.get(key or DEFAULT_SESSION_KEY)
+
+    def speed_for_request(self, request_id: str):
+        """取指定流式请求自己的基础速度样本，避免并发请求串样本。"""
+        record = self._speed_samples_by_request_id.get(request_id)
+        return record[1] if record is not None else None
 
     # ---- 默认桶的状态：保留为属性，兼容既有调用与测试 ----
     @property
@@ -281,6 +289,7 @@ class SessionStoreMixin:
             "cap_failures": getattr(state, "cap_failures", 0),
             # /bridge token：当前桶的滚动速度统计与最近一次样本。
             "speed_samples": state.speed_samples,
+            "speed_recent_samples": [dict(sample) for sample in state.speed_recent_samples],
             "speed_prefill_tps_sum": state.speed_prefill_tps_sum,
             "speed_decode_tps_sum": state.speed_decode_tps_sum,
             "speed_ttft_s_sum": state.speed_ttft_s_sum,
@@ -292,16 +301,100 @@ class SessionStoreMixin:
             "speed_last_ttft_s": state.speed_last_ttft_s,
             "speed_last_decode_s": state.speed_last_decode_s,
             "speed_last_total_s": state.speed_last_total_s,
+            "speed_last_ttft_adj_s": state.speed_last_ttft_adj_s,
+            "speed_last_decode_adj_s": state.speed_last_decode_adj_s,
+            "speed_last_poll_credit_s": state.speed_last_poll_credit_s,
+            "speed_last_settle_credit_s": state.speed_last_settle_credit_s,
             "speed_last_prefill_tps": state.speed_last_prefill_tps,
             "speed_last_decode_tps": state.speed_last_decode_tps,
             "speed_last_e2e_ttft_s": state.speed_last_e2e_ttft_s,
             "speed_last_e2e_decode_tps": state.speed_last_e2e_decode_tps,
             "speed_last_bridge_overhead": state.speed_last_bridge_overhead,
+            "speed_last_e2e_valid": state.speed_last_e2e_valid,
             "speed_last_saw_generating": state.speed_last_saw_generating,
             "speed_last_streamed": state.speed_last_streamed,
             "speed_last_rewritten": state.speed_last_rewritten,
             "buckets": self.session_keys(),
         }
+
+    @staticmethod
+    def _clean_e2e_value(value: Optional[float], *, maximum: Optional[float] = None) -> float:
+        if value is None:
+            return 0.0
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not (result >= 0.0 and result < float("inf")):
+            return 0.0
+        return min(maximum, result) if maximum is not None else result
+
+    def _apply_streaming_e2e(
+        self,
+        bucket: str,
+        sample: Dict[str, float],
+        *,
+        e2e_ttft_s: Optional[float],
+        e2e_decode_tps: Optional[float],
+        bridge_overhead_ratio: Optional[float],
+    ) -> None:
+        """更新指定样本；仅当它仍是最新样本时同步更新 speed_last_*。"""
+        ttft = self._clean_e2e_value(e2e_ttft_s)
+        decode = self._clean_e2e_value(e2e_decode_tps)
+        overhead = self._clean_e2e_value(bridge_overhead_ratio, maximum=1.0)
+        valid = e2e_ttft_s is not None and e2e_decode_tps is not None
+        if any(row is sample for row in self._state(bucket).speed_recent_samples):
+            sample.update({
+                "e2e_ttft_s": ttft,
+                "e2e_decode_tps": decode,
+                "bridge_overhead_ratio": overhead,
+                "e2e_valid": float(valid),
+            })
+
+        state = self._state(bucket)
+        latest_request_id = self._last_speed_request_ids.get(bucket)
+        # Legacy callers (or older fake drivers) don't pass request IDs; they target
+        # the current sample. Request-scoped callers are guarded by the caller below.
+        if latest_request_id is None or latest_request_id == getattr(self, "_e2e_update_request_id", None):
+            state.speed_last_e2e_ttft_s = ttft
+            state.speed_last_e2e_decode_tps = decode
+            state.speed_last_bridge_overhead = overhead
+            state.speed_last_e2e_valid = valid
+            state.speed_last_streamed = True
+        self._save_session_state(bucket)
+
+    def record_streaming_e2e_for_request(
+        self,
+        request_id: str,
+        *,
+        e2e_ttft_s: Optional[float],
+        e2e_decode_tps: Optional[float],
+        bridge_overhead_ratio: Optional[float],
+    ) -> None:
+        """按请求 ID 补写样本；不会覆盖同一桶里更新的另一个请求。"""
+        record = self._speed_samples_by_request_id.pop(request_id, None)
+        if record is None:
+            return
+        bucket, _speed, sample = record
+        state = self._state(bucket)
+        ttft = self._clean_e2e_value(e2e_ttft_s)
+        decode = self._clean_e2e_value(e2e_decode_tps)
+        overhead = self._clean_e2e_value(bridge_overhead_ratio, maximum=1.0)
+        valid = e2e_ttft_s is not None and e2e_decode_tps is not None
+        if any(row is sample for row in state.speed_recent_samples):
+            sample.update({
+                "e2e_ttft_s": ttft,
+                "e2e_decode_tps": decode,
+                "bridge_overhead_ratio": overhead,
+                "e2e_valid": float(valid),
+            })
+        if self._last_speed_request_ids.get(bucket) == request_id:
+            state.speed_last_e2e_ttft_s = ttft
+            state.speed_last_e2e_decode_tps = decode
+            state.speed_last_bridge_overhead = overhead
+            state.speed_last_e2e_valid = valid
+            state.speed_last_streamed = True
+        self._save_session_state(bucket)
 
     def record_streaming_e2e(
         self,
@@ -311,22 +404,27 @@ class SessionStoreMixin:
         e2e_decode_tps: Optional[float],
         bridge_overhead_ratio: Optional[float],
     ) -> None:
-        """把流式层测得的端到端指标补写到当前桶「最近一次」样本上。
-
-        非流式路径不调用；流式层在生成器收尾时调用一次。只覆盖 e2e_* 与
-        streamed 标记，不动已由 reply_waiter 写好的观测速度。
-        """
-        state = self._state(key)
-        if e2e_ttft_s is not None:
-            state.speed_last_e2e_ttft_s = max(0.0, float(e2e_ttft_s))
-        if e2e_decode_tps is not None:
-            state.speed_last_e2e_decode_tps = max(0.0, float(e2e_decode_tps))
-        if bridge_overhead_ratio is not None:
-            state.speed_last_bridge_overhead = max(
-                0.0, min(1.0, float(bridge_overhead_ratio))
-            )
+        """兼容旧调用：把端到端指标补写到该桶最近一次样本。"""
+        bucket = key or DEFAULT_SESSION_KEY
+        state = self._state(bucket)
+        sample = state.speed_recent_samples[-1] if state.speed_recent_samples else {}
+        ttft = self._clean_e2e_value(e2e_ttft_s)
+        decode = self._clean_e2e_value(e2e_decode_tps)
+        overhead = self._clean_e2e_value(bridge_overhead_ratio, maximum=1.0)
+        valid = e2e_ttft_s is not None and e2e_decode_tps is not None
+        if sample:
+            sample.update({
+                "e2e_ttft_s": ttft,
+                "e2e_decode_tps": decode,
+                "bridge_overhead_ratio": overhead,
+                "e2e_valid": float(valid),
+            })
+        state.speed_last_e2e_ttft_s = ttft
+        state.speed_last_e2e_decode_tps = decode
+        state.speed_last_bridge_overhead = overhead
+        state.speed_last_e2e_valid = valid
         state.speed_last_streamed = True
-        self._save_session_state(key)
+        self._save_session_state(bucket)
 
     def _session_over_budget(self, key: Optional[str] = None) -> bool:
         """会话体积是否已达到轮转阈值（0 表示禁用该维度）。"""

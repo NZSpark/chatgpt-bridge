@@ -346,8 +346,11 @@ def _token_reply(driver, bucket: str) -> str:
         ])
         return "\n".join(lines)
 
-    get_int = lambda name: max(0, int(stats.get(name) or 0))
-    get_float = lambda name: max(0.0, float(stats.get(name) or 0.0))
+    def get_int(name):
+        return max(0, int(stats.get(name) or 0))
+
+    def get_float(name):
+        return max(0.0, float(stats.get(name) or 0.0))
     lines.extend([
         f"  统计样本：{samples} 次成功生成",
         f"  最近一次 token：输入 {get_int('speed_last_prompt_tokens'):,} / 输出 {get_int('speed_last_reply_tokens'):,}",
@@ -358,7 +361,7 @@ def _token_reply(driver, bucket: str) -> str:
     e2e_ttft = get_float("speed_last_e2e_ttft_s")
     e2e_decode = get_float("speed_last_e2e_decode_tps")
     overhead = get_float("speed_last_bridge_overhead")
-    if e2e_ttft or e2e_decode:
+    if stats.get("speed_last_e2e_valid"):
         lines.append(
             f"  端到端（流式）：TTFT {e2e_ttft:.1f}s；decode {e2e_decode:,.0f} tokens/s"
         )

@@ -367,6 +367,7 @@ class TokenCommandTests(_BridgeTestBase):
         state.speed_last_e2e_ttft_s = 3.4
         state.speed_last_e2e_decode_tps = 48.0
         state.speed_last_bridge_overhead = 0.18
+        state.speed_last_e2e_valid = True
         state.speed_last_rewritten = True
 
         reply = asyncio.run(

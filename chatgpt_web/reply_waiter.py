@@ -19,7 +19,14 @@ from .errors import (
 from .logging_setup import set_log_context
 from .metrics import metrics
 from .prompting import _delta_piece, estimate_tokens
-from .token_speed import LAST_FIELDS, SUM_FIELDS, compute_speed
+from .token_speed import (
+    CURRENT_SPEED_REQUEST_ID,
+    LAST_FIELDS,
+    ROLLING_WINDOW_SIZE,
+    SUM_FIELDS,
+    compute_speed,
+    rolling_sample,
+)
 
 logger=logging.getLogger("chatgpt_web.chat_io")
 _EMPTY_NODE_REPORT_AFTER=3
@@ -387,6 +394,22 @@ class ReplyWaiterMixin:
             if speed is not None:
                 self._last_speeds[bucket] = speed
                 state.speed_samples += 1
+                request_id = CURRENT_SPEED_REQUEST_ID.get()
+                sample = rolling_sample(speed)
+                # 端到端数据稍后由流式适配层按 request_id 精确补写。
+                sample.update({
+                    "e2e_ttft_s": 0.0,
+                    "e2e_decode_tps": 0.0,
+                    "bridge_overhead_ratio": 0.0,
+                    "e2e_valid": 0.0,
+                })
+                state.speed_recent_samples.append(sample)
+                del state.speed_recent_samples[:-ROLLING_WINDOW_SIZE]
+                self._last_speed_request_ids[bucket] = request_id
+                if request_id:
+                    self._speed_samples_by_request_id[request_id] = (
+                        bucket, speed, sample
+                    )
                 for field, attr in SUM_FIELDS:
                     setattr(state, field, getattr(state, field) + getattr(speed, attr))
                 for field, attr in LAST_FIELDS:

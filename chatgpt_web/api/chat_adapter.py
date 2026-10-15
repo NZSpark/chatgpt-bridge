@@ -25,13 +25,13 @@ from ..models import (
     Usage,
 )
 from ..prompting import build_prompt, estimate_tokens, tool_nudge_predicate
-from ..token_speed import augment_e2e
 from ..protocol_adapters import (
     chat_sse_choice_for_event,
     completed_text,
     completed_tool_calls,
     responses_function_call_arguments,
 )
+from ..token_speed import CURRENT_SPEED_REQUEST_ID, augment_e2e
 from ..toolcalls import (
     EDIT_MARKDOWN_TOOL,
     EDIT_MARKDOWN_TOOL_NAME,
@@ -72,12 +72,36 @@ async def stream_chat_completion(
     request_started_at = time.perf_counter()
     first_sse_at: Optional[float] = None
     done_at: Optional[float] = None
+    speed_request_id = chat_id
 
     def _finish_e2e() -> None:
-        """在生成器收尾时把端到端指标补写到当前桶最近一次样本。"""
+        """把端到端指标写回本请求自己的样本，避免同桶并发串样本。"""
         nonlocal done_at
         if done_at is None:
             done_at = time.perf_counter()
+
+        request_speed = getattr(driver, "speed_for_request", None)
+        request_recorder = getattr(driver, "record_streaming_e2e_for_request", None)
+        if callable(request_speed) and callable(request_recorder):
+            speed = request_speed(speed_request_id)
+            # 生产 driver 不允许回退到桶内的 last_speed，否则可能污染另一个请求。
+            if speed is None:
+                return
+            augmented = augment_e2e(
+                speed,
+                request_started_at=request_started_at,
+                first_sse_at=first_sse_at,
+                done_at=done_at,
+            )
+            request_recorder(
+                speed_request_id,
+                e2e_ttft_s=augmented.e2e_ttft_s,
+                e2e_decode_tps=augmented.e2e_decode_tps,
+                bridge_overhead_ratio=augmented.bridge_overhead_ratio,
+            )
+            return
+
+        # 兼容未实现请求级关联的旧 driver 和测试 fake。
         speed = driver.last_speed(session_key) if hasattr(driver, "last_speed") else None
         recorder = getattr(driver, "record_streaming_e2e", None)
         if speed is None or not callable(recorder):
@@ -219,7 +243,13 @@ async def stream_chat_completion(
             traceback.print_exc()
             await queue.put(("done", (None, [], str(exc), "server_error")))
 
-    task = asyncio.create_task(runner())
+    # create_task 会复制当前 context；只让该请求的 runner 持有 ID，避免把
+    # ContextVar 留在消费 SSE 的外层任务里影响后续请求。
+    speed_context_token = CURRENT_SPEED_REQUEST_ID.set(speed_request_id)
+    try:
+        task = asyncio.create_task(runner())
+    finally:
+        CURRENT_SPEED_REQUEST_ID.reset(speed_context_token)
 
     streamed = False
     reply_content = ""

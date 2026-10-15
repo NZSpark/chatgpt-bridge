@@ -26,8 +26,10 @@ from . import (  # noqa: F401
     prompting,
     session_store,
 )
-from .browser.driver import BrowserLifecycleMixin
-from .browser.driver import async_playwright  # noqa: F401  (兼容再导出：历史上是模块全局)
+from .browser.driver import (
+    BrowserLifecycleMixin,
+    async_playwright,  # noqa: F401  (兼容再导出：历史上是模块全局)
+)
 from .chat_io import ChatIOMixin
 from .completion import CompletionMixin
 from .dom_adapter import ChatGPTDOMAdapter
@@ -64,6 +66,11 @@ class ChatGPTWebDriver(
         self._last_prompts: Dict[str, str] = {}
         # 每个桶最近一次成功生成的 TokenSpeed（仅内存，供流式层补算端到端）。
         self._last_speeds: Dict[str, object] = {}
+        # 流式请求 ID -> (会话桶, 对应 TokenSpeed, 对应的近期样本行)。
+        # 不把请求 ID 写入状态文件，避免持久化临时关联信息。
+        self._speed_samples_by_request_id: Dict[str, tuple[str, object, Dict[str, float]]] = {}
+        # 当前最近一次速度样本的请求 ID；非流式请求为 None。
+        self._last_speed_request_ids: Dict[str, Optional[str]] = {}
 
         # ---- 会话状态（按任务分桶，见 config.SESSION_KEY_HEADER）----
         # 每个桶持有：一条独立页面 + 独立会话状态。
