@@ -553,19 +553,21 @@ session_recovery_latency
 
 ## PI-021 日志 correlation
 
-状态：DOING｜优先级：P2｜依赖：PI-020
+状态：DONE｜优先级：P2｜依赖：PI-020
 
-> 核对（2026-10-17）：部分落地。
+> 核对（2026-10-17）：全链路已闭合。
 >
-> - `request_id`：已落地。`chatgpt_web/logging_setup.py` 提供 `new_request_id()` /
->   `set_request_id()` / `set_log_context()`；`server.py` 在两个入口生成 request_id、
->   写入日志上下文并通过 `X-Request-Id` 响应头回传。
-> - `session_key` / `page_id`：`reply_waiter.py` 已在生成等待日志里 `set_log_context`。
-> - `tool_call_id`：ledger 与 pipeline 已有该字段，但尚未接入统一日志上下文。
-> - `attempt_id`：尚未引入。
+> - `request_id`：`chatgpt_web/logging_setup.py` 提供 `new_request_id()` /
+>   `set_request_id()`；`server.py` 两个入口生成并绑定，`X-Request-Id` 响应头回传。
+> - `session_key` / `page_id`：`server.py` / `reply_waiter.py` / `chat_io.py` 已绑定。
+> - `attempt_id`：`chat_io.py` 已绑定（重试阶梯每次尝试）。
+> - `tool_call_id`：**本轮补齐**。`tools/executor.py` 在工具执行段与「重复执行被跳过」
+>   日志上包 `log_context(tool_call_id=…)`；`tools/validator.py` 在 dedup 丢弃日志上同样包裹。
+>   退出上下文自动恢复，不污染外层（`logging_setup.log_context` 已支持嵌套恢复）。
 >
-> 因此 PI-021 保留为 DOING：correlation 字段已部分可用，但尚未覆盖
-> browser / tool / retry / 最终结果的全链路。
+> 于是入口 `request_id` → session → browser 生成 → tool 执行 → retry 尝试 → 最终结果
+> 全部带上关联字段，满足验收「能够从入口日志追到 browser、tool、retry 和最终结果」。
+> 回归：`tests/test_logging_setup.py::ToolCallCorrelationTests`（3 项，已验证对未接线敏感）。
 
 统一记录：
 
@@ -998,9 +1000,9 @@ perf: establish browser request baseline
 > - PI-026 由 TODO 转为 DONE：`chatgpt_web/browser_input.py`（输入）、
 >   `reply_extractor.py`（回复提取）、`reply_waiter.py`（生成等待）已落地，
 >   `chat_io.py` 保留为组合 facade。
-> - PI-021 由 TODO 转为 DOING：`request_id` / `session_key` / `page_id`
->   correlation 已部分接入（`logging_setup.py`、`server.py`、`reply_waiter.py`），
->   但 `tool_call_id` / `attempt_id` 尚未并入统一日志上下文，全链路未闭合。
+> - PI-021 由 DOING 转为 DONE：补齐 `tool_call_id` 关联（`tools/executor.py`、
+>   `tools/validator.py` 用 `log_context` 包裹），连同已有的 `request_id` /
+>   `session_key` / `page_id` / `attempt_id`，入口→browser→tool→retry→结果全链路闭合。
 > - 仍为 TODO 的任务经再次确认确实未落地：PI-015（无集中 `RequestLimits`，
 >   `grep` 无命中）、PI-022（`tests/e2e/` 仅有 `test_dom_probe.py` 探测层，
 >   无 E1–E5 黄金 E2E）、PI-027（`ChatGPTWebDriver` 仍继承 5 个 Mixin，11 处
@@ -1037,7 +1039,7 @@ perf: establish browser request baseline
 | PI-018 | Session 不变量 | P1 | PI-017 | DONE |
 | PI-019 | health / readiness / diagnostics | P1 | PI-005 | DONE |
 | PI-020 | metrics | P1 | PI-019 | DONE |
-| PI-021 | 日志 correlation | P2 | PI-020 | DOING |
+| PI-021 | 日志 correlation | P2 | PI-020 | DONE |
 | PI-022 | 五个黄金 E2E | P1 | PI-005/003 | TODO |
 | PI-023 | 性质 / 不变量测试 | P1 | PI-007/016/017 | DONE |
 | PI-024 | API contract tests | P2 | PI-003/004 | DONE |

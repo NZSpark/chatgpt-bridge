@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .. import config
 from ..errors import ToolCallExecutionError, ToolCallParseError
+from ..logging_setup import log_context
 from ..metrics import metrics
 from . import policy as _policy
 from .ledger import TOOL_EXECUTION_LEDGER, ToolExecutionLedger
@@ -120,36 +121,40 @@ def run_local_edit_markdown(
                     out.append({**call, "id": call_id, "result": result, "duplicate": True})
                     continue
                 metrics.inc("tool_duplicate_total")
-                logger.warning(
-                    "重复工具执行被跳过：session_key=%r tool_call_id=%s tool=%s",
-                    session_key or "default",
-                    call_id,
-                    existing.tool_name,
-                )
+                with log_context(tool_call_id=call_id):
+                    logger.warning(
+                        "重复工具执行被跳过：session_key=%r tool_call_id=%s tool=%s",
+                        session_key or "default",
+                        call_id,
+                        existing.tool_name,
+                    )
                 out.append({**call, "id": call_id, "result": existing.result, "duplicate": True})
                 continue
             started_at = time.monotonic()
-            with metrics.timer("tool_execution_latency"):
-                try:
-                    result = execute_edit_markdown(arguments, backup_dir=backup_dir)
-                    success = bool(result.get("ok"))
-                    error_type = None if success else "ToolExecutionError"
-                except Exception as exc:  # noqa: BLE001
-                    error_type = type(exc).__name__
-                    result = {"ok": False, "error": str(exc)}
-                    success = False
-            if not success:
-                metrics.inc("tool_execution_failure_total")
-            ledger.record(
-                session_key=session_key,
-                tool_call_id=call_id,
-                tool_name=EDIT_MARKDOWN_TOOL_NAME,
-                normalized_arguments=arguments,
-                started_at=started_at,
-                success=success,
-                error_type=error_type,
-                result=result,
-            )
+            # PI-021：把 tool_call_id 绑进日志关联上下文，退出后自动恢复，
+            # 于是这一段的 ledger / metrics 日志都能从入口 request_id 追到具体工具调用。
+            with log_context(tool_call_id=call_id):
+                with metrics.timer("tool_execution_latency"):
+                    try:
+                        result = execute_edit_markdown(arguments, backup_dir=backup_dir)
+                        success = bool(result.get("ok"))
+                        error_type = None if success else "ToolExecutionError"
+                    except Exception as exc:  # noqa: BLE001
+                        error_type = type(exc).__name__
+                        result = {"ok": False, "error": str(exc)}
+                        success = False
+                if not success:
+                    metrics.inc("tool_execution_failure_total")
+                ledger.record(
+                    session_key=session_key,
+                    tool_call_id=call_id,
+                    tool_name=EDIT_MARKDOWN_TOOL_NAME,
+                    normalized_arguments=arguments,
+                    started_at=started_at,
+                    success=success,
+                    error_type=error_type,
+                    result=result,
+                )
             out.append({**call, "id": call_id, "result": result})
         else:
             out.append(call)

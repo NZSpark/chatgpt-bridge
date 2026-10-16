@@ -75,6 +75,89 @@ class RequestIdTests(unittest.TestCase):
         self.assertEqual(logging_setup.current_request_id(), "-")
 
 
+class ToolCallCorrelationTests(unittest.TestCase):
+    """PI-021：tool_call_id 必须能进入日志关联上下文，闭合入口→tool 链路。"""
+
+    def _filter(self):
+        logging_setup.configure_logging(force=True)
+        handler = logging.getLogger(logging_setup.LOGGER_NAME).handlers[0]
+        return next(
+            f for f in handler.filters if f.__class__.__name__ == "_RequestIdFilter"
+        )
+
+    def test_log_context_binds_tool_call_id(self) -> None:
+        filter_ = self._filter()
+        record = logging.LogRecord("chatgpt_web.tools", logging.INFO, __file__, 1, "x", (), None)
+        with logging_setup.log_context(tool_call_id="call_abc123"):
+            filter_.filter(record)
+            self.assertEqual(record.tool_call_id, "call_abc123")
+        # 退出上下文后恢复为占位符，不泄漏到后续日志
+        after = logging.LogRecord("chatgpt_web.tools", logging.INFO, __file__, 1, "y", (), None)
+        filter_.filter(after)
+        self.assertEqual(after.tool_call_id, "-")
+
+    def test_log_context_nests_and_restores_outer_value(self) -> None:
+        with logging_setup.log_context(tool_call_id="outer"):
+            self.assertEqual(logging_setup.current_log_context()["tool_call_id"], "outer")
+            with logging_setup.log_context(tool_call_id="inner"):
+                self.assertEqual(logging_setup.current_log_context()["tool_call_id"], "inner")
+            self.assertEqual(logging_setup.current_log_context()["tool_call_id"], "outer")
+
+    def test_executor_duplicate_log_carries_tool_call_id(self) -> None:
+        """走真实执行路径：重复执行被跳过时，那条 warning 必须带 tool_call_id。
+
+        场景：同一 ``(session_key, tool_call_id)`` 已被 ledger 记录过，第二次
+        ``run_local_edit_markdown`` 命中 not-owner 分支并发 warning。
+        """
+        from chatgpt_web.tools import executor as _executor
+        from chatgpt_web.tools.ledger import ToolExecutionLedger
+
+        filter_ = self._filter()
+        logger = logging.getLogger("chatgpt_web.tools.executor")
+        logger.setLevel(logging.DEBUG)
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                filter_.filter(record)
+                captured.append(record)
+
+        handler = _Capture()
+        logger.addHandler(handler)
+        try:
+            ledger = ToolExecutionLedger()
+            # 先占位登记，让第二次调用进入「重复执行被跳过」分支。
+            _existing, _event, owner = ledger.claim("sess", "call_dup")
+            self.assertTrue(owner)
+            ledger.record(
+                session_key="sess",
+                tool_call_id="call_dup",
+                tool_name="edit_markdown",
+                normalized_arguments={},
+                started_at=0.0,
+                success=True,
+                error_type=None,
+                result={"ok": True},
+            )
+            with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", True):
+                _executor.run_local_edit_markdown(
+                    [{
+                        "id": "call_dup",
+                        "name": "edit_markdown",
+                        "arguments": {"path": "README.md", "start": 1, "end": 1, "new_text": "x"},
+                    }],
+                    session_key="sess",
+                    backup_dir="/tmp/pi-correlation-backups",
+                    ledger=ledger,
+                )
+        finally:
+            logger.removeHandler(handler)
+
+        dup_records = [r for r in captured if "重复工具执行被跳过" in r.getMessage()]
+        self.assertTrue(dup_records, [r.getMessage() for r in captured])
+        self.assertEqual(dup_records[0].tool_call_id, "call_dup")
+
+
 class NonSilentFailureTests(unittest.TestCase):
     """落盘失败必须留下 warning（旧代码是静默 ``except: pass``）。"""
 

@@ -14,6 +14,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from ..errors import ToolCallValidationError
+from ..logging_setup import log_context
 from .parser import ToolCallRequest
 
 logger = logging.getLogger(__name__)
@@ -77,11 +78,13 @@ def deduplicate_tool_call_requests(
     unique: List[ToolCallRequest] = []
     for request in requests:
         if request.id in seen_ids:
-            logger.warning(
-                "重复 tool_call 被丢弃：tool_call_id=%s tool=%s",
-                request.id,
-                request.name,
-            )
+            # PI-021：dedup 日志也带上 tool_call_id 关联字段。
+            with log_context(tool_call_id=request.id):
+                logger.warning(
+                    "重复 tool_call 被丢弃：tool_call_id=%s tool=%s",
+                    request.id,
+                    request.name,
+                )
             continue
         seen_ids.add(request.id)
         unique.append(request)
