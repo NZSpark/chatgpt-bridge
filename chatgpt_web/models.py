@@ -89,11 +89,29 @@ class ChatCompletionResponse(BaseModel):
     saved_files: List[str] = []
 
 
+# 模型输入 / 输出模态声明（见 doc/image_upload.md §3.6）。
+# 客户端（Pi 等）通过 GET /v1/models 探测模型能力；标准 OpenAI 响应只有
+# ``{id, object, created, owned_by}``，不含模态字段，客户端据此默认 text-only，
+# 会在请求构建阶段就把图片静默剥离——图片根本到不了桥接服务。
+# 因此必须显式声明输入模态，且声明要诚实（关闭粘贴时仍声明 text+image，
+# 因为此时图片会以 `[图片]` 文本引用形式进入模型，模型「看得到」这是张图）。
+INPUT_MODALITIES = ["text", "image"]
+OUTPUT_MODALITIES = ["text"]
+MODALITY = "text+image->text"       # OpenRouter 风格模态串
+
+
 class ModelCard(BaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "chatgpt-web-bridge"
+    # OpenAI 现行字段：显式声明输入 / 输出模态，客户端据此决定是否发送图片。
+    input_modalities: List[str] = Field(default_factory=lambda: ["text", "image"])
+    output_modalities: List[str] = Field(default_factory=lambda: ["text"])
+    # OpenRouter 约定：部分客户端据此判定能否收图。两者都给，兼容面最广。
+    architecture: Dict[str, Any] = Field(
+        default_factory=lambda: {"modality": "text+image->text"}
+    )
 
 
 class ModelListResponse(BaseModel):

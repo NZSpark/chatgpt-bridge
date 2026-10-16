@@ -398,7 +398,15 @@ async def list_models():
     清单来自 :func:`chatgpt_web.models.advertised_models`（``/bridge models`` 同源）。
     """
     return ModelListResponse(
-        data=[ModelCard(id=m["id"]) for m in models.advertised_models()]
+        data=[
+            ModelCard(
+                id=m["id"],
+                input_modalities=models.INPUT_MODALITIES,
+                output_modalities=models.OUTPUT_MODALITIES,
+                architecture={"modality": models.MODALITY},
+            )
+            for m in models.advertised_models()
+        ]
     )
 
 

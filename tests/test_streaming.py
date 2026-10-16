@@ -35,12 +35,14 @@ class FakeDriver:
     def __init__(self, reply="hello there"):
         self.reply = reply
         self.validate_calls = []
+        self.images_calls = []
 
     async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None,
-                        validate_reply=None):
+                        validate_reply=None, images=None):
         # 生产代码在工具模式下会传纠偏判定；fake 记录它，但不重试
         # （纠偏重试的行为由 tests/test_tool_injection.py 用假 page 覆盖）。
         self.validate_calls.append(validate_reply)
+        self.images_calls.append(images)
         if on_delta:
             await on_delta(self.reply)
         return self.reply, []

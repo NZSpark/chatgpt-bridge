@@ -95,6 +95,20 @@ def _tool_to_chat(tool: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _has_image_part(content: Any) -> bool:
+    """content 数组里是否有图片分片（Responses 风格 ``input_image`` 等）。"""
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if isinstance(part, dict) and (
+            part.get("type") in ("input_image", "image_url")
+            or "image_url" in part
+            or "image" in part
+        ):
+            return True
+    return False
+
+
 def _content_parts_to_text(content: Any) -> str:
     """把 Responses 的 content（string / item 数组）里的文本抽出为纯文本。"""
     if content is None:
@@ -125,7 +139,12 @@ def _item_to_message(item: Dict[str, Any]) -> Optional[ChatMessage]:
     itype = item.get("type")
     if itype == "message" or ("role" in item and "content" in item):
         role = item.get("role", "user")
-        text = _content_parts_to_text(item.get("content"))
+        raw_content = item.get("content")
+        # 含图片分片时保留原始 content 数组（prompting.extract_images / _content_to_text
+        # 认得其中文本与图片分片）；否则归一化为纯文本，行为与以前一致。
+        if _has_image_part(raw_content):
+            return ChatMessage(role=role, content=raw_content)
+        text = _content_parts_to_text(raw_content)
         return ChatMessage(role=role, content=text)
     if itype == "function_call":
         call = ToolCall(

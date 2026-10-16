@@ -24,7 +24,7 @@ from ..models import (
     ChoiceMessage,
     Usage,
 )
-from ..prompting import build_prompt, estimate_tokens, tool_nudge_predicate
+from ..prompting import build_prompt, estimate_tokens, extract_images, tool_nudge_predicate
 from ..protocol_adapters import (
     chat_sse_choice_for_event,
     completed_text,
@@ -46,6 +46,17 @@ logger = logging.getLogger("chatgpt_web.streaming")
 
 def chunk_text(text: str, size: int = 64) -> List[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
+
+def collect_images(messages) -> list:
+    """抽取「本轮新增」的图片附件并做数量上限裁剪（见 doc/image_upload.md §3.2）。
+
+    只在图片首次出现的那一轮粘贴一次（``only_delta=True``），避免多轮里历史图片
+    被反复贴进输入框。开关关闭 / 超上限时返回空列表（全部退回文本引用）。
+    """
+    if not config.IMAGE_PASTE_ENABLED:
+        return []
+    return extract_images(messages, only_delta=True)[: config.IMAGE_PASTE_MAX]
 
 
 async def stream_chat_completion(
@@ -169,6 +180,9 @@ async def stream_chat_completion(
                     validate_reply=tool_nudge_predicate(
                         working_messages, request.tools, request.tool_choice
                     ),
+                    # 只贴「本轮新增」的图；本地 edit_markdown 续轮时，历史图片已在
+                    # 上一轮粘过，only_delta 会自然抽不到，不会重复粘。
+                    images=collect_images(working_messages),
                 )
 
                 parsed_tool_calls = parse_reply_tool_calls(reply, request.tools) if wants_tools else []
@@ -407,6 +421,7 @@ async def run_chat_completion(
             validate_reply=tool_nudge_predicate(
                 request.messages, request.tools, request.tool_choice
             ),
+            images=collect_images(request.messages),
         )
     except ChatGPTContextLimitError as exc:
         logger.error("\n[ERR] 网页会话已达上下文长度上限:", exc_info=True)
@@ -500,6 +515,7 @@ async def run_chat_completion(
                 validate_reply=tool_nudge_predicate(
                     working_messages, request.tools, request.tool_choice
                 ),
+                images=collect_images(working_messages),
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("本地 edit_markdown 执行后继续生成失败：%s", exc, exc_info=True)

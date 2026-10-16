@@ -8,7 +8,7 @@
 import asyncio
 import logging
 import uuid
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from . import config
 from .browser_input import BrowserInputMixin
@@ -51,6 +51,94 @@ def _recovery_reason(exc: RuntimeError) -> str:
 class ChatIOMixin(
     BucketActivityMixin, BrowserInputMixin, ReplyExtractorMixin, ReplyWaiterMixin
 ):
+    #: 在页面内合成 paste 事件，把真实图片文件贴进 contenteditable composer。
+    #: Playwright 的 evaluate 只能传可序列化数据，字节必须以 ``list[int]`` 传入，
+    #: 页面侧再用 ``new Uint8Array`` 还原（见 doc/image_upload.md §2.1）。
+    _PASTE_IMAGE_JS = """
+    ([name, mime, bytesArray]) => {
+      const el = document.activeElement
+        || document.querySelector('[contenteditable="true"]');
+      if (!el) return false;
+      const file = new File([new Uint8Array(bytesArray)], name, {type: mime});
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      el.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: dt, bubbles: true, cancelable: true, composed: true,
+      }));
+      return true;
+    }
+    """
+
+    async def _focus_composer(self, page, composer) -> None:
+        """粘贴前确保输入框获得焦点。
+
+        合成 paste 事件时页面侧用 ``document.activeElement`` 定位编辑器；若不先聚焦，
+        焦点可能不在 composer 上，图片会贴到错误的元素。click 失败时退回 JS focus
+        （元素被弹层遮挡等情况下 click 不可靠）。失败非致命：由调用方降级。
+        """
+        if composer is None:
+            return
+        try:
+            await composer.click(timeout=config.FILL_TIMEOUT_MS)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await composer.evaluate("(el) => el.focus()")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _download_image(self, url: str) -> Optional[bytes]:
+        """用浏览器上下文下载远程图片（复用登录态 / cookie）。
+
+        不要用裸 HTTP 客户端：远程图片可能要求与网页会话相同的 cookie / 来源。
+        任何失败都返回 None，由调用方降级（只记录日志，不阻断文本提交）。
+        """
+        context = getattr(self, "context", None)
+        if context is None:
+            return None
+        try:
+            response = await context.request.get(
+                url, timeout=config.IMAGE_DOWNLOAD_TIMEOUT_MS
+            )
+            if response.ok:
+                return await response.body()
+            logger.warning("[图片] 下载失败 status=%s url=%s", response.status, url[:80])
+        except Exception as exc:  # noqa: BLE001 下载失败一律降级
+            logger.warning("[图片] 下载异常 %s: url=%s", type(exc).__name__, url[:80])
+        return None
+
+    async def _paste_images(self, page, composer, images: Optional[List[Any]]) -> int:
+        """把真实图片文件以合成 paste 事件粘贴进输入框，返回成功派发的张数。
+
+        任何一步失败（下载失败、focus 失败、事件派发异常）都**只记录日志**，
+        不阻断文本提交——文本 prompt 已带 `[图片]` 引用行，最差退回到文本引用语义。
+        """
+        if not images or not config.IMAGE_PASTE_ENABLED:
+            return 0
+        pasted = 0
+        for image in images:
+            data = getattr(image, "data", None)
+            if data is None and getattr(image, "url", None):
+                data = await self._download_image(image.url)
+            if not data:
+                continue
+            name = getattr(image, "name", "image.png") or "image.png"
+            mime = getattr(image, "mime", "image/png") or "image/png"
+            try:
+                # 粘贴前确保输入框聚焦，否则 document.activeElement 不是编辑器。
+                await self._focus_composer(page, composer)
+                ok = await page.evaluate(
+                    self._PASTE_IMAGE_JS, [name, mime, list(data)]
+                )
+                if ok:
+                    pasted += 1
+                    if config.DEBUG:
+                        logger.debug("[图片] 已粘贴 %s（%s, %d 字节）", name, mime, len(data))
+            except Exception as exc:  # noqa: BLE001 粘贴失败一律降级，不阻断提交
+                logger.warning("[图片] 粘贴失败 %s: name=%s", type(exc).__name__, name)
+        return pasted
+
     async def send_chat(
         self,
         prompt: str,
@@ -58,6 +146,7 @@ class ChatIOMixin(
         seeded_prompt: Optional[str] = None,
         key: Optional[str] = None,
         validate_reply: Optional[Callable[[str], bool]] = None,
+        images: Optional[List[Any]] = None,
     ) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应。
 
@@ -66,6 +155,9 @@ class ChatIOMixin(
                               未提供则退回 ``prompt``）
         :param key: 会话桶标识（按任务隔离会话）。不同 key 各自持有一条独立
                     的网页会话与页面，互不污染上下文；None 表示默认桶。
+        :param images: 可选「本轮新增」的图片附件（:class:`prompting.ImageAttachment`）。
+                    在文本写进输入框之后、提交之前粘进去（见 doc/image_upload.md §3.3）。
+                    失败非致命：只告警，不阻断文本提交。
         :param validate_reply: 可选「回复是否可接受」判定；返回 False 时会
                     在同一会话追发一次工具纠偏指令（仅一次，见 T1.1）。
                     调用方需自行保证此时未把首轮回复流式发给客户端。
@@ -120,6 +212,7 @@ class ChatIOMixin(
                 seeded_prompt=seeded_prompt,
                 key=bucket,
                 validate_reply=validate_reply,
+                images=images,
             )
         finally:
             self._unmark_bucket_active(bucket)
@@ -131,6 +224,7 @@ class ChatIOMixin(
         seeded_prompt: Optional[str] = None,
         key: Optional[str] = None,
         validate_reply: Optional[Callable[[str], bool]] = None,
+        images: Optional[List[Any]] = None,
     ) -> tuple[str, List[dict]]:
         """发送与重试阶梯本体，供 :meth:`send_chat` 调用（见那里的说明）。"""
         bucket = key or DEFAULT_SESSION_KEY
@@ -200,8 +294,13 @@ class ChatIOMixin(
 
             await self._remember_session(bucket)
             try:
+                # 只在真的带图时才传 images：这样既让生产 driver 收到图片，也不破坏
+                # 既有测试里那些只接受 (prompt, on_delta, key) 的 _send_chat_locked 替身。
+                locked_kwargs = {"key": bucket}
+                if images:
+                    locked_kwargs["images"] = images
                 reply_text, blocks = await self._send_chat_locked(
-                    active_prompt, on_delta, key=bucket
+                    active_prompt, on_delta, **locked_kwargs
                 )
             except (ChatGPTPageLostError, ChatGPTComposerError) as exc:
                 # 页面不可继续使用：句柄没了（标签被关 / 渲染进程崩溃 / 挂起），或页面

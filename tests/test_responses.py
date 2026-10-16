@@ -40,6 +40,7 @@ class FakeDriver:
         self.reply = reply
         self.page = object()
         self.validate_calls = []
+        self.images_calls = []
 
     def needs_seed(self, key=None):
         return False
@@ -48,9 +49,10 @@ class FakeDriver:
         return "prompt"
 
     async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None,
-                        validate_reply=None):
+                        validate_reply=None, images=None):
         # validate_reply：生产代码在工具模式下传的纠偏判定；这里只记录，不重试。
         self.validate_calls.append(validate_reply)
+        self.images_calls.append(images)
         if on_delta:
             await on_delta(self.reply)
         return self.reply, []

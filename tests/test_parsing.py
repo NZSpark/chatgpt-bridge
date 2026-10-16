@@ -26,9 +26,11 @@ class ContentToTextTests(unittest.TestCase):
     def test_plain_string_parts(self):
         self.assertEqual(srv._content_to_text(["a", "b"]), "a\nb")
 
-    def test_non_text_parts_are_ignored(self):
+    def test_image_part_becomes_text_reference(self):
+        # 图片分片现在降级为一行 `[图片] …` 文本引用（不再被完全丢弃），
+        # 但绝不含完整 base64。
         content = [{"type": "image_url", "image_url": {"url": "x"}}, {"text": "kept"}]
-        self.assertEqual(srv._content_to_text(content), "kept")
+        self.assertEqual(srv._content_to_text(content), "[图片] x\nkept")
 
     def test_dict_without_text(self):
         self.assertEqual(srv._content_to_text({"foo": 1}), "")

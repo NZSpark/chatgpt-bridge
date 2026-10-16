@@ -156,7 +156,7 @@ class _FakeDriver:
         self.reply = reply
 
     async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None,
-                        validate_reply=None):
+                        validate_reply=None, images=None):
         if on_delta:
             await on_delta(self.reply)
         return self.reply, []

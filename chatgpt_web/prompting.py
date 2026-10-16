@@ -1,7 +1,9 @@
 """把客户端的消息数组转换成网页输入框里的一整段文本，以及若干纯文本工具函数。"""
 
+import base64
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
@@ -17,6 +19,139 @@ from .toolcalls import (
 # 播种 prompt 的上下文重建头（去重 / 泄漏检测共用同一份，见 toolcalls 里的标题常量说明）。
 CONTEXT_REBUILD_HEADER = "[上下文重建]"
 ENV_NOTE_HEADER = "[环境说明]"
+
+# 图片分片降级成文本引用行时的前缀标记（与 DeepseekBridge 对齐）。
+MARK_IMAGE = "[图片]"
+
+
+# ==================== 图片直传：抽取层 ====================
+# 参考 doc/image_upload.md：网页版 composer 是 contenteditable，无法用
+# set_input_files 塞文件，必须模拟「粘贴」；而粘贴需要的原始字节 / 远程 URL
+# 都要先从这里（客户端发来的 OpenAI 消息数组）抽出来。
+@dataclass(slots=True)
+class ImageAttachment:
+    """一张待粘贴进网页输入框的图片。
+
+    ``data`` 在 base64 已知时给出原始字节；``url`` 用于远程图片惰性下载。
+    两者至少有一个非空（由 :func:`extract_images` 保证）。
+    """
+
+    name: str
+    mime: str
+    data: Optional[bytes] = None
+    url: Optional[str] = None
+
+
+def _is_image_part(part: dict) -> bool:
+    """判断一个内容分片是否是 OpenAI 的图片分片。"""
+    ptype = part.get("type")
+    if ptype in ("image_url", "input_image"):
+        return True
+    # 兼容部分客户端直接给裸 url / image 字段
+    return "image_url" in part or "image" in part
+
+
+def _image_url(part: dict) -> Optional[str]:
+    """从图片分片里取出 URL（data URI 或远程地址），兼容三种写法。
+
+    * ``{"type": "image_url", "image_url": {"url": "..."}}``（标准 OpenAI）
+    * ``{"type": "image_url", "image_url": "..."}``（简化写法）
+    * ``{"type": "input_image", "image_url": "..."}``（Responses 风格）
+    * ``{"url": "..."}`` / ``{"image": "..."}``（裸字段）
+    """
+    raw = part.get("image_url")
+    if isinstance(raw, dict):
+        raw = raw.get("url")
+    if not isinstance(raw, str) or not raw:
+        raw = part.get("url") or part.get("image")
+    return raw if isinstance(raw, str) and raw else None
+
+
+def _parse_data_uri(url: str) -> Optional[Tuple[str, bytes]]:
+    """把 ``data:<mime>;base64,<payload>`` 解析为 (mime, 字节)。
+
+    非 base64 / 空 payload / 解码失败都返回 None（调用方跳过该分片）。
+    """
+    header, _, payload = url.partition(",")
+    if ";base64" not in header or not payload:
+        return None
+    mime = header.removeprefix("data:").split(";", 1)[0] or "application/octet-stream"
+    try:
+        return mime, base64.b64decode(payload, validate=False)
+    except (ValueError, TypeError):
+        return None
+
+
+def _messages_since_last_assistant(messages: List[ChatMessage]) -> List[ChatMessage]:
+    """返回最后一条 assistant 消息之后的「本轮新增」消息。
+
+    多轮对话里历史消息的图片会随每一轮请求被重复带上；只在「本轮新增」里抽图，
+    图片就只会在它首次出现的那一轮被粘贴一次（见 doc/image_upload.md §2.4）。
+    兼容 dict / 对象两种消息形态。
+    """
+
+    def _role(message: Any) -> Optional[str]:
+        if isinstance(message, dict):
+            return message.get("role")
+        return getattr(message, "role", None)
+
+    last = -1
+    for index, message in enumerate(messages):
+        if _role(message) == "assistant":
+            last = index
+    if last < 0 or last + 1 >= len(messages):
+        # 无 assistant / 无新增：退回全部（宁多贴不漏）。
+        return list(messages)
+    return list(messages[last + 1:])
+
+
+def _iter_image_parts(content: Any):
+    """遍历 content 里的图片分片，产出 (part, url)。非图片分片跳过。"""
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if not (isinstance(part, dict) and _is_image_part(part)):
+            continue
+        url = _image_url(part)
+        if url:
+            yield part, url
+
+
+def extract_images(messages: List[ChatMessage], only_delta: bool = False) -> List[ImageAttachment]:
+    """从消息里收集图片分片；base64 解码为字节，URL 保留待下载。
+
+    ``only_delta=True`` 时只看「本轮新增消息」——图片只粘贴一次，避免多轮里
+    历史图片被反复贴进输入框（见 doc/image_upload.md §2.4）。
+    """
+    if only_delta:
+        messages = _messages_since_last_assistant(messages)
+    attachments: List[ImageAttachment] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+        for _part, url in _iter_image_parts(content):
+            if url.startswith("data:"):
+                parsed = _parse_data_uri(url)
+                if parsed is None:
+                    continue
+                mime, data = parsed
+                if not data:  # 空 / 非法 base64 解出 b""：跳过，不贴 0 字节文件
+                    continue
+                ext = mime.split("/")[-1] or "png"
+                attachments.append(ImageAttachment(name=f"image.{ext}", mime=mime, data=data))
+            else:
+                name = url.rsplit("/", 1)[-1].split("?", 1)[0] or "image.png"
+                attachments.append(ImageAttachment(name=name, mime="image/png", url=url))
+    return attachments
+
+
+def _image_reference(url: str) -> str:
+    """图片分片降级成文本引用行。**绝不包含完整 base64 字节**（§2.5）。"""
+    if url.startswith("data:"):
+        header, _, payload = url.partition(",")
+        media = header.removeprefix("data:").split(";", 1)[0] or "image"
+        approx_kb = max(1, len(payload) * 3 // 4 // 1024)
+        return f"{MARK_IMAGE} ({media}, ~{approx_kb}KB base64)"
+    return f"{MARK_IMAGE} {url}"
 
 # ==================== 工具结果「没有输出」的识别与说明 ====================
 # 背景（用户实测死循环）：命令成功但没有任何 stdout 时，客户端（Pi / Codex）会把
@@ -155,6 +290,13 @@ def _content_to_text(content: Any) -> str:
             if isinstance(part, str):
                 pieces.append(part)
             elif isinstance(part, dict):
+                # 图片分片：降级为一行文本引用（历史图片仍会以 `[图片] …` 出现，
+                # 作为兜底锚点；但绝不含完整 base64）。
+                if _is_image_part(part):
+                    url = _image_url(part)
+                    if url:
+                        pieces.append(_image_reference(url))
+                    continue
                 text = part.get("text")
                 if isinstance(text, str):
                     pieces.append(text)

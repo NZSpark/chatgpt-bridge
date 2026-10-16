@@ -79,11 +79,13 @@ class ReplyWaiterMixin:
         )
 
     async def _send_chat_locked(self, prompt: str, on_delta=None,
-                                key: Optional[str] = None) -> tuple[str, List[dict]]:
+                                key: Optional[str] = None,
+                                images: Optional[List[Any]] = None) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应及提取的代码块。
 
         :param on_delta: 可选异步回调，生成过程中实时吐出增量文本（用于 SSE 流式）。
         :param key: 会话桶标识（决定使用哪一条页面）。
+        :param images: 本轮新增的图片附件；在文本写进输入框之后、提交之前粘进去。
         """
         bucket = key or DEFAULT_SESSION_KEY
         page = self._page_for(bucket)
@@ -158,6 +160,11 @@ class ReplyWaiterMixin:
                     "若仍看到这条错误，多半是站点改版或登录态问题。"
                 )
             chat_input = filled
+            # 图片必须在文本写进输入框之后、按 Enter 之前粘进去：编辑器此时已聚焦、
+            # 文本已在框内，合成 paste 会把图片附加到同一条消息上（见 doc/image_upload.md §3.3）。
+            # 失败非致命：_paste_images 内部只告警，不阻断提交。
+            if images:
+                await self._paste_images(page, chat_input, images)
             await self._submit_prompt(page, chat_input)
             generation_started_at = time.monotonic()
             first_text_at: Optional[float] = None

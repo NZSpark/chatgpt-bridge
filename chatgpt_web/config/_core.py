@@ -287,6 +287,17 @@ SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 120)
 SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 10000000)
 
 
+# ==================== 图片直传 ====================
+# 把请求里的图片（base64 data URI / 远程 URL）以真实文件的形式「粘贴」进网页版
+# 输入框，而不是降级成一行文本引用。见 doc/image_upload.md 的实现指南。
+# 关闭时全部退回文本引用（图片本体不进输入框，仅保留 `[图片] …` 引用行）。
+IMAGE_PASTE_ENABLED = env_bool("IMAGE_PASTE_ENABLED", True)
+# 单轮最多粘贴几张图（0 = 全部降级为文本引用）。
+IMAGE_PASTE_MAX = max(0, env_int("IMAGE_PASTE_MAX", 4))
+# 远程图片（http/https URL）下载超时（毫秒）。走浏览器上下文复用登录态 / cookie。
+IMAGE_DOWNLOAD_TIMEOUT_MS = max(500, env_int("IMAGE_DOWNLOAD_TIMEOUT_MS", 10000))
+
+
 # ==================== Responses API（Codex CLI）====================
 # 是否启用 /v1/responses 路由。默认开启；关闭后该端点返回 404，
 # 且 /v1/chat/completions（Pi）完全不受影响。
@@ -522,6 +533,9 @@ class CompletionConfig:
     tool_nudge_until_first_call: bool
     tools_instruction_verbose: bool
     tools_desc_max_chars: int
+    image_paste_enabled: bool
+    image_paste_max: int
+    image_download_timeout_ms: int
 
 
 @dataclass(frozen=True)
@@ -647,6 +661,9 @@ def build_config_bundle() -> ConfigBundle:
             tool_nudge_until_first_call=cfg.TOOL_NUDGE_UNTIL_FIRST_CALL,
             tools_instruction_verbose=cfg.TOOLS_INSTRUCTION_VERBOSE,
             tools_desc_max_chars=cfg.TOOLS_DESC_MAX_CHARS,
+            image_paste_enabled=cfg.IMAGE_PASTE_ENABLED,
+            image_paste_max=cfg.IMAGE_PASTE_MAX,
+            image_download_timeout_ms=cfg.IMAGE_DOWNLOAD_TIMEOUT_MS,
         ),
         tool=ToolConfig(
             tool_result_max_chars=cfg.TOOL_RESULT_MAX_CHARS,
