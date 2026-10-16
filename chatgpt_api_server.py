@@ -114,7 +114,12 @@ from chatgpt_web.toolcalls import (  # noqa: F401
 configure_logging()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """启动 HTTP 服务（控制台入口 ``chatgpt-bridge`` / ``python chatgpt_api_server.py``）。"""
     import uvicorn
 
     uvicorn.run(app, host=config.HOST, port=config.PORT)
+
+
+if __name__ == "__main__":
+    main()

@@ -24,12 +24,25 @@ dev = [
     "openai>=1,<4",     # e2e B8（SDK 冒烟）用
 ]
 
+[project.scripts]
+# 顶层入口（仓库根 chatgpt_api_server.py）；安装后可用同名命令启动，
+# 也让 tests/test_parsing.py 的 `import chatgpt_api_server` 在已安装环境下可用。
+chatgpt-bridge = "chatgpt_api_server:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["chatgpt_web"]
+# 自动发现 chatgpt_web 及其全部子包（api/browser/completion/config/session/tools）。
+# 旧写法 `packages = ["chatgpt_web"]` 只打包顶层，子包会全部漏掉、装出来直接不可用。
+packages = { find = { include = ["chatgpt_web*"] } }
+# chatgpt_api_server.py 是仓库根的单文件入口，不在 chatgpt_web 包内，需显式声明。
+py-modules = ["chatgpt_api_server"]
+
+[tool.uv]
+# 让 uv 把本项目当作可安装包处理（editable 安装 + 生成含 project 自身的 uv.lock）。
+package = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
