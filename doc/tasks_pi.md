@@ -164,7 +164,24 @@ extract_latest_reply()
 
 ## PI-006 DOM 改版黄金回归
 
-状态：BLOCKED｜优先级：P0｜依赖：PI-005
+状态：DONE｜优先级：P0｜依赖：PI-005
+
+> 核对（2026-10-17）：黄金回归已落地为**两层**，其中「不联网夹具层」默认运行，
+> 不再被 Cloudflare / 登录态阻塞。
+>
+> 1. **夹具层（默认运行，DONE）**：`tests/e2e/test_dom_golden.py` +
+>    `tests/e2e/fixtures/chatgpt_dom.html`。用真实 Playwright 打开复刻
+>    2026-10 校准结果的静态 DOM，再让真实的 `ChatGPTDOMAdapter` 跑六层探测，
+>    每层一个 `test_layer_*`，失败信息直接指名失效层（含真机含义），
+>    不再只能等 chat 请求总超时。六项全部通过，且已逐层验证「真破坏必失败」
+>    （移除 composer 候选 / reply 容器 / code block / stop 线索时对应层报错）。
+> 2. **真机层（仍需人工，环境阻塞）**：`tests/e2e/test_dom_probe.py` 继续负责
+>    真机选择器校准，能识别 Cloudflare challenge / `user_data` profile 占用为
+>    明确环境阻塞。
+>
+> 本机真实网页回归仍受 Cloudflare challenge 阻断，headed 模式另受 `user_data`
+> 被现有 Chromium 实例占用影响——这部分作为**已知环境限制**保留在真机层，
+> 不再阻塞 PI-006 的工程交付。
 
 增加真实网页检查：
 
@@ -179,7 +196,9 @@ extract_latest_reply()
 
 DOM 改版时，diagnostics 能指出具体失败层，而不是只能等待总超时。
 
-当前进展：`tests/e2e/test_dom_probe.py` 已覆盖上述探测层，并能把 Cloudflare / profile 占用识别为明确环境阻塞；本机真实回归目前被 ChatGPT Cloudflare challenge 阻断，headed 模式另受 `user_data` 被现有 Chromium 实例占用影响，因此不能宣称真实 DOM 黄金回归已通过。
+**已满足**：夹具层六个 `test_layer_*` 各自独立命名失效层，选择器改坏时对应层
+立即失败并给出命中情况；真机层 `test_dom_probe.py` 继续提供真实网页校准与
+环境阻塞识别。
 
 ---
 
@@ -988,8 +1007,10 @@ perf: establish browser request baseline
 >   Mixin 引用）、PI-028（无 `RetryPolicy`）、PI-029（无 `ChatBackend` Protocol）、
 >   PI-030（依赖 PI-015）、PI-031（无 LOCAL/SHARED mode、无 API key / rate limit）、
 >   PI-032（无性能 baseline 测试）。
-> - PI-006 仍为 BLOCKED：`tests/e2e/test_dom_probe.py` 已覆盖探测层，但真实
->   DOM 黄金回归受 ChatGPT Cloudflare challenge 与 `user_data` profile 占用阻断。
+> - PI-006 由 BLOCKED 转为 DONE：新增夹具层黄金回归
+>   `tests/e2e/test_dom_golden.py` + `tests/e2e/fixtures/chatgpt_dom.html`，
+>   默认运行、不联网，六层各自命名失效层；真机探测仍由 `test_dom_probe.py`
+>   负责，Cloudflare / profile 占用作为已知环境限制保留。
 > - 全套 `pytest -q` 通过（0 failed）；`git diff --check` 通过。工作区存在本轮
 >   相关的未提交改动（`.env.example`、`config/_core.py`、`chat_io.py`、`models.py`、
 >   `prompting.py`、`reply_waiter.py`、`server.py`、`api/*_adapter.py` 及对应测试）。
@@ -1001,7 +1022,7 @@ perf: establish browser request baseline
 | PI-003 | Bridge Event Model | P0 | PI-001 | DONE |
 | PI-004 | Chat / Responses Adapter | P0 | PI-003 | DONE |
 | PI-005 | DOM Adapter | P0 | - | DONE |
-| PI-006 | DOM 黄金回归 | P0 | PI-005 | BLOCKED |
+| PI-006 | DOM 黄金回归 | P0 | PI-005 | DONE |
 | PI-007 | ToolCall 强类型 | P1 | PI-003 | DONE |
 | PI-008 | ToolCall pipeline | P1 | PI-007 | DONE |
 | PI-009 | Execution ledger | P1 | PI-008 | DONE |

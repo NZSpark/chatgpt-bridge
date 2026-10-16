@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ChatGPT DOM golden fixture</title>
+<style>
+  /* 让元素在 Playwright 里被判为 visible（有尺寸、非 hidden）。 */
+  body { font-family: sans-serif; }
+  .row { display: block; min-height: 24px; }
+  button { min-width: 120px; min-height: 32px; }
+  div.ProseMirror { min-height: 40px; border: 1px solid #ccc; }
+  .CodeBlock-fixture { min-height: 60px; border: 1px solid #ddd; }
+</style>
+</head>
+<body>
+<!--
+  PI-006 DOM 黄金回归夹具。
+
+  用途：不联网地复现 2026-10 校准过的 ChatGPT 网页版 DOM 结构，让
+  ChatGPTDOMAdapter 的真实方法（find_input / find_new_chat / find_think_mode /
+  extract_latest_reply / find_stop_button / extract_code_blocks）在真实 Playwright
+  下跑一遍。选择器一旦被改坏，对应层会立刻失败，而不是等到真机总超时。
+
+  这里刻意只保留「选择器契约」相关的结构与属性（class / role / aria-label /
+  data-testid / data-language），不复制任何真实回复正文。
+-->
+
+  <!-- New Chat（侧边栏入口，命中 [data-testid="create-new-chat-button"]） -->
+  <nav id="sidebar">
+    <a class="row" data-testid="create-new-chat-button" aria-label="New chat"
+       href="/">New chat</a>
+  </nav>
+
+  <!-- composer：form 内的 ProseMirror（命中 INPUT_SELECTORS 首选） -->
+  <main id="thread">
+    <!-- assistant 回复节点：命中 [data-message-author-role="assistant"] -->
+    <div class="row" data-message-author-role="assistant">
+      <div class="markdown">
+        <p>Hello from the fixture.</p>
+        <!-- 新版代码块：容器 [class*="CodeBlock"]，正文 [data-language] -->
+        <div class="CodeBlock-fixture" data-markdown-copy="exclude">
+          <div class="code-head">python · Copy · Run code</div>
+          <div class="cm-content" data-language="python">print(&quot;hi&quot;)</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- composer 区域 -->
+  <form id="composer-form" class="row">
+    <div class="ProseMirror" contenteditable="true" role="textbox"
+         aria-label="Ask ChatGPT"></div>
+    <!-- Think 模式 pill：命中 button.__composer-pill，文本含 Think。
+         真实站点点击后会切换 aria-pressed；夹具用最小 JS 复刻这个行为，
+         否则 adapter 的「读回验证」会正确地判定切换失败（夹具缺陷，非 adapter）。 -->
+    <button type="button" class="__composer-pill" aria-pressed="false"
+            onclick="this.setAttribute('aria-pressed',
+                     this.getAttribute('aria-pressed') === 'true' ? 'false' : 'true')">
+      Think
+    </button>
+    <!-- 发送按钮：命中 button[data-testid="send-button"] -->
+    <button data-testid="send-button" aria-label="Send prompt" type="submit">Send</button>
+  </form>
+
+  <!-- 生成中：停止控件（find_stop_button 用 STOP_CONTROL_SELECTOR + 关键词）。
+       GENERATING_JS 只在「可见且位于视口下半部（rect.top > innerHeight/2）」时
+       判定为生成中，因此用一段高空白把停止控件推到页面底部。 -->
+  <div id="spacer" style="height:120vh"></div>
+  <div id="generating">
+    <button data-testid="stop-button" aria-label="Stop generating"
+            class="stop-button">Stop</button>
+  </div>
+</body>
+</html>
