@@ -534,7 +534,19 @@ session_recovery_latency
 
 ## PI-021 日志 correlation
 
-状态：TODO｜优先级：P2｜依赖：PI-020
+状态：DOING｜优先级：P2｜依赖：PI-020
+
+> 核对（2026-10-17）：部分落地。
+>
+> - `request_id`：已落地。`chatgpt_web/logging_setup.py` 提供 `new_request_id()` /
+>   `set_request_id()` / `set_log_context()`；`server.py` 在两个入口生成 request_id、
+>   写入日志上下文并通过 `X-Request-Id` 响应头回传。
+> - `session_key` / `page_id`：`reply_waiter.py` 已在生成等待日志里 `set_log_context`。
+> - `tool_call_id`：ledger 与 pipeline 已有该字段，但尚未接入统一日志上下文。
+> - `attempt_id`：尚未引入。
+>
+> 因此 PI-021 保留为 DOING：correlation 字段已部分可用，但尚未覆盖
+> browser / tool / retry / 最终结果的全链路。
 
 统一记录：
 
@@ -656,17 +668,22 @@ E5 必须检查输入框最后一次被填充的内容，确保 bridge 没有追
 
 ## PI-026 拆分 chat_io.py
 
-状态：TODO｜优先级：P2｜依赖：PI-005、PI-012
+状态：DONE｜优先级：P2｜依赖：PI-005、PI-012
 
-建议：
+> 核对（2026-10-17）：拆分已落地。
+>
+> - `chatgpt_web/browser_input.py`（`BrowserInputMixin`）：输入框定位、填充、清空、提交；
+> - `chatgpt_web/reply_extractor.py`（`ReplyExtractorMixin`）：回复文本 / code block 提取；
+> - `chatgpt_web/reply_waiter.py`（`ReplyWaiterMixin`）：生成等待、流式 delta、stop 检测；
+> - `chatgpt_web/chat_io.py` 保留为组合 facade，分别从上述模块 import 并 `_send_chat_locked` 编排。
+>
+> 定向回归：`tests/test_input_clear.py`、`tests/test_end_detection.py`、`tests/test_page_recovery.py`、
+> `tests/test_bridge_commands.py` 及全套 `pytest -q` 均通过。
 
-text
-browser_input.py
-reply_extractor.py
-reply_waiter.py
+建议文件名：`browser_input.py` / `reply_extractor.py` / `reply_waiter.py`
 
-
-分别负责输入、回复提取、生成等待。
+实际落地：`chatgpt_web/browser_input.py`（输入）、`chatgpt_web/reply_extractor.py`（回复提取）、
+`chatgpt_web/reply_waiter.py`（生成等待）；`chat_io.py` 保留为组合 facade。
 
 ## PI-027 Mixin → Service Composition
 
@@ -955,23 +972,27 @@ perf: establish browser request baseline
 
 # 15. 汇总任务表
 
-> 状态核对：2026-10-13（对照代码与测试）。正文各任务的状态与此表已对齐。
+> 状态核对：2026-10-17（对照代码与测试）。正文各任务的状态与此表已对齐。
 >
-> 本轮复核结论（2026-10-13）：
+> 本轮复核结论（2026-10-17）：
 > - 所有标记为 DONE 的任务均能在代码 / 测试中找到对应实现，无需回退。
-> - 仍为 TODO 的任务经再次确认确实未落地：PI-015（无集中 `RequestLimits`）、
->   PI-021（无 `request_id`/`attempt_id`/`page_id` correlation 字段）、
->   PI-022（仅有 `tests/e2e/test_dom_probe.py` 探测层，无 E1–E5 黄金 E2E）、
->   PI-026（未拆分 `browser_input.py`/`reply_extractor.py`/`reply_waiter.py`）、
->   PI-027（driver 仍为 Mixin 结构）、PI-028（无 `RetryPolicy`）、
->   PI-029（无 `ChatBackend` Protocol）、PI-030（依赖 PI-015）、
->   PI-031（无 LOCAL/SHARED mode、无 API key / rate limit）、
+> - PI-026 由 TODO 转为 DONE：`chatgpt_web/browser_input.py`（输入）、
+>   `reply_extractor.py`（回复提取）、`reply_waiter.py`（生成等待）已落地，
+>   `chat_io.py` 保留为组合 facade。
+> - PI-021 由 TODO 转为 DOING：`request_id` / `session_key` / `page_id`
+>   correlation 已部分接入（`logging_setup.py`、`server.py`、`reply_waiter.py`），
+>   但 `tool_call_id` / `attempt_id` 尚未并入统一日志上下文，全链路未闭合。
+> - 仍为 TODO 的任务经再次确认确实未落地：PI-015（无集中 `RequestLimits`，
+>   `grep` 无命中）、PI-022（`tests/e2e/` 仅有 `test_dom_probe.py` 探测层，
+>   无 E1–E5 黄金 E2E）、PI-027（`ChatGPTWebDriver` 仍继承 5 个 Mixin，11 处
+>   Mixin 引用）、PI-028（无 `RetryPolicy`）、PI-029（无 `ChatBackend` Protocol）、
+>   PI-030（依赖 PI-015）、PI-031（无 LOCAL/SHARED mode、无 API key / rate limit）、
 >   PI-032（无性能 baseline 测试）。
 > - PI-006 仍为 BLOCKED：`tests/e2e/test_dom_probe.py` 已覆盖探测层，但真实
 >   DOM 黄金回归受 ChatGPT Cloudflare challenge 与 `user_data` profile 占用阻断。
-> - 全套 `pytest -q` 通过；注意工作区当前存在与本任务清单无关的未提交改动
->   （`token_speed.py`、session schema/store、reply_waiter、bridge_commands），
->   不影响上述状态判定。
+> - 全套 `pytest -q` 通过（0 failed）；`git diff --check` 通过。工作区存在本轮
+>   相关的未提交改动（`.env.example`、`config/_core.py`、`chat_io.py`、`models.py`、
+>   `prompting.py`、`reply_waiter.py`、`server.py`、`api/*_adapter.py` 及对应测试）。
 
 | ID | 任务 | 优先级 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -995,12 +1016,12 @@ perf: establish browser request baseline
 | PI-018 | Session 不变量 | P1 | PI-017 | DONE |
 | PI-019 | health / readiness / diagnostics | P1 | PI-005 | DONE |
 | PI-020 | metrics | P1 | PI-019 | DONE |
-| PI-021 | 日志 correlation | P2 | PI-020 | TODO |
+| PI-021 | 日志 correlation | P2 | PI-020 | DOING |
 | PI-022 | 五个黄金 E2E | P1 | PI-005/003 | TODO |
 | PI-023 | 性质 / 不变量测试 | P1 | PI-007/016/017 | DONE |
 | PI-024 | API contract tests | P2 | PI-003/004 | DONE |
 | PI-025 | 拆分 toolcalls.py | P2 | PI-007/008/010 | DONE（由 PI-901 吸收，见 §9 说明） |
-| PI-026 | 拆分 chat_io.py | P2 | PI-005/012 | TODO |
+| PI-026 | 拆分 chat_io.py | P2 | PI-005/012 | DONE |
 | PI-027 | Mixin → composition | P0/P1 | PI-005/003 | TODO |
 | PI-028 | RetryPolicy | P2 | PI-001/012 | TODO |
 | PI-029 | Browser Backend Protocol | P2 | PI-005/003 | TODO |
