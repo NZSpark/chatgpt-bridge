@@ -27,6 +27,7 @@ COUNTERS = (
     "reply_extraction_failure_total",
     "tool_call_total",
     "tool_parse_failure_total",
+    "tool_call_json_syntax_error_total",
     "tool_execution_failure_total",
     "tool_duplicate_total",
 )

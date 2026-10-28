@@ -23,6 +23,20 @@ from ..models import FunctionCall, ToolCall
 
 logger = logging.getLogger(__name__)
 
+# 模型输出里「看起来像工具调用、但 JSON 语法本身就不合法」的检测结果。
+# 与「载体/工具名不对」区分开：只有**语法错误**才值得让模型重发一次；
+# 工具名不在列表里是幻觉，重发也不会有用（见 tool_call_predicate 的说明）。
+_JSON_SYNTAX_ERROR_MARKERS = (
+    "Expecting property name",
+    "Expecting ',' delimiter",
+    "Expecting ':' delimiter",
+    "Expecting value",
+    "Unterminated string",
+    "Invalid control character",
+    "Extra data",
+    "Invalid \\escape",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ToolCallRequest:
@@ -84,6 +98,12 @@ class ToolCallRequest:
 _TOOL_CALL_LINE_RE = re.compile(r"^[ \t]*TOOL_CALL\s*:\s*", re.IGNORECASE | re.MULTILINE)
 # 仅匹配 "tool_call" / "tool-call" 围栏，避免误伤普通 ```json 代码块。
 # 允许围栏被 DOM/引用符号包裹： ``> ```tool_call `` 这类形态也要能识别。
+# 裸 ``tool_call`` 标记（可带冒号）：DOM 提取后的常见形态，JSON 跟在下一行。
+# 与 _TOOL_CALL_LINE_RE 的区别：冒号可有可无，且不要求标记与 JSON 同行。
+_BARE_TOOL_CALL_RE = re.compile(
+    r"^[ \t]*tool[-_]?call\b(?![0-9A-Za-z_])[ \t]*[:：]?[ \t]*",
+    re.MULTILINE | re.IGNORECASE,
+)
 _TOOL_CALL_FENCE_RE = re.compile(r"```\s*(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 # ChatGPT 网页版 markdown 渲染会在标识符里插入转义反斜杠：
 #   TOOL_CALL -> TOOL\_CALL, exec_command -> exec\_command
@@ -815,6 +835,16 @@ def parse_tool_calls(
     text = _MD_ESCAPED_CHAR_RE.sub(r"\1", text)
 
     calls: List[Dict[str, Any]] = []
+    # 记录「JSON 语法本身就不合法」的次数与首个错误信息：这种错误是模型的
+    # 输出格式问题（漏逗号、字符串没闭合、换行没转义……），不是工具名幻觉，
+    # 值得让模型按严格 JSON 重发一次；修复/兜底解析成功与否都记下来，
+    # 交给 tool_call_predicate 决定是否纠偏。
+    syntax_errors: List[str] = []
+
+    def _note_syntax_error(exc: Exception) -> None:
+        msg = str(exc)
+        if any(marker in msg for marker in _JSON_SYNTAX_ERROR_MARKERS):
+            syntax_errors.append(msg)
 
     def _consume(raw: str, allow_bare_object: bool) -> None:
         raw = raw.strip()
@@ -822,7 +852,8 @@ def parse_tool_calls(
             return
         try:
             data = json.loads(raw)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - json.JSONDecodeError 之外还可能是 TypeError
+            _note_syntax_error(exc)
             # 模型常把 shell 命令里的引号原样写进 JSON 字符串（未转义），
             # 标准解析失败；退回尽力修复（见 _repair_json_quotes）。
             data = _repair_json_quotes(raw)
@@ -966,7 +997,51 @@ def parse_tool_calls(
             len(matches),
         )
 
+    if syntax_errors:
+        metrics.inc("tool_call_json_syntax_error_total")
+        logger.warning(
+            "工具调用 JSON 语法错误 %d 次（首个：%s）。若最终没有可用调用，"
+            "纠偏逻辑会要求模型严格按 JSON 重新输出一次。",
+            len(syntax_errors),
+            syntax_errors[0],
+        )
+
     return calls
+
+
+def has_tool_call_syntax_error(text: str) -> bool:
+    """回复里是否出现了「像工具调用、但 JSON 语法不合法」的内容。
+
+    只做语法判定，不关心能否修复出调用：用于纠偏判定——即使兜底修复出了
+    一条调用，只要原始 JSON 语法就是错的，也应该提醒模型严格遵循格式，
+    否则同一个错误会一直重复。
+
+    载体覆盖与 :mod:`chatgpt_web.malformed` 一致（围栏 + 裸标记，body 允许跨行），
+    因此 ``tool_call`` 独占一行、JSON 跟在下一行的常见形态也能判到。
+    不会因为正文里恰好有一个非法 JSON 对象就误报。
+    """
+    if not text:
+        return False
+    text = _MD_ESCAPED_CHAR_RE.sub(r"\1", text)
+    segments: List[str] = []
+    for match in _TOOL_CALL_FENCE_RE.finditer(text):
+        segments.append(match.group(2))
+    if not segments:
+        # 裸标记：标记之后到下一个标记（或文末）都算同一段 body。
+        # 用 _BARE_TOOL_CALL_RE 而不是 _TOOL_CALL_LINE_RE：后者要求带冒号，
+        # 而网页 DOM 里更常见的是裸 ``tool_call`` 换行后跟 JSON。
+        matches = list(_BARE_TOOL_CALL_RE.finditer(text))
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            segments.append(text[match.end():end])
+    for segment in segments:
+        for obj in _iter_balanced_objects(segment):
+            try:
+                json.loads(obj)
+            except Exception as exc:  # noqa: BLE001
+                if any(marker in str(exc) for marker in _JSON_SYNTAX_ERROR_MARKERS):
+                    return True
+    return False
 
 
 def parse_tool_call_requests(

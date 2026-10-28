@@ -61,6 +61,7 @@ from .tools.parser import (  # noqa: F401
     _shell_quotes_balanced,
     _strip_redundant_value_quotes,
     _tool_names,
+    has_tool_call_syntax_error,
     parse_reply_tool_calls,
     parse_tool_call_requests,
     parse_tool_calls,
@@ -91,6 +92,8 @@ EDIT_MD_HEADER = "[edit_markdown notes]"
 RETRY_HEADER = "[Tool Call Correction]"
 # 同一命令被重复调用且每次都是空输出时的点名提醒（防死循环，见 prompting）
 REPEAT_HEADER = "[Repeated Empty Tool Call]"
+# 模型输出的工具调用 JSON 语法不合法（漏逗号/引号没闭合/换行没转义）时的纠偏块
+JSON_FORMAT_HEADER = "[Tool Call JSON Format Error]"
 
 
 def builtin_tool_names() -> set:
@@ -165,17 +168,43 @@ def format_tool_retry_nudge() -> str:
     ])
 
 
+def format_tool_json_format_nudge() -> str:
+    """工具调用 JSON 语法 / 结构不合法时的纠偏指令（追加到同一网页会话，只一次）。
+
+    文案直接复用 ``malformed.RETRY_PROMPT``（与 DeepseekBridge 对齐的实测有效措辞）：
+    短、只讲“重新调用”、并且把期望的代码块形态原样给出来。长篇讲道理反而会被
+    模型忽略，而逐条列举转义规则容易把错误写法也教给它。
+    """
+    from .malformed import RETRY_PROMPT
+
+    return RETRY_PROMPT
+
+
 def tool_call_predicate(tools: Optional[List[Dict[str, Any]]]) -> Callable[[str], bool]:
-    """构造「回复里是否包含至少一个工具调用」的判定函数。
+    """构造「回复是否可接受」的判定函数。
 
     供 ``chat_io.send_chat`` 的纠偏重试使用：判定失败就追发一次纠偏指令。
-    与最终解析共用同一个 ``parse_tool_calls``，不会出现「重试判定说不合格、
-    外面却解析出了 tool_calls」的不一致。
+
+    判失败（= 要求模型重新发一次调用命令）的三种情况：
+      1. 一个可用调用都没解析出来（模型无视工具，或工具名幻觉）；
+      2. 载体结构坏了：``tool_call`` 围栏没闭合 / 围栏是空的 / 围栏里的 JSON
+         结构不完整（见 :mod:`chatgpt_web.malformed`）；
+      3. 解析出了调用，但原始 JSON 语法就是不合法（靠修复/兜底才勉强取到）。
+
+    第 2、3 条都是**格式**问题而不是工具名幻觉：重发一次通常就能成功；不纠正的话
+    同一段坏 JSON 会被反复生成，客户端只会收到纯文本并把任务当成已完成。
     """
     def _has_call(text: str) -> bool:
+        raw = text or ""
+        from .malformed import has_malformed_tool_call
+
+        if has_malformed_tool_call(raw):
+            return False
         # 与最终解析共用同一条路径（含 shell 围栏修复）：否则修复出的调用会被判为
         # “没调用工具”，桥会追发一次多余的纠偏指令。
-        return bool(parse_reply_tool_calls(text or "", tools))
+        if not parse_reply_tool_calls(raw, tools):
+            return False
+        return not has_tool_call_syntax_error(raw)
 
     return _has_call
 

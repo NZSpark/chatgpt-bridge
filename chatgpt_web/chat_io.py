@@ -392,18 +392,35 @@ class ChatIOMixin(
                 # 没调用过任何工具**时才会传判定进来；任务已进入执行阶段后的纯文本
                 # 回复是**收尾**，不会走到这里——否则等于把结论重新推成一条新命令，
                 # 模型只能继续下指令，任务永远结束不了（用户实测，见 update.md §2.12）。
-                from .toolcalls import format_tool_retry_nudge
-
-                logger.warning(
-                    "[工具纠偏] 本轮尚未调用过任何工具，回复里没有工具调用——"
-                    "追加一次纠偏指令重发（仅一次）。"
+                from .toolcalls import (
+                    format_tool_json_format_nudge,
+                    format_tool_retry_nudge,
                 )
+                from .tools.parser import has_tool_call_syntax_error
+
+                # 两类失败用不同文案：
+                #   * 语法不合法（有调用但 JSON 解析不了）——点明换行/引号/逗号怎么转义；
+                #   * 完全没调用——要求它别再凭知识作答、直接给出结构化调用。
+                # 用通用文案去纠正 JSON 错误是无效的（实测模型会原样重犯同一种语法错），
+                # 所以这里必须区分。
+                if has_tool_call_syntax_error(reply_text or ""):
+                    nudge = format_tool_json_format_nudge()
+                    logger.warning(
+                        "[工具纠偏] 回复里的工具调用 JSON 语法不合法——追加一次"
+                        "「严格遵循 JSON 格式重发」的纠偏指令（仅一次）。"
+                    )
+                else:
+                    nudge = format_tool_retry_nudge()
+                    logger.warning(
+                        "[工具纠偏] 本轮尚未调用过任何工具，回复里没有工具调用——"
+                        "追加一次纠偏指令重发（仅一次）。"
+                    )
                 try:
                     # 纠偏是会话内的后续消息：不更新 _last_prompts（usage 仍按
                     # 客户端真正发来的 prompt 估算），也不实时吐字（首轮内容已
                     # 可能发给客户端，避免两段文本拼接错乱）。
                     retry_text, retry_blocks = await self._send_chat_locked(
-                        format_tool_retry_nudge(), None, key=bucket
+                        nudge, None, key=bucket
                     )
                 except (ChatGPTTimeoutError, ChatGPTContextLimitError,
                         ChatGPTBusyError) as exc:

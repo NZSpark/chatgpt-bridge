@@ -1013,9 +1013,9 @@ perf: establish browser request baseline
 >   `tests/e2e/test_dom_golden.py` + `tests/e2e/fixtures/chatgpt_dom.html`，
 >   默认运行、不联网，六层各自命名失效层；真机探测仍由 `test_dom_probe.py`
 >   负责，Cloudflare / profile 占用作为已知环境限制保留。
-> - 全套 `pytest -q` 通过（0 failed）；`git diff --check` 通过。工作区存在本轮
->   相关的未提交改动（`.env.example`、`config/_core.py`、`chat_io.py`、`models.py`、
->   `prompting.py`、`reply_waiter.py`、`server.py`、`api/*_adapter.py` 及对应测试）。
+> - `git diff --check` 通过；全套 `pytest` 全绿：**688 passed, 17 skipped, 127 subtests passed**。
+> - 工作区本轮仅剩：`doc/tasks_pi.md` 的文档更新，以及未跟踪的 `doc/speed.png`。
+> - **已处理**：此前工作区曾存在一处未提交、进行中的 `token_speed` 重构（`chatgpt_web/token_speed.py` 与 `reply_waiter.py` 被改写为基于时间线的新 API，但 `session/schema.py`、`session/store.py`、`api/chat_adapter.py` 及三个测试仍用旧字段，导致 15 failed）。该重构尚未收尾且缺 `doc/tokenspeed.md`，已用 `git stash`（stash: wip token_speed refactor (broken)）暂存、恢复 HEAD 的实现使测试全绿。如需继续该重构，应作为独立任务收尾后再合入。
 
 | ID | 任务 | 优先级 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- |
