@@ -47,8 +47,9 @@ def _is_image_part(part: dict) -> bool:
     ptype = part.get("type")
     if ptype in ("image_url", "input_image"):
         return True
-    # 兼容部分客户端直接给裸 url / image 字段
-    return "image_url" in part or "image" in part
+    # 兼容部分客户端直接给裸 url / image 字段。仅有 url 字段时也视为图片分片；
+    # 这是有意的兼容行为，调用方应确保 content 数组符合消息分片协议。
+    return "image_url" in part or "image" in part or "url" in part
 
 
 def _image_url(part: dict) -> Optional[str]:
