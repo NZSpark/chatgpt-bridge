@@ -405,16 +405,23 @@ class ChatIOMixin(
                 # 所以这里必须区分。
                 if has_tool_call_syntax_error(reply_text or ""):
                     nudge = format_tool_json_format_nudge()
+                    nudge_reason = "json_syntax"
                     logger.warning(
                         "[工具纠偏] 回复里的工具调用 JSON 语法不合法——追加一次"
                         "「严格遵循 JSON 格式重发」的纠偏指令（仅一次）。"
                     )
                 else:
                     nudge = format_tool_retry_nudge()
+                    nudge_reason = "no_call"
                     logger.warning(
                         "[工具纠偏] 本轮尚未调用过任何工具，回复里没有工具调用——"
                         "追加一次纠偏指令重发（仅一次）。"
                     )
+                # 纠偏有效率统计（doc/prompt_tasks.md T5.2）：触发记一条，结果再记
+                # 一条 recovered/failed，二者按 reason 配对即可算比率。
+                logger.info(
+                    "nudge_fired reason=%s bucket=%s", nudge_reason, bucket
+                )
                 try:
                     # 纠偏是会话内的后续消息：不更新 _last_prompts（usage 仍按
                     # 客户端真正发来的 prompt 估算），也不实时吐字（首轮内容已
@@ -425,12 +432,27 @@ class ChatIOMixin(
                 except (ChatGPTTimeoutError, ChatGPTContextLimitError,
                         ChatGPTBusyError) as exc:
                     logger.warning(f"[工具纠偏] 重发失败（{exc!r}），返回原回复。")
+                    logger.info(
+                        "nudge_failed reason=%s bucket=%s cause=%r",
+                        nudge_reason, bucket, exc,
+                    )
                     task_state.complete()
                     return reply_text, blocks
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"[工具纠偏] 重发异常（{exc!r}），返回原回复。")
+                    logger.info(
+                        "nudge_failed reason=%s bucket=%s cause=%r",
+                        nudge_reason, bucket, exc,
+                    )
                     task_state.complete()
                     return reply_text, blocks
+                # 重发后仍不合格也记 failed（判定函数可能是无状态纯函数，直接复用）。
+                recovered = validate_reply is None or validate_reply(retry_text)
+                logger.info(
+                    "nudge_%s reason=%s bucket=%s",
+                    "recovered" if recovered else "failed",
+                    nudge_reason, bucket,
+                )
                 task_state.complete()
                 return retry_text, retry_blocks
 

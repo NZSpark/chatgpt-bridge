@@ -15,10 +15,16 @@ from unittest import mock
 
 from chatgpt_web import config
 from chatgpt_web.models import ChatMessage
-from chatgpt_web.prompting import build_prompt
+from chatgpt_web.models import FunctionCall, ToolCall
+from chatgpt_web.prompting import (
+    SECTION_TOOL_RESULTS,
+    SECTION_USER,
+    build_prompt,
+)
 from chatgpt_web.toolcalls import (
     EDIT_MD_HEADER,
     EMPHASIS_HEADER,
+    REPEAT_HEADER,
     RETRY_HEADER,
     TOOLCALL_HEADER,
     edit_markdown_spec,
@@ -278,6 +284,110 @@ class RetryNudgeTests(unittest.TestCase):
         self.assertTrue(predicate(ToolRetryTests.CALL))
         self.assertFalse(predicate("这里没有任何工具调用"))
         self.assertFalse(predicate(""))
+
+
+def _tool_call(call_id: str, command: str) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        function=FunctionCall(name="bash", arguments='{"command": "%s"}' % command),
+    )
+
+
+def _empty_result(call_id: str, command: str) -> ChatMessage:
+    return ChatMessage(
+        role="tool",
+        content="$ %s\n(no output)\nTook 0.0s" % command,
+        tool_call_id=call_id,
+    )
+
+
+class SectionOrderTests(unittest.TestCase):
+    """I10：三块顺序固定为 契约 → 任务 → 纠偏（design §1、§6）。"""
+
+    def test_sections_order_is_contract_task_hint(self) -> None:
+        """带工具 + 空结果 + 同命令重复 2 次时，三块的相对顺序必须固定。"""
+        messages = [ChatMessage(role="user", content="看看仓库状态")]
+        for index, command in enumerate(("git status --short", "git status --short")):
+            call = _tool_call(f"call_{index}", command)
+            messages.append(ChatMessage(role="assistant", content="", tool_calls=[call]))
+            messages.append(_empty_result(call.id, command))
+
+        text = build_prompt(messages, tools=TOOLS)
+        self.assertIn(TOOLCALL_HEADER, text)
+        self.assertIn(SECTION_TOOL_RESULTS, text)
+        self.assertIn(REPEAT_HEADER, text)
+        self.assertLess(
+            text.index(TOOLCALL_HEADER),
+            text.index(SECTION_TOOL_RESULTS),
+            "契约块必须在任务块之前",
+        )
+        self.assertLess(
+            text.index(SECTION_TOOL_RESULTS),
+            text.index(REPEAT_HEADER),
+            "纠偏块必须在任务块之后（近因效应）",
+        )
+
+    def test_contract_last_switch_moves_block_to_end(self) -> None:
+        """T3.2 的 A/B 开关：PROMPT_CONTRACT_LAST=true 时契约块挪到最后。"""
+        messages = [ChatMessage(role="user", content="请查看当前目录")]
+        with mock.patch.object(config, "PROMPT_CONTRACT_LAST", True):
+            text = build_prompt(messages, tools=TOOLS)
+        self.assertIn(TOOLCALL_HEADER, text)
+        self.assertGreater(
+            text.index(TOOLCALL_HEADER),
+            text.index(SECTION_USER),
+            "开关打开时契约块应在用户任务之后",
+        )
+
+    def test_user_request_section_precedes_repeat_hint(self) -> None:
+        """无工具结果时，[User Request] 也必须在纠偏块之前。"""
+        messages = [
+            ChatMessage(role="user", content="看看仓库状态"),
+        ]
+        # 历史里已重复两次空调用，但本轮新增只有一条新 user（无新工具结果）
+        for index, command in enumerate(("git status --short", "git status --short")):
+            call = _tool_call(f"call_{index}", command)
+            messages.append(ChatMessage(role="assistant", content="", tool_calls=[call]))
+            messages.append(_empty_result(call.id, command))
+        messages.append(ChatMessage(role="user", content="再确认一次"))
+
+        text = build_prompt(messages, tools=TOOLS)
+        if REPEAT_HEADER in text:
+            self.assertLess(
+                text.index(SECTION_USER),
+                text.index(REPEAT_HEADER),
+                "用户任务块必须在纠偏块之前",
+            )
+
+
+class SectionMutualExclusionTests(unittest.TestCase):
+    """design §1.2：第 2 块内部互斥——有工具结果就不发用户任务。"""
+
+    def test_tool_result_turn_has_no_user_request(self) -> None:
+        """常规次轮（user → assistant → tool）只发工具结果，不发用户任务。"""
+        call = _tool_call("call_0", "git status --short")
+        messages = [
+            ChatMessage(role="user", content="看看仓库状态"),
+            ChatMessage(role="assistant", content="", tool_calls=[call]),
+            ChatMessage(role="tool", content="clean", tool_call_id="call_0"),
+        ]
+        text = build_prompt(messages, tools=TOOLS)
+        self.assertIn(SECTION_TOOL_RESULTS, text)
+        self.assertNotIn(SECTION_USER, text, "工具结果轮不得再重发用户指令")
+
+    def test_new_user_after_tool_result_drops_stale_result(self) -> None:
+        """畸形输入（旧 tool 结果 + 新 user）不得同时输出两块。"""
+        call = _tool_call("call_0", "git status --short")
+        messages = [
+            ChatMessage(role="user", content="看看仓库状态"),
+            ChatMessage(role="assistant", content="", tool_calls=[call]),
+            ChatMessage(role="tool", content="clean", tool_call_id="call_0"),
+            ChatMessage(role="user", content="换成看 log"),
+        ]
+        text = build_prompt(messages, tools=TOOLS)
+        self.assertIn(SECTION_USER, text)
+        self.assertNotIn(SECTION_TOOL_RESULTS, text, "新 user 之前的旧工具结果必须被排除")
+        self.assertEqual(text.count(SECTION_USER), 1)
 
 
 if __name__ == "__main__":

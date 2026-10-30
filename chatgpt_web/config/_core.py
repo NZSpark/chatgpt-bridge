@@ -272,6 +272,10 @@ TOOL_NUDGE_UNTIL_FIRST_CALL = env_bool("TOOL_NUDGE_UNTIL_FIRST_CALL", True)
 TOOLS_INSTRUCTION_VERBOSE = env_bool("TOOLS_INSTRUCTION_VERBOSE", False)
 # 工具说明里单条描述的最大字符数（0 = 不限制）。过长的描述无助于模型选对工具。
 TOOLS_DESC_MAX_CHARS = env_int("TOOLS_DESC_MAX_CHARS", 200)
+# 契约块位置 A/B（doc/prompt_tasks.md T3.2）：默认 false = 契约在任务之前
+# （本项目 T1.1 实测的最优位置）。true = 契约放最后（DeepseekBridge 的排法），
+# 仅供同一套 E2E 上做顺序对比，不作为默认值。
+PROMPT_CONTRACT_LAST = env_bool("PROMPT_CONTRACT_LAST", False)
 # shell 围栏修复（2026-10-07 用户实测）：模型有时不写 tool_call JSON，而是直接回一个
 # ```bash / ```sh 代码块，内容只有裸命令。旧解析链只认 tool_call 围栏，于是整条回复被
 # 当成纯文本、任务静默结束。

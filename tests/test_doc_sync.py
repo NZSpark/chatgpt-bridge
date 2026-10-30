@@ -26,6 +26,53 @@ def _env_values():
     return values
 
 
+class PromptDesignDocSyncTests(unittest.TestCase):
+    """doc/prompt_design.md §2 的标题表必须与代码里的常量一致。
+
+    标题常量是「生成 / 去重 / 泄漏检测」的唯一键（design §2、§6 I1）。
+    文档漂移会让读者以为某个标题存在，而代码里其实是别的字符串。
+    """
+
+    # design §2 表格里声明的「常量名 → 期望值」；改标题时必须两边一起改。
+    EXPECTED = {
+        "TOOLCALL_HEADER": "[Tool Calling Instructions]",
+        "EMPHASIS_HEADER": "[Output Format Emphasis]",
+        "EDIT_MD_HEADER": "[edit_markdown notes]",
+        "RETRY_HEADER": "[Tool Call Correction]",
+        "JSON_FORMAT_HEADER": "[Tool Call JSON Format Error]",
+        "REPEAT_HEADER": "[Repeated Empty Tool Call]",
+        "SECTION_USER": "[User Request]",
+        "SECTION_TOOL_RESULTS": "[Tool Results]",
+        "CONTEXT_REBUILD_HEADER": "[上下文重建]",
+        "ENV_NOTE_HEADER": "[环境说明]",
+    }
+
+    def test_doc_table_matches_code_constants(self):
+        from chatgpt_web import toolcalls
+
+        doc = (ROOT / "doc" / "prompt_design.md").read_text(encoding="utf-8")
+        for name, value in self.EXPECTED.items():
+            self.assertTrue(
+                hasattr(toolcalls, name), "代码里缺少标题常量 %s" % name
+            )
+            self.assertEqual(
+                getattr(toolcalls, name), value,
+                "%s 的代码值与文档不一致" % name,
+            )
+            self.assertIn(
+                value, doc, "doc/prompt_design.md 未记录 %s 的值 %s" % (name, value)
+            )
+
+    def test_titles_defined_once_in_toolcalls(self):
+        """标题常量必须单点定义（design §2 / §9 实现位置表）。"""
+        prompting = (ROOT / "chatgpt_web" / "prompting.py").read_text(encoding="utf-8")
+        for name, value in self.EXPECTED.items():
+            self.assertNotIn(
+                '%s = "%s"' % (name, value), prompting,
+                "%s 不得在 prompting.py 里重复定义" % name,
+            )
+
+
 class DesignDocSyncTests(unittest.TestCase):
     def test_env_example_lists_every_config_key(self):
         example = (ROOT / ".env.example").read_text(encoding="utf-8")

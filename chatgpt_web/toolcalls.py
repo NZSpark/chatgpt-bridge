@@ -88,6 +88,14 @@ from .tools.validator import (  # noqa: F401
 TOOLCALL_HEADER = "[Tool Calling Instructions]"
 EMPHASIS_HEADER = "[Output Format Emphasis]"
 EDIT_MD_HEADER = "[edit_markdown notes]"
+# 区段标题（doc/prompt_design.md §2）：全部集中在这里，prompting 从这里导入。
+# 唯一用途是让模型区分段落语义，并供生成 / 去重 / 泄漏检测共用同一字符串。
+CONTEXT_REBUILD_HEADER = "[上下文重建]"
+ENV_NOTE_HEADER = "[环境说明]"
+SECTION_USER = "[User Request]"
+SECTION_TOOL_RESULTS = "[Tool Results]"
+SECTION_SYSTEM = "[System]"
+SECTION_ASSISTANT = "[Your Previous Reply]"
 # 首轮未调用工具时追加的纠偏指令块（见 T1.1）
 RETRY_HEADER = "[Tool Call Correction]"
 # 同一命令被重复调用且每次都是空输出时的点名提醒（防死循环，见 prompting）
@@ -130,17 +138,16 @@ def format_repeat_call_hint(repeats: List[tuple]) -> str:
     :param repeats: ``[(命令签名, 出现次数)]``，来自 ``prompting._repeated_empty_calls``。
     """
     lines = [
-        f"{REPEAT_HEADER} You have already issued the SAME tool call more than once, and it",
-        "returned EMPTY output every time:",
+        f"{REPEAT_HEADER} You already issued the SAME tool call more than once; it returned",
+        "EMPTY output every time:",
     ]
     for signature, count in repeats:
         lines.append(f"- called {count}x, always empty: {signature}")
     lines += [
-        "An empty result means the command SUCCEEDED and printed nothing. Running it again will",
-        "NEVER produce output — repeating it is an infinite loop and the task will fail.",
-        "Do NOT repeat any call listed above. Either use a DIFFERENT command that prints the state",
-        "you need (another flag, a narrower path, or an explicit echo), or stop and summarise what",
-        "you already know as the final answer.",
+        "An empty result means the command SUCCEEDED and printed nothing; re-running it will",
+        "NEVER produce output, and repeating it is an infinite loop that fails the task.",
+        "Do NOT repeat any call listed above. Use a DIFFERENT command that prints the state you",
+        "need, or stop and summarise what you know as the final answer.",
     ]
     return "\n".join(lines)
 
@@ -155,10 +162,9 @@ def format_tool_retry_nudge() -> str:
     """
     return "\n".join([
         f"{RETRY_HEADER} Your previous reply did not call any tool.",
-        "You are not expected to have tools of your own: this conversation is read by a local",
-        "client on the user's machine, and it executes whatever tool call you write, then sends the",
-        "real output back to you. Refusing because you \"have no tools\", or answering from your own",
-        "knowledge instead of calling a tool, means the task FAILED.",
+        "A local client on the user's machine executes whatever tool call you write and sends the",
+        "real output back. Refusing because you \"have no tools\", or answering from your own",
+        "knowledge instead, means the task FAILED.",
         "Reply now with EXACTLY ONE fenced code block in this form (no other text):",
         "```tool_call",
         '{"name": "...", "arguments": {"param": "..."}}',
@@ -311,23 +317,19 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
 
     lines = [
         TOOLCALL_HEADER,
-        "You are a language model: the only thing you produce is text, and you cannot run",
-        "anything yourself. This conversation is read by a small local client running on the",
-        "user's own computer - when you write a tool call in the format below, that client",
-        "executes it there for real and returns the real output to you as your next message.",
-        "No tool has to be installed or mounted on your side, and the tools below will never",
-        "appear in your built-in tool list - that is expected and normal, because the client",
-        "takes the call out of your reply text.",
-        "Writing a tool call is therefore not fabrication and not a false claim about your",
-        "capabilities: you are writing the command and the client runs it.",
-        "That is the only way you take real action here. If the task needs real action or data and you",
-        "answer from your own knowledge instead, the task FAILS. Never fabricate tool output.",
+        "You produce text only; you cannot run anything yourself. This conversation is read",
+        "by a local client running on the user's machine: it executes the tool calls you",
+        "write and returns the real output to you as your next message. No tool has to be installed or mounted on your side,",
+        "and the tools below will never appear in your built-in tool list - that is expected and normal,",
+        "because the client takes the call out of your reply text. Writing one is not fabrication.",
+        "Calling a tool is the only way you take real action here. If the task needs real",
+        "action or data and you answer from your own knowledge instead, the task FAILS.",
+        "Never fabricate tool output.",
         "",
-        "A tool call is ONE fenced code block labelled exactly `tool_call`, containing one JSON",
+        "A tool call is ONE fenced block labelled exactly `tool_call`, containing one JSON",
         "object and nothing else:",
         example_call,
-        "(Replace the \"...\" placeholders above with the real values. Do NOT copy the example",
-        "literally.)",
+        "(Replace the \"...\" placeholders with the real values; do NOT copy the example.)",
         "",
         "Tools the client (not you) can execute - use these exact names:",
     ]
@@ -367,35 +369,26 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
     lines += [
         "",
         "Rules:",
-        "1. The fence label MUST be exactly `tool_call` - not json, not text, not empty - and the",
-        "   JSON must sit INSIDE the fence. A block labelled anything else, or a call written",
-        "   as plain text instead of a fenced block, will NOT be executed.",
-        "2. `arguments` must be a JSON object using the tool's own parameter names, with values of",
-        "   the declared type (numbers and booleans unquoted, strings in double quotes).",
-        "3. Keep the JSON on ONE line inside the fence: escape double quotes as \\\" and line breaks",
-        "   as \\n; never put a raw line break inside a JSON string.",
-        "4. Paste command / script / file text into the JSON string verbatim - the fenced block",
-        "   preserves it exactly. A shell command always travels as the `command` value inside the",
-        "   tool_call JSON: never reply with the bare command in a `bash` style code block.",
-        "   Prefer single quotes inside the command (e.g. git commit -m 'msg') so they never clash",
-        "   with the JSON quotes.",
-        "5. Output at most THREE tool_call blocks per reply - never four or more; the client",
-        "   processes a few calls at a time. If you need more than three tools, issue up to three",
-        "   now, wait for their results, then issue the rest in your next reply.",
-        "6. When you call tools, output ONLY the fenced blocks: no explanation, no preamble,",
-        "   no text before or after them.",
-        "7. Never decline a task on the grounds that you \"have no tools\" or that the tools are not",
-        "   in your own tool list: you are not the one that runs them - the client executes",
-        "   whatever you write, and such a refusal means the task FAILED. Never offer the user",
-        "   instructions or a patch to apply themselves instead of calling a tool. Answer",
-        "   directly (no tool_call block) ONLY when the task genuinely needs no action and no",
-        "   real data.",
-        "8. If a tool result is EMPTY (e.g. shows \"(no output)\"), the command SUCCEEDED and",
-        "   genuinely printed nothing. That is a valid result, not a failure: move on to the NEXT",
-        "   command or give the final answer. Never re-run the exact same command and never assume",
-        "   the tool failed - repeating it loops forever.",
-        "9. Never emit XML / DSL tags (native tool markers of that shape are not executed): the",
-        "   fenced `tool_call` block above is the only carrier this client accepts.",
+        "1. Fence label exactly `tool_call`, JSON INSIDE the fence. Anything else (json, text,",
+        "   empty, or a bare plain-text call) is NOT executed.",
+        "2. `arguments` is a JSON object with the tool's own parameter names and declared types",
+        "   (numbers/booleans unquoted, strings double-quoted).",
+        "3. One line of JSON: escape quotes as \\\" and line breaks as \\n; no raw line breaks",
+        "   inside a string.",
+        "4. Paste command text verbatim. A shell command always travels as the `command` value",
+        "   inside the tool_call JSON - never as a bare `bash` block. Use single quotes inside",
+        "   commands (e.g. git commit -m 'msg').",
+        "5. At most THREE tool_call blocks per reply; defer the rest to your next reply.",
+        "6. Output ONLY the fenced blocks: no explanation before or after.",
+        "7. Never refuse because you \"have no tools\" or the tools are not in your own list - the",
+        "   client executes what you write, so such a refusal means the task FAILED. Never hand the",
+        "   user a patch to apply themselves. Answer without a tool_call block only when the task",
+        "   needs no real action or data.",
+        "8. An EMPTY tool result (shown as (no output)) means the command SUCCEEDED and genuinely",
+        "   printed nothing - a valid result, not a failure. It is fine to move on to the NEXT",
+        "   command, then give the final answer. Never re-run the exact same command: repeating it",
+        "   loops forever.",
+        "9. Never emit XML / DSL tags: the fenced `tool_call` block is the only accepted carrier.",
     ]
     return "\n".join(lines)
 
@@ -419,23 +412,19 @@ def format_tool_call_emphasis(tools: Optional[List[Dict[str, Any]]] = None) -> s
             {"name": "...", "arguments": {"param": "..."}}, ensure_ascii=False
         ) + "\n```"
     return "\n".join([
-        f"{EMPHASIS_HEADER} This is a new session (or one that was just reset); "
-        "the following rules stay in effect for this whole session:",
-        "You MUST use the provided tools whenever the task needs real action or data; never fabricate tool output.",
-        "You do not run anything yourself: the user's local client executes the tool calls you write and",
-        "sends their real output back as your next message; never reply that you have no tools.",
-        "To call a tool, output ONE fenced code block labelled exactly `tool_call`:",
+        f"{EMPHASIS_HEADER} New session (or just reset); these rules hold for the whole session:",
+        "Use the provided tools whenever the task needs real action or data; never fabricate output.",
+        "You MUST use the provided tools when the task needs real action or data; never fabricate output.",
+        "You run nothing yourself: a local client executes the tool calls you write and sends",
+        "the real output back; never reply that you have no tools.",
+        "A tool call is ONE fenced block labelled exactly `tool_call`:",
         example_call,
-        "(Replace the \"...\" placeholders above with the real values; never copy the example literally.)",
-        "The fence label must be `tool_call` - not json, not text, not empty - and the JSON must sit inside the fence;",
-        "a call written as plain text will NOT be executed.",
-        "Keep the JSON on one line: escape double quotes as \\\" and line breaks as \\n; for shell commands",
-        "prefer single quotes inside the command (e.g. git commit -m 'msg') so they never clash with the JSON quotes.",
-        "A shell command always travels as the `command` value inside that JSON - never as the bare",
-        "command in a `bash` style code block.",
-        "Use the exact tool names given in the tool instructions; never invent tool names.",
-        "Output at most THREE tool_call blocks per reply - never four or more in the same message; if you need",
-        "more than three tools, call up to three now and the rest only after you receive their results.",
-        "When you call tools, output only the fenced blocks: no explanation, no preamble.",
-        "Never emit XML / DSL tags - only the fenced `tool_call` block is executed.",
+        "(Replace the \"...\" placeholders with the real values; do NOT copy the example.)",
+        "Label must be `tool_call` (not json, not text, not empty) with the JSON inside the fence;",
+        "a plain-text call is NOT executed.",
+        "One line of JSON: escape quotes as \\\" and line breaks as \\n; prefer single quotes inside",
+        "commands (e.g. git commit -m 'msg'). A shell command always travels as the `command` value",
+        "inside that JSON - never as a bare `bash` block. Use the exact tool names given; never invent names.",
+        "At most THREE tool_call blocks per reply; the rest after you receive the results.",
+        "Output only the fenced blocks: no explanation, no preamble, no XML / DSL tags.",
     ])

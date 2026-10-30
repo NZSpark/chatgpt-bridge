@@ -59,15 +59,15 @@ class EmptyToolResultTests(unittest.TestCase):
 
     def test_blank_result_is_explained(self):
         _, body = self._body("   \n")
-        self.assertIn("没有任何输出", body)
-        self.assertIn("下一条指令", body)
-        self.assertIn("不是失败", body)
+        self.assertIn("printed NOTHING", body)
+        self.assertIn("next command", body)
+        self.assertIn("not a failure", body)
 
     def test_harness_no_output_rendering_is_explained(self):
         raw = "$ git status --short\n\n(no output)\n\nTook 0.0s\n"
         header, body = self._body(raw)
         self.assertIn("call_1", header)
-        self.assertIn("没有任何输出", body)
+        self.assertIn("printed NOTHING", body)
         # 歧义原文不再交给模型
         self.assertNotIn("(no output)", body)
 
@@ -77,7 +77,7 @@ class EmptyToolResultTests(unittest.TestCase):
             "Process exited with code 0\nOriginal token count: 0\nOutput:\n"
         )
         _, body = self._body(raw)
-        self.assertIn("没有任何输出", body)
+        self.assertIn("printed NOTHING", body)
 
     def test_real_output_is_never_rewritten(self):
         # 关键回归：含真实内容的输出必须逐字节保留，否则 edit 的 oldText 匹配会失败。
@@ -152,7 +152,7 @@ class RepeatedEmptyToolCallTests(unittest.TestCase):
         prompt = self._prompt(["git status --short"])
         self.assertNotIn("[Repeated Empty Tool Call]", prompt)
         # 但逐条说明仍必须在（空输出的正确解读）
-        self.assertIn("没有任何输出", prompt)
+        self.assertIn("printed NOTHING", prompt)
 
     def test_different_commands_are_not_flagged(self):
         prompt = self._prompt(["git status --short", "git log --oneline -1"])
@@ -387,6 +387,57 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         # “工具不在我的工具列表里”必须被说明成预期现象（模型曾据此拒答）。
         self.assertIn("appear in your built-in tool list", instruction)
         self.assertIn("that is expected and normal", instruction)
+        # 精简时不得把旧的两类拒答措辞写回来（doc/prompt_design.md §4.1.1）：
+        # 一是否定式能力断言（被读成“没工具”），二是“已挂载”式断言
+        # （推模型去核对自身工具列表）。两种都会让它拒答。
+        for text in blocks:
+            for banned in (
+                "NO direct access",
+                "ALREADY MOUNTED",
+                "autonomous agent",
+                "you do not have access",
+            ):
+                self.assertNotIn(
+                    banned, text, "旧拒答措辞不得重新出现：%s" % banned
+                )
+
+    def test_contract_keeps_all_load_bearing_constraints(self):
+        """精简不得丢失任何承重约束（doc/prompt_design.md §4.1.3）。
+
+        精简只删解释性长句，不删语义点。这张表是「哪些点必须在」的集中清单，
+        删掉对应规则时该测试必须失败。
+        """
+        from chatgpt_web.toolcalls import format_tools_instruction
+
+        text = format_tools_instruction(self.TOOLS)
+        load_bearing = {
+            "载体是 tool_call 围栏": "`tool_call`",
+            "参数必须符合声明类型": "declared types",
+            "单行 JSON 转义": "escape quotes",
+            "命令进 command 值": "command` value",
+            "单轮最多三条": "THREE tool_call blocks",
+            "只输出围栏块": "ONLY the fenced blocks",
+            "禁止无工具拒答": "have no tools",
+            "空输出是成功": "EMPTY tool result",
+            "禁止 XML/DSL": "XML / DSL tags",
+            "不得凭知识作答": "task FAILS",
+            "不得伪造输出": "Never fabricate",
+        }
+        for meaning, fragment in load_bearing.items():
+            self.assertIn(fragment, text, "承重约束缺失：%s" % meaning)
+
+    def test_contract_block_stays_compact(self):
+        """契约块体积上限，防止后续改动重新膨胀（design §4.1.3）。
+
+        阈值依据：2026-10-30 精简后实测约 2400 字符（单工具），留约 10% 余量。
+        调高阈值需在 PR 说明里给出理由。
+        """
+        from chatgpt_web.toolcalls import format_tools_instruction
+
+        length = len(format_tools_instruction(self.TOOLS))
+        self.assertLess(
+            length, 2600, "契约块已膨胀到 %d 字符，精简成果被侵蚀" % length
+        )
 
     def test_instruction_contains_concrete_example(self):
         from chatgpt_web.toolcalls import format_tools_instruction

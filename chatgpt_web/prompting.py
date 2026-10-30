@@ -9,16 +9,27 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import config
 from .models import ChatMessage
 from .toolcalls import (
+    CONTEXT_REBUILD_HEADER,
     EDIT_MD_HEADER,
+    ENV_NOTE_HEADER,
+    SECTION_ASSISTANT,
+    SECTION_SYSTEM,
+    SECTION_TOOL_RESULTS,
+    SECTION_USER,
     TOOLCALL_HEADER,
     format_repeat_call_hint,
     format_tool_call_emphasis,
     format_tools_instruction,
 )
 
-# 播种 prompt 的上下文重建头（去重 / 泄漏检测共用同一份，见 toolcalls 里的标题常量说明）。
-CONTEXT_REBUILD_HEADER = "[上下文重建]"
-ENV_NOTE_HEADER = "[环境说明]"
+# 区段标题常量统一在 toolcalls.py 定义（见 doc/prompt_design.md §2），此处仅再导出，
+# 保证「生成 / 去重 / 泄漏检测」永远共用同一份字符串。
+__all__ = [
+    "CONTEXT_REBUILD_HEADER",
+    "ENV_NOTE_HEADER",
+    "SECTION_USER",
+    "SECTION_TOOL_RESULTS",
+]
 
 # 图片分片降级成文本引用行时的前缀标记（与 DeepseekBridge 对齐）。
 MARK_IMAGE = "[图片]"
@@ -165,10 +176,10 @@ def _image_reference(url: str) -> str:
 #   1. 逐条结果：替换成「已完成、无输出、请给下一条指令」（见 EMPTY_TOOL_RESULT_NOTE）；
 #   2. 同一命令已重复 ≥2 次时再追加点名提醒（见 build_prompt / format_repeat_call_hint）。
 EMPTY_TOOL_RESULT_NOTE = (
-    "（本命令已执行完毕、退出正常，但**没有任何输出**：空输出是有效的正常结果，"
-    "既不是失败，也不代表工具异常或命令未生效。）\n"
-    "请直接给出**下一条指令**或最终结论；不要重复执行同一条命令——"
-    "同样的命令只会再次得到空输出。若确实需要看到内容，请换一条会打印状态的命令。"
+    "The command finished successfully but printed NOTHING. Empty output is a valid "
+    "result - not a failure, and not a sign that the tool broke.\n"
+    "Give the next command or the final answer. Do not re-run the same command (it will "
+    "print nothing again); if you need to see state, use a different command."
 )
 
 # 空输出的等价写法（均为括号/尖括号包裹形式，避免把真实输出里的普通句子误判成空）
@@ -372,14 +383,14 @@ def _render_message(message: ChatMessage) -> str:
             # 空输出必须显式说明（见 EMPTY_TOOL_RESULT_NOTE 的背景）：把
             # "(no output)" 原样交给模型，它会以为命令没生效而反复重发同一条命令。
             # 真实（非空）结果仍逐字节保留——那是 edit 工具 oldText 匹配的前提。
-            return f"[工具执行结果{tag}]\n{EMPTY_TOOL_RESULT_NOTE}"
-        return f"[工具执行结果{tag}]\n{raw}"
+            return f"{SECTION_TOOL_RESULTS}{tag}\n{EMPTY_TOOL_RESULT_NOTE}"
+        return f"{SECTION_TOOL_RESULTS}{tag}\n{raw}"
     content = raw.strip()
     if message.role == "system":
-        return f"[系统指令]\n{content}"
+        return f"{SECTION_SYSTEM}\n{content}"
     if message.role == "assistant":
-        return f"[你之前的回复]\n{content}"
-    return content
+        return f"{SECTION_ASSISTANT}\n{content}"
+    return f"{SECTION_USER}\n{content}"
 
 
 def has_prior_tool_use(messages: List[ChatMessage]) -> bool:
@@ -468,6 +479,16 @@ def _run_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
             for m in messages
             if m.role == "user" and not _is_harness_noise(m)
         ][-1:]
+    # 第 2 块内部互斥（doc/prompt_design.md §1.2）：最后一条 user 之后若还跟着
+    # 工具结果，说明这条指令已提交、本轮只发结果；反之（畸形输入：旧 tool 结果 +
+    # 一条新 user）必须丢掉新 user 之前的旧结果，否则两块同时出现，模型会把旧结果
+    # 当成本轮刚发生的事。
+    last_user = -1
+    for index, message in enumerate(delta):
+        if message.role == "user":
+            last_user = index
+    if last_user >= 0:
+        delta = [m for i, m in enumerate(delta) if i >= last_user or m.role != "tool"]
     return delta
 
 
@@ -598,6 +619,10 @@ def build_prompt(
         if seed:
             insert_at = len(parts) - 1 if len(parts) > history_start else history_start
             parts.insert(max(history_start, insert_at), format_tools_instruction(tool_list))
+        elif config.PROMPT_CONTRACT_LAST:
+            # A/B 开关（doc/prompt_tasks.md T3.2）：DeepseekBridge 的「契约放最后」排法。
+            # 仅供同一套 E2E 上对比，默认关闭——本项目 T1.1 的实测结论是契约在前。
+            parts.append(format_tools_instruction(tool_list))
         else:
             parts.insert(0, format_tools_instruction(tool_list))
 
