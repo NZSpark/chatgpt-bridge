@@ -437,12 +437,12 @@ class ToolsInstructionDesignTests(unittest.TestCase):
         self.assertIn("```tool_call", text)
         self.assertNotIn("no code fences", text)
 
-    def test_instruction_mandates_single_call(self):
-        """提示词必须要求「一次只返回一个 TOOL_CALL」。
+    def test_instruction_mandates_at_most_three_calls(self):
+        """提示词必须要求「一次最多返回三个 TOOL_CALL」。
 
-        客户端一次只能处理一个工具调用；若模型在同一回复里输出多条
-        TOOL_CALL，用户端无法处理。两块提示词（工具说明 + 格式强调）都要
-        明确禁止多调用，且不得再出现旧版「可以一次调用多个工具」的措辞。
+        客户端一次最多并行处理三个工具调用；超过三个的必须留到下一轮。
+        两块提示词（工具说明 + 格式强调）都要写清上限，且不得再出现旧版
+        「可以一次调用任意多个工具」的措辞。
         """
         from chatgpt_web.toolcalls import (
             format_tool_call_emphasis,
@@ -453,7 +453,7 @@ class ToolsInstructionDesignTests(unittest.TestCase):
             format_tools_instruction(self.TOOLS),
             format_tool_call_emphasis(),
         ):
-            self.assertIn("ONE tool_call", text)
+            self.assertIn("THREE tool_call", text)
             self.assertNotIn("several tool_call", text)
             self.assertNotIn("multiple tools at once", text)
 
