@@ -196,9 +196,13 @@ def tool_call_predicate(tools: Optional[List[Dict[str, Any]]]) -> Callable[[str]
     """
     def _has_call(text: str) -> bool:
         raw = text or ""
-        from .malformed import has_malformed_tool_call
+        from .malformed import has_malformed_tool_call, has_unbalanced_shell_quotes
 
         if has_malformed_tool_call(raw):
+            return False
+        # shell 命令引号不配对 = 解析阶段把值截断了，命令执行必报 unexpected EOF。
+        # 不在这里拦下的话，这段坏命令会被当成最终调用交给客户端（用户实测）。
+        if has_unbalanced_shell_quotes(raw, tools):
             return False
         # 与最终解析共用同一条路径（含 shell 围栏修复）：否则修复出的调用会被判为
         # “没调用工具”，桥会追发一次多余的纠偏指令。

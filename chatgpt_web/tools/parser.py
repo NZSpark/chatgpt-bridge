@@ -758,22 +758,39 @@ def _repair_json_quotes(raw: str) -> Optional[Any]:
 
 
 def _shell_quotes_balanced(cmd: str) -> bool:
-    """粗判 shell 命令里的双引号是否成对（忽略 \\" 转义引号）。
+    """粗判 shell 命令里的双引号是否成对。
 
     解析出的命令若引号不配对，几乎必然是 JSON 修复阶段把值截断/丢尾引号，
     直接发给 shell 只会得到 `unexpected EOF`。宁可在桥接层拦下，让模型重出。
+
+    必须按 shell 词法扫描，而不是数 `"` 的个数：
+      * 单引号内部的双引号是**字面量**，不参与配对
+        （典型：``grep -oE 'text="[^"]"|bounds="[^"]*"'``，
+        里面的 `"` 全在单引号内，数个数会得到奇数并误丢整条命令）；
+      * 反斜杠转义（`\\"`）跳过；
+      * 单引号无法用反斜杠转义，只能靠 `'\\''` 拼接，这里按最朴素规则处理。
     """
-    count = 0
+    in_single = False
+    in_double = False
     i = 0
     n = len(cmd)
     while i < n:
-        if cmd[i] == "\\":
+        ch = cmd[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            # 双引号/普通上下文里反斜杠转义下一个字符
             i += 2
             continue
-        if cmd[i] == '"':
-            count += 1
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = not in_double
         i += 1
-    return count % 2 == 0
+    return not (in_single or in_double)
 
 
 def _iter_balanced_objects(text: str):
@@ -967,6 +984,25 @@ def parse_tool_calls(
                 parsed = True
                 break
             if not parsed:
+                # 平衡扫描失败：值里有未转义的双引号（典型是 shell 命令
+                # ``"$ADB" -s ...``）会让字符串状态提前错乱，depth 回不到 0。
+                # 先按边界引号归一化再扫一次。
+                for obj in _iter_balanced_objects(_strip_redundant_value_quotes(probe)):
+                    _consume(obj, allow_bare_object=True)
+                    pos = marker_match.end()
+                    parsed = True
+                    break
+            if not parsed:
+                # 仍失败：改用锚点式 salvage（按 name/arguments 定位，绕开括号配对），
+                # 与 TOOL_CALL: 分支保持一致。否则这条调用会被整条丢弃，客户端只收到纯文本。
+                salvaged = _salvage_string_args(probe)
+                if salvaged is None:
+                    salvaged = _salvage_missing_final_brace(probe)
+                if salvaged is not None:
+                    calls.append(salvaged)
+                    parsed = True
+                    pos = marker_match.end() + brace + len(probe)
+            if not parsed:
                 pos = marker_match.end()
 
     if not calls and config.SHELL_FENCE_FALLBACK:
@@ -979,10 +1015,12 @@ def parse_tool_calls(
     if valid_names is not None:
         calls = [c for c in calls if c.get("name") in valid_names]
 
-    # 护栏：shell 类命令若双引号不配对，几乎必然是解析阶段把值截断/丢尾引号。
-    # 这类命令发给 shell 只会得到 `unexpected EOF`，宁可在桥接层丢弃，
-    # 让模型下一轮重新输出完整命令。
-    calls = [c for c in calls if _call_args_sane(c)]
+    # 注意：这里**不再**直接丢弃「shell 引号不配对」的调用。
+    # 那种情况几乎必然是解析阶段把值截断/丢尾引号，命令直接发给 shell 只会
+    # `unexpected EOF`；但如果在解析层静默丢掉，客户端只会收到纯文本、把回复
+    # 当最终答案，任务就悄悄结束了（用户实测：整条调用直接发到客户端、无人执行）。
+    # 正确做法是把它交出去，由 tool_call_predicate / malformed 判定为不合格并
+    # 触发一次「重新调用」纠偏（见 chatgpt_web/malformed.py）。
 
     # 诊断：模型**确实想调用工具**（写了 TOOL_CALL 标记 / 围栏），但我们一个可用的
     # 调用都没能交出去。以前这里是静默的：客户端只收到纯文本、把回复当最终答案，

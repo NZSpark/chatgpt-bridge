@@ -366,14 +366,18 @@ class ControlCharRepairTests(unittest.TestCase):
 class ShellGuardTests(unittest.TestCase):
     """护栏：shell 类命令引号不配对时丢弃，避免把坏命令发给 bash。"""
 
-    def test_unbalanced_double_quote_dropped(self):
+    def test_unbalanced_double_quote_kept_for_retry(self):
         # 模型/解析把命令尾部闭引号弄丢："git commit -m "msg"
-        # 引号数为奇数 → 丢弃（否则 bash 报 unexpected EOF）。
+        # 引号数为奇数 → 解析层保留，但必须被纠偏判据识别为不合格。
+        from chatgpt_web.malformed import has_unbalanced_shell_quotes
+
         text = (
             'TOOL_CALL: {"name": "exec_command", "arguments": '
             '{"cmd": "git commit -m "msg"}}'
         )
-        self.assertEqual(parse_tool_calls(text), [])
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(has_unbalanced_shell_quotes(text))
 
     def test_balanced_double_quotes_kept(self):
         text = (
@@ -659,11 +663,13 @@ class ShellFenceRepairTests(unittest.TestCase):
             "git status --short\ngit log --oneline -1",
         )
 
-    def test_unbalanced_quotes_are_dropped(self):
-        # 既有护栏仍生效：引号不配对的命令几乎必然是解析截断，宁可丢弃
-        self.assertEqual(
-            parse_reply_tool_calls('```bash\necho "oops\n```', self.BASH_TOOLS), []
-        )
+    def test_unbalanced_quotes_kept_for_retry(self):
+        # 引号不配对的命令不在解析层丢弃，交给纠偏重发。
+        from chatgpt_web.malformed import has_unbalanced_shell_quotes
+
+        text = '```bash\necho "oops\n```'
+        self.assertEqual(len(parse_reply_tool_calls(text, self.BASH_TOOLS)), 1)
+        self.assertTrue(has_unbalanced_shell_quotes(text, self.BASH_TOOLS))
 
     def test_config_flag_disables_repair(self):
         with mock.patch.object(config, "SHELL_FENCE_FALLBACK", False):

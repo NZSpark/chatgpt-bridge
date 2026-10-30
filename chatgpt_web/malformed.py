@@ -124,6 +124,52 @@ def has_malformed_tool_call(text: str) -> bool:
     return any(not _is_valid_call(body) for body in _bare_bodies(text))
 
 
+def has_unbalanced_shell_quotes(text: str, valid_names=None) -> bool:
+    """出现了可用调用，但 shell 命令的引号不配对。
+
+    这种情况几乎必然是解析阶段把 JSON 值截断/丢尾引号（未转义的双引号、
+    换行没转义……）。命令直接发给 shell 只会 `unexpected EOF`，应当在桥接层
+    拦下，让模型重发一次，而不是当成最终答案或直接发到客户端执行。
+    """
+    if not text:
+        return False
+    try:
+        from .tools.parser import (
+            _SHELL_FENCE_LABELS,
+            _SHELL_FENCE_RE,
+            _dedent_command,
+            _shell_quotes_balanced,
+        )
+    except Exception:  # noqa: BLE001 解析层缺席
+        return False
+    # 1) ```bash / ```sh 围栏里的裸命令
+    for match in _SHELL_FENCE_RE.finditer(text):
+        if match.group(1).strip().lower() not in _SHELL_FENCE_LABELS:
+            continue
+        command = _dedent_command(match.group(2))
+        if command.strip() and not _shell_quotes_balanced(command):
+            return True
+    # 2) tool_call JSON 里的 command/cmd/script
+    try:
+        from .toolcalls import parse_tool_calls
+
+        calls = parse_tool_calls(text, valid_names)
+    except Exception:  # noqa: BLE001, S110
+        calls = []
+    for call in calls:
+        name = (call.get("name") or "").lower()
+        if not any(k in name for k in ("bash", "shell", "exec", "terminal", "run")):
+            continue
+        args = call.get("arguments")
+        if not isinstance(args, dict):
+            continue
+        for key in ("command", "cmd", "script"):
+            value = args.get(key)
+            if isinstance(value, str) and not _shell_quotes_balanced(value):
+                return True
+    return False
+
+
 def has_no_usable_call(text: str, valid_names=None) -> bool:
     """出现了 tool_call 标记、却拿不到任何可用调用（含工具名不在列表里的情况）。
 
