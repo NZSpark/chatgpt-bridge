@@ -27,12 +27,12 @@ def resolve_edit_path(path: Any) -> tuple[Optional[Path], Optional[str]]:
     返回的第二个值非空时，调用方应直接以 ``{"ok": false, "error": ...}`` 回传。
     """
     if not isinstance(path, str) or not path.strip():
-        return None, "edit_markdown 需要 path"
+        return None, "edit_markdown requires a non-empty path"
     raw = Path(path.strip())
     if raw.is_absolute():
-        return None, f"路径越界（不允许绝对路径）：{path}"
+        return None, f"path rejected (absolute paths are not allowed): {path}"
     if ".." in raw.parts:
-        return None, f"路径越界（不允许 .. 段）：{path}"
+        return None, f"path rejected ('..' segments are not allowed): {path}"
     root = Path(config.EDIT_MARKDOWN_ROOT or config.PROJECT_ROOT).resolve()
     resolved = (root / raw).resolve()
     try:
@@ -40,7 +40,7 @@ def resolve_edit_path(path: Any) -> tuple[Optional[Path], Optional[str]]:
     except AttributeError:  # pragma: no cover - Python < 3.9 的兜底
         inside = str(resolved).startswith(str(root) + os.sep)
     if not inside:
-        return None, f"路径越界（必须位于 {root} 之内）：{path}"
+        return None, f"path rejected (must stay inside {root}): {path}"
     # 返回**解析后的绝对路径**：读写必须落在沙箱解析结果上，
     # 而不是让 markdown_io 拿相对路径去拼当前工作目录（可能落到沙箱之外）。
     return resolved, None

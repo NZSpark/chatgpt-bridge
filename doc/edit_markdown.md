@@ -52,6 +52,16 @@
 {"name":"edit_markdown","arguments":{"path":"doc/example.md","start":10,"end":12,"new_text":"替换后的内容","write":false}}
 ```
 
+注入提示词时，`description` 与各字段的 `description` 一律使用**英文**（与项目其他注入文案一致，见 `doc/prompt_design.md`）：
+
+- 工具描述：`Edit a local Markdown file by 1-based inclusive line range. ...`；
+- 字段描述：`Path to the target Markdown file, relative to the sandbox root.`、`First line to replace (1-based, inclusive).`、`Last line to replace (1-based, inclusive).`、`Replacement text for lines [start, end]; \n separates lines.`、`true to persist to disk; default false returns only the diff.`
+
+同理，模型可见的错误串（`path rejected (...)`、`line range out of bounds: ...`、`file too large: ...`、
+`structural validation failed after edit`、`backup failed, file not written: ...`、`write=true was ignored: ...`）
+也都是英文；中文只保留在仓库内部注释与本说明文档里。修改这些字符串时需同步
+`tests/test_edit_markdown_sandbox.py` 的断言。
+
 `start` 和 `end` 构成 **1-based 闭区间**。例如 `start=10, end=12` 会替换原第 10、11、12 行，而不是只替换第 10 至 11 行之间的内容。
 
 `new_text` 可以包含换行。空字符串表示该区间不保留替换行，因此可以用来删除选中行。行号、路径和文本均应来自目标文件的实际状态，不能直接照抄说明中的占位示例。
@@ -223,6 +233,25 @@ ChatGPT 网页端不是项目自己的命令执行器。桥接层通过提示词
 
 该函数为 `server` 与 `responses` 相关路径提供共用执行实现。
 
+### 7.1.1 同批对同一文件的多次调用
+
+模型在一轮里可能对**同一个文件**给出多个 `edit_markdown`（例如一次请求改多处）。这些调用的
+`start` / `end` 都是基于**同一份原始文件**的绝对行号，而每次编辑都可能改变行数。若按模型给出的
+顺序从前往后执行，后一个调用的行号就会指向偏移后的内容——轻则静默改错位置，重则行号越界。
+
+实现规则：
+
+- 按 `path`（`arguments.path` 原样去空白）分组；组内**按 `start` 降序**执行（先改后面的行）。
+- 组内超过 1 个调用时记一条 INFO 日志，便于从运行日志确认发生过重排。
+- **返回列表仍保持模型给出的原始顺序**，客户端看到的 `tool_call_id` ↔ 结果对应关系不变。
+- 缺省或非法的 `start` 视为 0（排到最后执行），实际执行时仍由 `execute_edit_markdown()` 报错。
+
+提示词侧同步约定（`toolcalls.edit_markdown_spec()`）：同一文件多次编辑请按 `start` 降序给出，
+或合并为一次编辑。这是对模型行为的第一道引导；上面的执行期重排是兜底，不依赖模型是否遵守。
+
+回归用例：`tests/test_edit_markdown_sandbox.py::
+RunLocalEditMarkdownTests::test_same_file_three_edits_front_to_back_do_not_drift`。
+
 ### 7.2 `execute_edit_markdown()` 的处理顺序
 
 1. 取得 `path` 并调用 `resolve_edit_path()`。
@@ -344,6 +373,7 @@ ChatGPT 网页端不是项目自己的命令执行器。桥接层通过提示词
 
 | 测试文件 | 主要验证内容 |
 | --- | --- |
+| `tests/test_edit_markdown_sandbox.py` | 路径沙箱、写入门槛、同批同文件多调用的执行顺序与返回顺序 |
 | `tests/test_markdown_io.py` | 文档读取、LF/CRLF 内存解析、尾换行、围栏状态机、定位、替换、diff、备份、回滚和结构验证 |
 | `tests/test_toolcalls.py` | 工具调用格式、解析与修复、类型化请求、工具管线、执行台账和本地 Markdown 执行相关用例 |
 | `tests/test_tool_injection.py` | 内置工具说明、示例 JSON 可解析性、注入格式和去重相关契约 |
@@ -377,7 +407,10 @@ ChatGPT 网页端不是项目自己的命令执行器。桥接层通过提示词
 2. **schema 与执行器类型校验并非完全等价。** `start` / `end` 当前通过 `int()` 转换，`write` 通过 `bool()` 转换。若希望严格拒绝错误 JSON 类型，可补充专用参数 validator，或在执行器中先进行严格类型检查。
 3. **备份文件名冲突。** 当前名称精度为秒级，连续备份同名文件可能撞名。若频繁写盘是受支持的使用方式，可改进为高精度时间戳或唯一后缀，并增加碰撞测试。
 4. **策略扩展要保持真实。** `ToolPolicy` 暴露的字段不应被文档或调用方误认为都已实施。新增工具时应明确哪些字段由策略层、执行器或外部调用方真正执行。
-5. **保留最小权限和 dry-run。** 本地执行开关、路径沙箱、全局写入门槛、结构校验、备份与台账是互补措施，任何一个都不应被提示词约定取代。
+5. **同批多调用的重叠区间尚未拦截。** 当前只做「按 `start` 降序执行」，区间重叠时仍会依次叠加
+   应用（等于以后一次的新内容为基础再改）。若认为这属于误用，应在执行前拒绝重叠区间并把错误
+   回灌给模型，而不是静默叠加。
+6. **保留最小权限和 dry-run。** 本地执行开关、路径沙箱、全局写入门槛、结构校验、备份与台账是互补措施，任何一个都不应被提示词约定取代。
 6. **将端到端失败分类清楚。** 模型未调用工具、工具 JSON 格式错误、路径策略拒绝、Markdown 结构错误以及网页/模型环境不可用属于不同故障，应在测试与日志中保持可区分。
 
 ## 15. 总结

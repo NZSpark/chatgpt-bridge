@@ -65,18 +65,18 @@ class ResolveEditPathTests(SandboxCase):
     def test_parent_traversal_is_rejected(self) -> None:
         resolved, error = resolve_edit_path("../../etc/passwd")
         self.assertIsNone(resolved)
-        self.assertIn("路径越界", error or "")
+        self.assertIn("path rejected", error or "")
 
     def test_absolute_path_is_rejected(self) -> None:
         resolved, error = resolve_edit_path("/tmp/x.md")
         self.assertIsNone(resolved)
-        self.assertIn("绝对路径", error or "")
+        self.assertIn("absolute paths are not allowed", error or "")
 
     def test_absolute_path_inside_root_is_still_rejected(self) -> None:
         """即便绝对路径正好在沙箱内也拒绝——模型没有理由给出绝对路径。"""
         resolved, error = resolve_edit_path(str(self.doc))
         self.assertIsNone(resolved)
-        self.assertIn("绝对路径", error or "")
+        self.assertIn("absolute paths are not allowed", error or "")
 
     def test_symlink_escape_is_rejected(self) -> None:
         outside = self.root.parent / "edit-md-symlink-target.md"
@@ -89,17 +89,17 @@ class ResolveEditPathTests(SandboxCase):
             self.skipTest(f"symlink unavailable: {exc}")
         resolved, error = resolve_edit_path("linked.md")
         self.assertIsNone(resolved)
-        self.assertIn("路径越界", error or "")
+        self.assertIn("path rejected", error or "")
 
     def test_empty_path_is_rejected(self) -> None:
         resolved, error = resolve_edit_path("   ")
         self.assertIsNone(resolved)
-        self.assertIn("需要 path", error or "")
+        self.assertIn("requires a non-empty path", error or "")
 
     def test_non_string_path_is_rejected(self) -> None:
         resolved, error = resolve_edit_path({"a": 1})  # type: ignore[arg-type]
         self.assertIsNone(resolved)
-        self.assertIn("需要 path", error or "")
+        self.assertIn("requires a non-empty path", error or "")
 
 
 class ExecuteSandboxTests(SandboxCase):
@@ -111,7 +111,7 @@ class ExecuteSandboxTests(SandboxCase):
             with self.subTest(path=bad):
                 result = self._edit(path=bad)
                 self.assertFalse(result["ok"], result)
-                self.assertIn("路径越界", result["error"])
+                self.assertIn("path rejected", result["error"])
         self.assertEqual(outside.read_text(encoding="utf-8"), "原始内容\n")
 
     def test_dry_run_does_not_write(self) -> None:
@@ -142,7 +142,7 @@ class ExecuteSandboxTests(SandboxCase):
     def test_line_range_still_validated(self) -> None:
         result = self._edit(start=1, end=999)
         self.assertFalse(result["ok"])
-        self.assertIn("行号越界", result["error"])
+        self.assertIn("line range out of bounds", result["error"])
 
     def test_backup_failure_never_writes(self) -> None:
         original = self.doc.read_text(encoding="utf-8")
@@ -151,7 +151,7 @@ class ExecuteSandboxTests(SandboxCase):
         ):
             result = self._edit(write=True)
         self.assertFalse(result["ok"], result)
-        self.assertIn("备份失败", result["error"])
+        self.assertIn("backup failed", result["error"])
         self.assertEqual(self.doc.read_text(encoding="utf-8"), original)
 
     def test_oversized_file_is_rejected_before_parse(self) -> None:
@@ -161,7 +161,7 @@ class ExecuteSandboxTests(SandboxCase):
         ) as read_md:
             result = self._edit()
         self.assertFalse(result["ok"], result)
-        self.assertIn("文件过大", result["error"])
+        self.assertIn("file too large", result["error"])
         read_md.assert_not_called()
 
 
@@ -193,6 +193,56 @@ class RunLocalEditMarkdownTests(SandboxCase):
         self.assertTrue(
             str(out[1]["result"]["resolved_path"]).startswith(str(self.root.resolve()))
         )
+
+    def test_same_file_three_edits_front_to_back_do_not_drift(self) -> None:
+        """同批同文件三个 edit_markdown：模型按行号从前往后给出，也不能改错位置。
+
+        三处编辑都会改变行数（第 1 处插入 2 行），若按模型顺序执行，后两处的
+        ``start`` 会指向偏移后的内容；实现改为同文件组内按 start 降序执行，
+        返回列表仍保持模型给出的原始顺序。
+        """
+        doc = self.root / "multi.md"
+        lines = [f"line-{i:02d}" for i in range(1, 21)]
+        doc.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        calls = [
+            # 从前往后：第 2 行处插入两行，后面的行号会整体下移
+            {"id": "c1", "name": EDIT_MARKDOWN_TOOL_NAME, "arguments": {
+                "path": "multi.md", "start": 2, "end": 2,
+                "new_text": "inserted-a\ninserted-b", "write": True,
+            }},
+            {"id": "c2", "name": EDIT_MARKDOWN_TOOL_NAME, "arguments": {
+                "path": "multi.md", "start": 10, "end": 10,
+                "new_text": "TEN", "write": True,
+            }},
+            {"id": "c3", "name": EDIT_MARKDOWN_TOOL_NAME, "arguments": {
+                "path": "multi.md", "start": 18, "end": 18,
+                "new_text": "EIGHTEEN", "write": True,
+            }},
+        ]
+        with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", True), \
+                mock.patch.object(config, "EDIT_MARKDOWN_WRITE", True):
+            out = run_local_edit_markdown(
+                calls, backup_dir=str(self.root / "backups")
+            )
+        # 返回顺序 == 入参顺序
+        self.assertEqual([c["id"] for c in out], ["c1", "c2", "c3"])
+        for call in out:
+            self.assertTrue(call["result"]["ok"], call)
+            self.assertTrue(call["result"]["written"], call)
+        final = doc.read_text(encoding="utf-8").split("\n")
+        # 原 line-02 被替换为两行，原 line-10 / line-18 仍被精确替换
+        self.assertEqual(final[0], "line-01")
+        self.assertEqual(final[1], "inserted-a")
+        self.assertEqual(final[2], "inserted-b")
+        self.assertIn("TEN", final)
+        self.assertIn("EIGHTEEN", final)
+        self.assertNotIn("line-10", final)
+        self.assertNotIn("line-18", final)
+        # 漂移会改掉邻近行；确认它们没被动
+        self.assertIn("line-11", final)
+        self.assertIn("line-19", final)
+        # 20 行：第 2 行 1→2（+1），第 10/18 行各 1→1，故净增 1 行
+        self.assertEqual(len(final) - 1, 21)
 
     def test_disabled_keeps_calls_intact(self) -> None:
         calls = [{"name": EDIT_MARKDOWN_TOOL_NAME, "arguments": {}}]

@@ -175,20 +175,34 @@ EDIT_MARKDOWN_TOOL: Dict[str, Any] = {
     "function": {
         "name": EDIT_MARKDOWN_TOOL_NAME,
         "description": (
-            "按行号区间编辑本地 Markdown 文件：保留围栏代码块结构，"
-            "只替换 [start, end] 行，区间外字节级保真。默认只返回 diff（dry-run），"
-            "传 write=true 才落盘，落盘前自动备份。"
+            "Edit a local Markdown file by 1-based inclusive line range. "
+            "Fenced code blocks stay structurally intact and everything outside "
+            "[start, end] is preserved verbatim. By default only a unified diff "
+            "is returned (dry-run); pass write=true to persist, which backs up "
+            "the file first."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目标 Markdown 文件路径"},
-                "start": {"type": "integer", "description": "起始行号（1-based，闭区间）"},
-                "end": {"type": "integer", "description": "结束行号（1-based，闭区间）"},
-                "new_text": {"type": "string", "description": "替换 [start, end] 的新文本"},
+                "path": {
+                    "type": "string",
+                    "description": "Path to the target Markdown file, relative to the sandbox root.",
+                },
+                "start": {
+                    "type": "integer",
+                    "description": "First line to replace (1-based, inclusive).",
+                },
+                "end": {
+                    "type": "integer",
+                    "description": "Last line to replace (1-based, inclusive).",
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Replacement text for lines [start, end]; \\n separates lines.",
+                },
                 "write": {
                     "type": "boolean",
-                    "description": "true 才落盘；默认 false 仅返回 diff",
+                    "description": "true to persist to disk; default false returns only the diff.",
                 },
             },
             "required": ["path", "start", "end", "new_text"],

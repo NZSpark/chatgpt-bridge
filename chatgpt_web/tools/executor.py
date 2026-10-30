@@ -86,6 +86,33 @@ def tool_call_request_mappings(
     return [request.as_mapping() for request in requests]
 
 
+def _edit_sort_key(call: Dict[str, Any]) -> int:
+    """同一文件多调用时按 start 降序执行的排序键（越大越先执行）。
+
+    模型给出的 start/end 都是**同一份原始文件**上的绝对行号；若从前往后
+    执行，前面的编辑改变行数后，后面的行号就会漂移（改错位置或越界）。
+    先改后面的行、再改前面的行，行号语义始终对齐原始快照（见
+    doc/edit_markdown.md「同批多调用」）。缺省/非法 start 视为 0（最后执行）。
+    """
+    args = call.get("arguments")
+    if not isinstance(args, dict):
+        return 0
+    try:
+        return int(args.get("start"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _order_same_file_edits(
+    indices: List[int], tool_calls: List[Dict[str, Any]]
+) -> List[int]:
+    """把「同一批里对同一文件」的 edit_markdown 索引按 start 降序重排。
+
+    只调整执行顺序，不改动返回顺序（返回仍按模型给出的原始顺序）。
+    """
+    return sorted(indices, key=lambda i: _edit_sort_key(tool_calls[i]), reverse=True)
+
+
 def run_local_edit_markdown(
     tool_calls: List[Dict[str, Any]],
     *,
@@ -98,6 +125,10 @@ def run_local_edit_markdown(
 
     非 ``edit_markdown`` 的调用原样透传，顺序与内容不变。未开启本地执行或
     没有调用时原样返回。
+
+    同一批里针对**同一文件**的多个 edit_markdown 按 ``start`` 降序执行，
+    避免模型用原始行号从前往后改时行号漂移（见 :func:`_edit_sort_key`）。
+    返回列表仍保持入参顺序。
     """
     if enabled is None:
         enabled = config.EDIT_MARKDOWN_LOCAL
@@ -105,8 +136,35 @@ def run_local_edit_markdown(
         backup_dir = config.EDIT_MARKDOWN_BACKUP_DIR
     if not enabled or not tool_calls:
         return tool_calls
-    out: List[Dict[str, Any]] = []
-    for call in tool_calls:
+
+    # 先按 (path) 分组，组内按 start 降序决定执行顺序；最终结果按原始下标写回。
+    by_path: Dict[str, List[int]] = {}
+    for idx, call in enumerate(tool_calls):
+        if call.get("name") != EDIT_MARKDOWN_TOOL_NAME:
+            continue
+        args = call.get("arguments")
+        raw_path = args.get("path") if isinstance(args, dict) else None
+        path_key = raw_path.strip() if isinstance(raw_path, str) else ""
+        by_path.setdefault(path_key, []).append(idx)
+    execution_order: List[int] = [
+        idx for idx, call in enumerate(tool_calls)
+        if call.get("name") != EDIT_MARKDOWN_TOOL_NAME
+    ]
+    for group in by_path.values():
+        if len(group) > 1:
+            logger.info(
+                "同批同文件 edit_markdown 多调用（%d 个），按 start 降序执行以避免行号漂移",
+                len(group),
+            )
+        execution_order.extend(_order_same_file_edits(group, tool_calls))
+
+    # 按执行顺序算结果，再按原始下标回填，保证输出顺序 == 入参顺序。
+    results: Dict[int, Dict[str, Any]] = {}
+    for idx in execution_order:
+        call = tool_calls[idx]
+        if call.get("name") != EDIT_MARKDOWN_TOOL_NAME:
+            results[idx] = call
+            continue
         if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
             metrics.inc("tool_call_total")
             call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:16]}")
@@ -118,7 +176,7 @@ def run_local_edit_markdown(
                     existing = ledger.get(session_key, call_id)
                 if existing is None:
                     result = {"ok": False, "error": "tool execution did not produce a ledger result"}
-                    out.append({**call, "id": call_id, "result": result, "duplicate": True})
+                    results[idx] = {**call, "id": call_id, "result": result, "duplicate": True}
                     continue
                 metrics.inc("tool_duplicate_total")
                 with log_context(tool_call_id=call_id):
@@ -128,7 +186,7 @@ def run_local_edit_markdown(
                         call_id,
                         existing.tool_name,
                     )
-                out.append({**call, "id": call_id, "result": existing.result, "duplicate": True})
+                results[idx] = {**call, "id": call_id, "result": existing.result, "duplicate": True}
                 continue
             started_at = time.monotonic()
             # PI-021：把 tool_call_id 绑进日志关联上下文，退出后自动恢复，
@@ -155,10 +213,9 @@ def run_local_edit_markdown(
                     error_type=error_type,
                     result=result,
                 )
-            out.append({**call, "id": call_id, "result": result})
-        else:
-            out.append(call)
-    return out
+            results[idx] = {**call, "id": call_id, "result": result}
+
+    return [results[i] for i in range(len(tool_calls))]
 
 
 def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/backups") -> Dict[str, Any]:
@@ -181,10 +238,10 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
         start = int(args["start"])
         end = int(args["end"])
     except (KeyError, TypeError, ValueError):
-        return {"ok": False, "error": "edit_markdown 需要合法的 start/end"}
+        return {"ok": False, "error": "edit_markdown requires integer start/end"}
     new_text = args.get("new_text", "")
     if not isinstance(new_text, str):
-        return {"ok": False, "error": "edit_markdown 的 new_text 必须是字符串"}
+        return {"ok": False, "error": "edit_markdown requires new_text to be a string"}
     write_requested = bool(args.get("write", False))
     do_write = write_requested and config.EDIT_MARKDOWN_WRITE
     write_refused = write_requested and not do_write
@@ -192,15 +249,15 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
     try:
         file_size = path.stat().st_size
     except FileNotFoundError:
-        return {"ok": False, "error": f"文件不存在：{path}"}
+        return {"ok": False, "error": f"file not found: {path}"}
     except OSError as exc:
-        return {"ok": False, "error": f"无法访问文件：{exc}"}
+        return {"ok": False, "error": f"cannot access file: {exc}"}
     max_file_bytes = config.EDIT_MARKDOWN_MAX_FILE_BYTES
     if max_file_bytes > 0 and file_size > max_file_bytes:
         return {
             "ok": False,
             "error": (
-                f"文件过大：{file_size} bytes > "
+                f"file too large: {file_size} bytes > "
                 f"EDIT_MARKDOWN_MAX_FILE_BYTES={max_file_bytes}"
             ),
         }
@@ -208,13 +265,16 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
     try:
         doc = markdown_io.read_md(path)
     except FileNotFoundError:
-        return {"ok": False, "error": f"文件不存在：{path}"}
+        return {"ok": False, "error": f"file not found: {path}"}
     except markdown_io.MarkdownError as exc:
         return {"ok": False, "error": str(exc)}
 
     total = len(doc.lines)
     if start < 1 or end > total or start > end:
-        return {"ok": False, "error": f"行号越界：{start}-{end}（共 {total} 行）"}
+        return {
+            "ok": False,
+            "error": f"line range out of bounds: {start}-{end} (file has {total} lines)",
+        }
 
     try:
         edited = markdown_io.apply_edit(doc, start, end, new_text)
@@ -225,7 +285,7 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
     if issues:
         return {
             "ok": False,
-            "error": "编辑后结构校验未通过",
+            "error": "structural validation failed after edit",
             "issues": [{"code": i.code, "message": i.message, "line": i.line} for i in issues],
         }
 
@@ -236,7 +296,7 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
             backup_path = str(backup.backup_path)
         except OSError as exc:
             logger.warning("edit_markdown 备份失败（%s）：未写盘。", path, exc_info=True)
-            return {"ok": False, "error": f"备份失败：{exc}"}
+            return {"ok": False, "error": f"backup failed, file not written: {exc}"}
 
     diff = markdown_io.write_md(edited, path=path, dry_run=not do_write)
     result: Dict[str, Any] = {
@@ -252,7 +312,7 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
     }
     if write_refused:
         result["note"] = (
-            "已忽略 write=true：EDIT_MARKDOWN_WRITE=false（默认只做 dry-run，"
-            "不落盘）。需要落盘请在 .env 里显式打开。"
+            "write=true was ignored: EDIT_MARKDOWN_WRITE=false (default is dry-run, "
+            "nothing written). Enable it in .env to allow persisting."
         )
     return result

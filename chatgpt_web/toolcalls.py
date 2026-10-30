@@ -123,6 +123,7 @@ def edit_markdown_spec() -> str:
         "start/end are 1-based inclusive line numbers; content outside the range (including blank lines, indentation, trailing whitespace) is preserved verbatim.",
         "Do not touch the fence lines themselves (triple-backtick lines); content inside a fence",
         "does not participate in structural positioning.",
+        "If you edit the SAME file more than once in one batch, order the calls by descending start line (highest line number first), or merge them into a single edit; line numbers refer to the original file.",
         "By default only a diff is returned (dry-run); pass write=true to persist to disk.",
     ])
 

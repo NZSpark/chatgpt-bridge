@@ -151,7 +151,9 @@ def scan_fences(lines: List[Line]) -> List[Fence]:
 
     if open_fence is not None:
         char, length, lang, start_no = open_fence
-        raise MarkdownError(f"未闭合的围栏：起始于第 {start_no} 行（{char * length}{lang}）")
+        raise MarkdownError(
+            f"unclosed code fence: opened at line {start_no} ({char * length}{lang})"
+        )
     return fences
 
 
@@ -204,9 +206,12 @@ def locate(doc: MdDoc, anchor: Anchor) -> Tuple[int, int]:
 
     if anchor.kind == "line":
         if anchor.start is None or anchor.end is None:
-            raise LocateError("line 锚点需要 start 与 end")
+            raise LocateError("line anchor requires both start and end")
         if anchor.start < 1 or anchor.end > len(lines) or anchor.start > anchor.end:
-            raise LocateError(f"行号越界：{anchor.start}-{anchor.end}（共 {len(lines)} 行）")
+            raise LocateError(
+                f"line range out of bounds: {anchor.start}-{anchor.end} "
+                f"(file has {len(lines)} lines)"
+            )
         return anchor.start, anchor.end
 
     if anchor.kind == "heading":
@@ -224,7 +229,7 @@ def locate(doc: MdDoc, anchor: Anchor) -> Tuple[int, int]:
                 hit = (line.no, level)
                 break
         if hit is None:
-            raise LocateError(f"未找到标题：{target}")
+            raise LocateError(f"heading not found: {target}")
         start, level = hit
         end = len(lines)
         for line in lines[start:]:
@@ -242,7 +247,9 @@ def locate(doc: MdDoc, anchor: Anchor) -> Tuple[int, int]:
         candidates = [f for f in doc.fences if not anchor.lang or f.lang == anchor.lang]
         if anchor.index:
             if anchor.index > len(candidates):
-                raise LocateError(f"没有第 {anchor.index} 个围栏（lang={anchor.lang or '*'!r}）")
+                raise LocateError(
+                    f"no fence at index {anchor.index} (lang={anchor.lang or '*'!r})"
+                )
             f = candidates[anchor.index - 1]
         else:
             if len(candidates) != 1:
@@ -256,15 +263,15 @@ def locate(doc: MdDoc, anchor: Anchor) -> Tuple[int, int]:
     if anchor.kind == "text":
         needle = anchor.text
         if not needle:
-            raise LocateError("text 锚点需要非空片段")
+            raise LocateError("text anchor requires a non-empty snippet")
         hits = [line.no for line in lines if not line.in_fence and needle in line.text]
         if not hits:
-            raise LocateError("片段未命中任何正文行")
+            raise LocateError("snippet did not match any body line")
         if len(hits) > 1:
-            raise LocateError(f"片段多命中，候选行号：{hits}")
+            raise LocateError(f"snippet matched multiple lines; candidates: {hits}")
         return hits[0], hits[0]
 
-    raise LocateError(f"未知锚点类型：{anchor.kind}")
+    raise LocateError(f"unknown anchor kind: {anchor.kind}")
 
 
 def apply_edit(doc: MdDoc, start: int, end: int, new_text: str) -> MdDoc:
@@ -273,7 +280,9 @@ def apply_edit(doc: MdDoc, start: int, end: int, new_text: str) -> MdDoc:
     new_text 内部换行按 \n 处理；替换后重新扫描围栏。
     """
     if start < 1 or end > len(doc.lines) or start > end:
-        raise MarkdownError(f"行号越界：{start}-{end}（共 {len(doc.lines)} 行）")
+        raise MarkdownError(
+            f"line range out of bounds: {start}-{end} (file has {len(doc.lines)} lines)"
+        )
 
     replacement: List[str] = [] if new_text == "" else new_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
@@ -301,7 +310,7 @@ def write_md(doc: MdDoc, path=None, dry_run: bool = False) -> str:
     """
     target = Path(path) if path is not None else doc.path
     if target is None:
-        raise MarkdownError("write_md 需要 path")
+        raise MarkdownError("write_md requires a path")
 
     old = target.read_text(encoding="utf-8") if target.exists() else ""
     new = doc.text
@@ -424,21 +433,24 @@ def generate_edit(doc: MdDoc, instruction: str, llm) -> Tuple[int, int, str]:
     calls = parse_tool_calls(raw, valid_names={"edit_markdown"})
     call = next((c for c in calls if c.get("name") == "edit_markdown"), None)
     if call is None:
-        raise MarkdownError("模型未返回 edit_markdown 工具调用")
+        raise MarkdownError("model did not return an edit_markdown tool call")
 
     args = call.get("arguments") or {}
     try:
         start = int(args["start"])
         end = int(args["end"])
     except (KeyError, TypeError, ValueError):
-        raise MarkdownError("edit_markdown 参数缺少合法的 start/end")
+        raise MarkdownError("edit_markdown is missing integer start/end")
     new_text = args.get("new_text", "")
     if not isinstance(new_text, str):
-        raise MarkdownError("edit_markdown 的 new_text 必须是字符串")
+        raise MarkdownError("edit_markdown requires new_text to be a string")
 
     total = len(doc.lines)
     if start < 1 or end > total or start > end:
-        raise MarkdownError(f"模型返回的行号越界：{start}-{end}（共 {total} 行）")
+        raise MarkdownError(
+            f"model returned an out-of-bounds line range: {start}-{end} "
+            f"(file has {total} lines)"
+        )
     return start, end, new_text
 
 
