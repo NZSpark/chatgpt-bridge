@@ -207,10 +207,14 @@ SESSION_SCOPING = env_bool("SESSION_SCOPING", True)
 # 默认开：不同 AI 编程助手自动各用一条 ChatGPT 会话。关闭后退回旧的「默认桶，全局共用」行为。
 # 注意：自动分桶会使桶数随客户端数量增长，实际受 MAX_SESSION_BUCKETS 约束（超出按 LRU 回收页面，状态保留）。
 SESSION_SCOPING_BY_UA = env_bool("SESSION_SCOPING_BY_UA", True)
+# cwd 元数据自动分桶默认关闭；仅在采集并验证真实客户端格式后显式启用。
+SESSION_SCOPING_BY_CWD = env_bool("SESSION_SCOPING_BY_CWD", False)
+# cwd 桶键使用完整规范化路径的 SHA-256 前缀；建议保持至少 8 位。
+SESSION_CWD_HASH_LEN = env_int("SESSION_CWD_HASH_LEN", 12)
 # 单个 key 的长度上限（防止超长头部变成文件名/JSON 键）
 SESSION_KEY_MAX_LEN = env_int("SESSION_KEY_MAX_LEN", 64)
-# 同时在用的会话桶数量上限。超出时**回收最久未用**的页面（状态保留，下次按 URL 恢复）。
-# 0 表示不允许额外会话桶（所有请求都走默认桶）；想彻底关闭分桶用 SESSION_SCOPING=false。
+# 非默认会话桶的打开页面数量上限；超出时先回收空闲页面，再按 LRU 淘汰非活跃页面（状态保留）。
+# 0 表示禁止创建额外桶，非默认 key 请求会报错而非合并到默认桶；关闭分桶请用 SESSION_SCOPING=false。
 MAX_SESSION_BUCKETS = env_int("MAX_SESSION_BUCKETS", 8)
 # 内存里缓存的会话状态上限（超出按最久未用逐出）。
 # 状态本就落盘（session_store._state 未命中会从磁盘恢复），逐出内存副本是安全的，
@@ -257,7 +261,12 @@ SEED_ENV_NOTE = env_str(
 # 单条 tool 结果（role=="tool"）注入 prompt 时的最大字符数。
 # Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆 ChatGPT 网页版输入框
 # （Playwright fill 超时）。超出即截断并标注。0 = 不限制（不推荐）。
-TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 20000)
+# 默认 200,000：早期 20000 会截掉大型 diff / 日志 / 长文件，导致模型拿到的
+# 工具结果与真实文件不一致（edit 的 oldText 匹配失败、看不清完整改动）。
+# 但也不宜再往上加：单条结果过大会让 Playwright fill 超时，进而长时间占住
+# 会话桶锁（BUCKET_LOCK_TIMEOUT_S 到期后同桶请求全部 503 upstream_busy）。
+# 需要更大时同时调高 FILL_TIMEOUT_MS；彻底不截断设 0（风险自负）。
+TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 200000)
 # 工具纠偏（T1.1）的适用范围：**只在「本轮任务还没调用过任何工具」时**才纠偏。
 # 背景（2026-10-06 用户实测）：模型已经用过工具、最后用纯文本收尾时（“工作区是干净的，
 # 任务完成”），旧行为会立即追发一条纠偏指令 —— 等于把「任务已完成」的结论又重新推成
@@ -503,6 +512,8 @@ class SessionConfig:
     session_file: str
     session_scoping: bool
     session_scoping_by_ua: bool
+    session_scoping_by_cwd: bool
+    session_cwd_hash_len: int
     session_key_max_len: int
     max_session_buckets: int
     max_session_state_cache: int
@@ -633,6 +644,8 @@ def build_config_bundle() -> ConfigBundle:
             session_file=str(cfg.SESSION_FILE),
             session_scoping=cfg.SESSION_SCOPING,
             session_scoping_by_ua=cfg.SESSION_SCOPING_BY_UA,
+            session_scoping_by_cwd=cfg.SESSION_SCOPING_BY_CWD,
+            session_cwd_hash_len=cfg.SESSION_CWD_HASH_LEN,
             session_key_max_len=cfg.SESSION_KEY_MAX_LEN,
             max_session_buckets=cfg.MAX_SESSION_BUCKETS,
             max_session_state_cache=cfg.MAX_SESSION_STATE_CACHE,

@@ -356,15 +356,17 @@ codex --profile chatgpt
 | --- | --- | --- |
 | `SESSION_KEY_HEADER` | `X-ChatGPT-Session` | 分桶键请求头 |
 | `SESSION_SCOPING` | `true` | 是否启用分桶 |
-| `SESSION_SCOPING_BY_UA` | `true` | 无键时按 UA 分桶 |
-| `MAX_SESSION_BUCKETS` | `8` | 会话桶上限（LRU） |
+| `SESSION_SCOPING_BY_UA` | `true` | 无显式键时按 UA 分桶 |
+| `SESSION_SCOPING_BY_CWD` | `false` | opt-in：从受控环境元数据提取 cwd 自动分桶 |
+| `SESSION_CWD_HASH_LEN` | `12` | cwd 桶键的路径 SHA-256 摘要长度 |
+| `MAX_SESSION_BUCKETS` | `8` | 非默认会话桶的打开 Page 数上限（默认桶不计入）；0 = 禁止创建额外桶，非默认 key 请求报错且不合并到默认桶；关闭分桶请设置 `SESSION_SCOPING=false` |
 | `MAX_SESSION_STATE_CACHE` | `64` | 内存会话状态缓存上限（LRU 逐出，0 不限） |
 | `BUCKET_IDLE_TTL_S` | `900` | 空闲回收 |
 | `PARALLEL_BUCKETS` | `false` | 各桶并行页面 |
-| `BUCKET_LOCK_TIMEOUT_S` | `120` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
+| `BUCKET_LOCK_TIMEOUT_S` | `120` | 同桶排队超时，>0 超时返回 503 `upstream_busy`（建议 30：卡住时快速失败，别让客户端干等） |
 | `LINK_ALLOWED_HOSTS` | `chatgpt.com,chat.openai.com` | `/link` 允许绑定的站点（逗号或 `||` 分隔，子域自动允许；`*` = 不限制） |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
-| `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
+| `TOOL_RESULT_MAX_CHARS` | `200000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限；调大需同时调高 `FILL_TIMEOUT_MS`） |
 | `TOOL_NUDGE_UNTIL_FIRST_CALL` | `true` | 工具纠偏只在本轮还没调用过任何工具时生效；`false` = 完全不纠偏（桥绝不自行追发 prompt） |
 | `PROMPT_MAX_CHARS` | `1000000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
 | `SESSION_MAX_TURNS` | `120` | 轮数到顶阈值（0 禁用） |

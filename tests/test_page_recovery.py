@@ -335,6 +335,46 @@ class PageLivenessClassificationTests(_RecoveryTestBase):
 
 
 class EnsurePageRebuildTests(_RecoveryTestBase):
+    def test_zero_bucket_limit_rejects_non_default_bucket_without_merging(self) -> None:
+        driver = self.make_driver()
+        driver.context = _FakeContext()
+
+        with mock.patch.object(config, "MAX_SESSION_BUCKETS", 0):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(driver._ensure_page("non-default"))
+
+        message = str(ctx.exception)
+        self.assertIn("禁止创建额外会话桶", message)
+        self.assertIn("不会自动合并到默认桶", message)
+        self.assertNotIn("non-default", driver._pages)
+        self.assertEqual(driver.context.created, [], "拒绝请求前不应创建页面")
+
+    def test_default_bucket_is_allowed_when_bucket_limit_is_zero(self) -> None:
+        driver = self.make_driver()
+        driver.context = _FakeContext()
+
+        with mock.patch.object(config, "MAX_SESSION_BUCKETS", 0), _quiet_page_setup():
+            asyncio.run(driver._ensure_page(DEFAULT_SESSION_KEY))
+
+        self.assertIs(driver.page, driver.context.created[0])
+        self.assertEqual(driver._pages, {}, "默认桶不计入非默认桶页面池")
+
+    def test_bucket_limit_one_recycles_lru_non_default_page(self) -> None:
+        driver = self.make_driver()
+        driver.context = _FakeContext()
+
+        with mock.patch.object(config, "MAX_SESSION_BUCKETS", 1), \
+                mock.patch.object(config, "BUCKET_IDLE_TTL_S", 3600), \
+                _quiet_page_setup():
+            asyncio.run(driver._ensure_page("first"))
+            first_page = driver._pages["first"]
+            asyncio.run(driver._ensure_page("second"))
+
+        self.assertTrue(first_page.closed, "达到上限时应淘汰最久未用的非默认页面")
+        self.assertNotIn("first", driver._pages)
+        self.assertIn("second", driver._pages)
+        self.assertEqual(len(driver._pages), 1)
+
     def test_live_page_is_kept(self) -> None:
         driver = self.make_driver()
         page = _HealthyPage()

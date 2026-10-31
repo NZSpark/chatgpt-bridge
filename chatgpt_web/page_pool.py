@@ -293,9 +293,9 @@ class PagePoolMixin(BucketActivityMixin):
         新页面回到一个空白新对话并把 ``has_history`` 置 False，本轮由调用方用
         「播种」prompt 重放历史，上下文因此不丢。
 
-        桶数量达到 ``MAX_SESSION_BUCKETS`` 时**不再直接报错**：先回收空闲页面，
-        再按 LRU 淘汰最久未用的页面（**只关页面、状态保留**）。只有显式把
-        ``MAX_SESSION_BUCKETS=0`` 设成“不允许额外桶”时才拒绝。
+        非默认桶页面数量达到 ``MAX_SESSION_BUCKETS`` 时，先回收空闲页面，再按 LRU
+        淘汰最久未用的非活跃页面（**只关页面、状态保留**）。
+        ``MAX_SESSION_BUCKETS=0`` 时拒绝创建非默认桶；请求不会自动合并到默认桶。
         """
         bucket = key or DEFAULT_SESSION_KEY
         if not force and self._page_alive(bucket):
@@ -316,8 +316,8 @@ class PagePoolMixin(BucketActivityMixin):
             limit = config.MAX_SESSION_BUCKETS
             if limit <= 0:
                 raise RuntimeError(
-                    "MAX_SESSION_BUCKETS=0 表示不允许额外的会话桶（所有请求共用默认会话）。"
-                    "如需按任务隔离，请把它设为 >=1；想彻底关闭分桶请用 SESSION_SCOPING=false。"
+                    "MAX_SESSION_BUCKETS=0 表示禁止创建额外会话桶；非默认会话 key 请求不会自动合并到默认桶。"
+                    "如需按任务隔离，请把它设为 >=1；如需所有请求共用默认会话，请设置 SESSION_SCOPING=false。"
                 )
             # 先回收空闲页面，仍不够就按 LRU 淘汰最久未用的（两者都不丢会话状态）
             await self._recycle_idle_pages(exclude=bucket)

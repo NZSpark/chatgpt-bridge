@@ -33,6 +33,7 @@ from .models import (
 )
 from .prompting import build_prompt
 from .responses import ResponsesRequest, handle_responses
+from .session_scoping import cwd_bucket_key
 from .streaming import _stream_chat_completion
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,28 @@ def _client_from_ua(ua: str) -> Optional[str]:
     return None
 
 
+def _sanitize_session_key(raw: str, *, max_len: int, generated: bool = False) -> Optional[str]:
+    """Sanitize bucket identifiers and prevent common normalization collisions."""
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        limit = max(1, int(max_len))
+    except (TypeError, ValueError):
+        limit = 64
+    safe = "".join(ch if ch.isalnum() or ch in "_.:-" else "_" for ch in raw)
+    reserved = not generated and raw.lower().startswith(("ua:", "cwd:"))
+    if safe == raw and len(safe) <= limit and not reserved:
+        return safe
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:min(12, limit)]
+    prefix_room = limit - len(digest) - 1
+    prefix = safe[:prefix_room].rstrip("._:-") if prefix_room > 0 else ""
+    result = f"{prefix}-{digest}" if prefix else digest
+    return result[:limit] or None
+
+
 def _session_key(
     request: Union[ChatCompletionRequest, ResponsesRequest],
     header_value: Optional[str],
@@ -161,18 +184,26 @@ def _session_key(
     """
     if not config.SESSION_SCOPING:
         return None
-    raw = header_value or ""
+    raw = header_value.strip() if isinstance(header_value, str) else ""
+    generated = False
     if not raw:
         user = getattr(request, "user", None)
-        raw = user if isinstance(user, str) else ""
-    raw = raw.strip()
+        raw = user.strip() if isinstance(user, str) else ""
+    if not raw and config.SESSION_SCOPING_BY_CWD:
+        # cwd 只作兜底，不能覆盖显式 header 或 user。
+        raw = cwd_bucket_key(
+            request,
+            hash_len=config.SESSION_CWD_HASH_LEN,
+            max_key_len=config.SESSION_KEY_MAX_LEN,
+        ) or ""
+        generated = bool(raw)
     if not raw and config.SESSION_SCOPING_BY_UA:
         # 自动按 User-Agent 分桶：不同客户端自动隔离到不同会话（可由参数关闭）
         raw = _client_from_ua(user_agent or "") or ""
-    if not raw:
-        return None
-    sanitized = re.sub(r"[^\w.\-:]", "_", raw)[: max(1, config.SESSION_KEY_MAX_LEN)]
-    return sanitized or None
+        generated = bool(raw)
+    return _sanitize_session_key(
+        raw, max_len=config.SESSION_KEY_MAX_LEN, generated=generated
+    )
 
 
 async def _readiness_snapshot() -> dict:

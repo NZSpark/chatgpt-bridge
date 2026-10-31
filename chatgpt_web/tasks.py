@@ -13,6 +13,7 @@
 播种内容的最前面，确保目标始终传达给新会话。
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -39,6 +40,23 @@ def _dir() -> Path:
 
 def _file(bucket: str) -> Path:
     # bucket 已经过 _session_key 消毒（只保留 [\w.\-:]），这里再兜底一次文件名安全
+    safe = bucket if isinstance(bucket, str) and bucket else "default"
+    stem = safe.split(".", 1)[0].upper()
+    reserved = stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} or bool(
+        re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", stem)
+    )
+    portable = bool(re.fullmatch(r"[a-z0-9_-][a-z0-9._-]{0,79}", safe))
+    portable = portable and not reserved and not safe.endswith(".")
+    # '!' is intentionally outside the accepted bucket-key alphabet, keeping
+    # encoded filenames disjoint from every directly-mapped portable key.
+    filename = safe if portable else "!bucket-" + hashlib.sha256(safe.encode("utf-8")).hexdigest()
+    return _dir() / f"{filename}.json"
+
+
+def _legacy_file(bucket: str) -> Path | None:
+    """Find the old sanitized snapshot path for backward-compatible reads."""
+    if not isinstance(bucket, str) or not bucket:
+        return None
     safe = "".join(ch if ch.isalnum() or ch in ".-_:" else "_" for ch in bucket) or "default"
     return _dir() / f"{safe}.json"
 
@@ -142,12 +160,22 @@ def _recent_texts(messages: List[ChatMessage]) -> List[Dict[str, str]]:
 
 def load(bucket: str) -> Dict[str, Any]:
     try:
-        raw = _file(bucket).read_text(encoding="utf-8")
+        path = _file(bucket)
+        if not path.exists():
+            legacy = _legacy_file(bucket)
+            if legacy is not None and legacy != path and legacy.is_file():
+                path = legacy
+        raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)
     except Exception:  # noqa: BLE001
         logger.warning("任务快照解析失败（bucket=%s）：本次忽略。", bucket, exc_info=True)
         return {}
     if not isinstance(data, dict):
+        return {}
+    # 文件名清理可能让不同旧 bucket 落到同一个 legacy 路径（例如
+    # ``repo/a`` 与 ``repo_a``）。必须校验文件内的原始 bucket，不能只校验 namespace。
+    # 历史 record() 一直写入 bucket，因此缺失或不匹配都应视为无效快照。
+    if data.get("bucket") != bucket:
         return {}
     # 归属校验：旧版本可能把别的项目/别的命名空间的快照写在同一个位置，
     # 一旦发现 namespace 不匹配就视为无效，避免串台。
